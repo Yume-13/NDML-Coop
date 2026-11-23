@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "mods/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+license = "MIT"
+repository = "https://github.com/Yume-13/NDML-Coop"
+
+[workspace.dependencies]
+ndml-sdk = { git = "https://github.com/Yume-13/NDML", tag = "v0.1.2" }
+ndml-net = { path = "crates/ndml-net" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+# An `# Errors` section on every public function returning `Result` adds
+# little over the error type itself.
+missing_errors_doc = "allow"
+# Casts on game numbers and wire fields are checked or capped before
+# narrowing.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Tests write `assert!(x.is_empty())`; the lint asks for
+# `assert_eq!(x, [] as [T; 0])`, which only changes the failure text.
+assert_is_empty = "allow"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"

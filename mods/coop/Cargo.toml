@@ -1,0 +1,26 @@
+[package]
+name = "coop"
+description = "Play a run together over Steam, internet, or LAN."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Mod DLLs are named ndmod_<name>.dll; the manager deploys every such DLL.
+name = "ndmod_coop"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndml-sdk.workspace = true
+ndml-net.workspace = true
+log.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

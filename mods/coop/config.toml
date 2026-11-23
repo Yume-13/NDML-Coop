@@ -1,0 +1,118 @@
+# Co-op: play a run together over Steam, internet, or LAN.
+#
+# Choose "Co-op" in the game's main menu. Both players need the same game
+# build and this mod.
+
+# Your name on codes and LAN, at most 24 characters; "Random" picks one.
+# Steam uses your Steam name.
+player_name = "Random"
+
+# UDP port for connection codes and LAN. A taken port falls back to a free
+# one; 0 = any free port.
+port = 7777
+
+# Ask a public server for your internet address, so another player can join
+# by code over the internet. false: the game contacts no such server; Steam and
+# LAN play still work.
+internet_lookup = true
+
+# Enemy hull while linked, times normal. The host's value counts for both
+# players. 0.1-10.
+enemy_health_mult = 1.8
+
+# Damage enemies deal while linked, times normal. The host's value counts
+# for both players. 0.1-10.
+enemy_damage_mult = 1.0
+
+# Seconds a downed ship waits before it respawns next to the partner. Game
+# time: the count stops while paused. The host's value counts for both
+# players. 5-600.
+respawn_seconds = 45
+
+# Show the link state beside the Co-op menu row, and the partner's name and
+# round trip during a run.
+overlay = true
+
+# ---- Shared world -----------------------------------------------------------
+
+# Your colour on your partner's screen. "auto" = your ship's colours; blue,
+# gold, red, green, violet, purple, cyan, magenta, amber, orange, pink, white,
+# or a hex colour such as "#40C0FF". The co-op page sets it too.
+# options:
+#   auto
+#   Ship palettes:
+#     blue #00a0ff
+#     gold #fcb652
+#     red #fe003d
+#     green #38f5cd
+#     violet #7046ed
+#     purple #6e2594
+#   Other colours:
+#     cyan #40dcff
+#     magenta #ff46dc
+#     amber #ffbe40
+#     orange #ff8c32
+#     pink #ff96c8
+#     white #ffffff
+#   #rrggbb
+color = "auto"
+
+# How your partner's ship is coloured on your screen. "off": as on their own
+# screen; "native": another of the game's palettes when it matches yours;
+# "chosen": their chosen colour.
+# options: off, native, chosen
+partner_tint = "off"
+
+# Your partner's name above their ship, and a marker pointing at them. The
+# co-op page sets these too.
+show_names = false
+show_marker = false
+
+# Seconds the host plays on alone after the link is lost, before it pauses
+# too. The host's value counts for both players. 0-600.
+host_plays_on_seconds = 15
+
+# Your partner's sounds on your screen, as a share of normal volume. 0 = none
+# (and their game sends none). Your own setting only.
+partner_sound_volume = 0.5
+
+# ---- Co-op UI ---------------------------------------------------------------
+# Where the partner's name and round trip go during a run.
+# options: right, left
+hud_corner = "right"
+# On a Steam Deck, its on-screen keyboard for text entry.
+deck_keyboard = true
+
+# ---- Steam ------------------------------------------------------------------
+# How two games find each other: through Steam when it runs, else codes
+# ("auto", "steam"), or codes and LAN only ("udp").
+# options: auto, steam, udp
+connector = "auto"
+
+# Who can join a lobby you host: your Steam friends, people you invite, or
+# anyone with its 5-character room code. The co-op page changes it per lobby.
+# options: friends, invite_only, code
+steam_lobby = "friends"
+
+# ---- Session rules ----------------------------------------------------------
+# A co-op run always shares the pause (either player pausing pauses both; play
+# resumes when both have resumed), the upgrade screen (it opens for both, and
+# the run waits until both have chosen), one experience level and one score
+# (no leaderboard uploads in co-op), and downs: a ship that would die while
+# the partner flies goes down and respawns after respawn_seconds; both down
+# ends the run. These settings apply in a co-op run only.
+
+# Losing window focus pauses, as in solo play. false = the run keeps going.
+pause_on_focus_loss = true
+
+# Wild mods on your own upgrade screens. "game": as the run has them (the
+# host's Wild Metamorphosis setting). "off": none are offered to you, even
+# when the host has Wild Metamorphosis on, and you keep the normal number of
+# rerolls. Your partner's upgrades and the run itself stay as they are, and
+# nothing is saved to your game.
+# options: game, off
+wild_mods = "game"
+
+# Seconds of waiting before Esc plays on without your partner. 10-3600;
+# 0 = never. The host's value counts for both players.
+upgrade_wait_seconds = 60
