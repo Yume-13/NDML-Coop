@@ -55,7 +55,7 @@ use std::fmt;
 pub const MAGIC: [u8; 2] = *b"ND";
 /// Bumped on any incompatible wire or protocol change; packets with another
 /// version are dropped.
-pub const PROTOCOL_VERSION: u8 = 11;
+pub const PROTOCOL_VERSION: u8 = 12;
 /// Largest datagram ever sent.
 pub const MAX_DATAGRAM: usize = 1200;
 /// Size of the fixed header.
@@ -518,7 +518,7 @@ mod tests {
                 assert_eq!(Header::read(&buf).unwrap().0, h);
             }
         }
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
         let mut v7 = Vec::new();
         header().write(&mut v7);
         v7[2] = 7;

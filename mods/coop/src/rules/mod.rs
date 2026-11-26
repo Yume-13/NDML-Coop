@@ -30,25 +30,30 @@
 //! * [`glue`]: the hooks and game calls.
 //! * [`xp`], [`score`], [`orbs`]: the shared experience, score and pickups.
 //! * [`downed`]: what a down does to what follows the ship.
+//! * [`countdown`], [`protect`], [`banish`]: the 3, 2, 1 count, the respawn's
+//!   protection, and Last Stand banished in every co-op run.
 //!
 //! In short:
 //! * *Pause.* A player's pause pauses everyone; play resumes when everyone
 //!   has resumed. A player who resumes first waits on the pause screen.
 //! * *Upgrades.* Opening the upgrade screen opens everyone's. A player who
-//!   has chosen, has nothing to choose, or is down waits; after
-//!   `upgrade_wait_seconds` Esc stops waiting.
+//!   has chosen, or has nothing to choose, waits. The round ends when
+//!   everyone is done, or for a partner gone (a lost link, a leave).
 //! * *Downed.* A ship that would die while a partner is linked goes down
-//!   instead (hidden, invulnerable, no control) and respawns next to the
-//!   partner after the respawn time (game time). Last Stand's revive comes
-//!   first. When nobody is left standing, every game dies through its own
-//!   death path.
+//!   instead (hidden, invulnerable, no control) and comes back after the
+//!   respawn time (game time) by the game's own fly-in (`oPlayer_Alarm_3`).
+//!   Last Stand's revive comes first. When nobody is left standing, every
+//!   game dies through its own death path.
 
 #![forbid(unsafe_code)]
 
+pub mod banish;
+pub mod countdown;
 pub mod downed;
 pub mod glue;
 pub mod machine;
 pub mod orbs;
+pub mod protect;
 pub mod score;
 pub mod settings;
 pub mod xp;

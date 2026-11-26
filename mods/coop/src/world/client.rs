@@ -26,7 +26,10 @@
 //! collisions; each tick writes the host's interpolated pose and hull. Parts a
 //! puppet builds while it is created belong to it and die with it; other
 //! ticking `oSolid` instances are strays the glue removes. A resync drops
-//! every puppet and rebuilds the world under the host's net ids.
+//! every puppet and rebuilds the world under the host's net ids. A copy of an
+//! enemy that emerges from the background goes in the frame what it turned
+//! into is born here, and never ends its emerge on its own
+//! ([`super::emerge`]).
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +40,8 @@ use ndml_net::interp::{Sample, Track, Vec2};
 use ndml_net::msg::{DespawnCause, EnemySnapshot, EnemySpawn, Message, NetId, PeerId, SpawnMarker};
 use ndml_net::time;
 use ndml_sdk::Value;
+
+use super::emerge;
 
 mod contain; // the GML error guard's table edits (`crate::guard`)
 
@@ -83,6 +88,13 @@ struct Entry {
     spawn: EnemySpawn,
     track: Track,
     hull_frac: f32,
+    /// The host's last hull above 0 (a fraction, as `hull_frac`), and the
+    /// host-clock time of the state its hull reached 0 in since: the host's
+    /// death is shown on the timeline, so until the render time reaches that
+    /// state, and while its despawn is still to come, the copy lives by that
+    /// last hull ([`ClientWorld::host_hull_alive`]).
+    living_frac: f32,
+    zero_at: Option<Duration>,
     target: Option<PeerId>,
     state: State,
     despawn: Option<DespawnCause>,
@@ -97,6 +109,61 @@ struct Entry {
     shown_seg: Option<u8>,
     /// The host's instance is deactivated (`Message::Asleep`).
     asleep: bool,
+    /// Born incomplete ([`ClientWorld::update_held`]): the frame its hold
+    /// began; deactivated here until what it was born with is there.
+    held: Option<u64>,
+    /// It has run its own events (complete at its first check, let go
+    /// complete, or at [`HOLD_FRAMES`]): never held again. Only what a copy
+    /// was born with holds it; a reference a later repair names waits
+    /// without stopping the copy.
+    ran: bool,
+    /// An enemy that emerges from the background ([`super::emerge`]): its
+    /// copy's emerge against the host's, from its birth.
+    emerge: Option<emerge::Clock>,
+    /// An emerging copy whose despawn was its turn, not yet taken by the
+    /// birth of what it turned into ([`ClientWorld::take_turn`]).
+    turn: Option<Turn>,
+    /// A newborn copy that took a turned one (each birth takes one, once).
+    took_turn: bool,
+}
+
+/// Where the turned copy `e` (its turn `t`) is matched from, for a newborn
+/// whose first sample is at host time `when`: its last place, and its place
+/// on its own track at `when` (carried past its last sample up to the
+/// extrapolation cap). The nearer counts.
+fn turned_at(e: &Entry, t: Turn, when: Option<Duration>) -> [(f32, f32); 2] {
+    let then = when
+        .and_then(|w| e.track.sample(w))
+        .map_or(t.at, |p| (p.pos.x, p.pos.y));
+    [t.at, then]
+}
+
+/// An emerging copy's turn on the host, waiting for its birth here.
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    /// Its last host sample's time: what it turned into began after.
+    last: Option<Duration>,
+    /// Where it was last (its last sample, or its spawn).
+    at: (f32, f32),
+}
+
+/// The longest a copy born incomplete is held before it runs anyway
+/// ([`ClientWorld::update_held`]): 2.5 s. It must stay past the longest the
+/// transfer waits for what such a copy lacks (a first state held for its
+/// maker, 120 frames; [`BIRTH_WAIT_FRAMES`]).
+pub const HOLD_FRAMES: u64 = 150;
+
+/// What [`ClientWorld::update_held`] changed this frame.
+#[derive(Debug, Default, PartialEq)]
+pub struct HeldChange {
+    /// Every copy held now (the world deactivates them at the frame's end).
+    pub hold: Vec<Value>,
+    /// Copies let go now, complete (activated, unless asleep with the host's).
+    pub released: Vec<Value>,
+    /// Copies let go at [`HOLD_FRAMES`] still incomplete (net ids, for the log).
+    pub spent: Vec<NetId>,
+    /// Holds begun this frame.
+    pub started: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -262,15 +329,30 @@ pub struct ClientWorld {
     snap_clock: Option<(u32, f64)>,
     /// The newest snapshot time (where a death that arrives now is placed).
     newest: Option<Duration>,
+    /// The host's snapshots taken (distinct stamps) and the newest stamp
+    /// (its clock, ms): how fast its world runs (`crate::slow_log`).
+    host_snaps: (u64, u32),
+    /// The objects that emerge from the background (the glue's, from the
+    /// object tree; kept across runs: facts of the game).
+    emerging: HashSet<u16>,
+    /// The host's snapshot times as filed (the emerging copies' clock).
+    snaps: emerge::SnapTimes,
+    /// The field's size (`viewWidth`, `viewHeight`; the glue's): a turn's
+    /// birth is matched across its wrap.
+    field: Option<(f32, f32)>,
 }
 
 impl ClientWorld {
     /// An enemy snapshot part: a sample for each copy it names.
     fn on_snapshot(&mut self, snap: EnemySnapshot) {
+        if self.host_snaps.0 == 0 || snap.time_ms != self.host_snaps.1 {
+            self.host_snaps = (self.host_snaps.0 + 1, snap.time_ms);
+        }
         let t = self.snapshot_time(snap.time_ms);
         if self.newest.is_none_or(|n| t > n) {
             self.newest = Some(t);
         }
+        self.snaps.push(t);
         for st in snap.enemies {
             let Some(e) = self.entries.get_mut(&st.net_id) else {
                 continue; // spawn not here yet, or gone
@@ -284,6 +366,12 @@ impl ClientWorld {
             });
             if kept {
                 e.hull_frac = st.hull_frac;
+                if st.hull_frac > 0.0 {
+                    e.living_frac = st.hull_frac;
+                    e.zero_at = None;
+                } else {
+                    e.zero_at = Some(e.zero_at.map_or(t, |z| z.min(t)));
+                }
                 e.target = st.target;
             }
         }
@@ -304,10 +392,33 @@ impl ClientWorld {
             }
             Message::Despawn { net_id, cause } => {
                 let (timeline, newest) = (self.timeline, self.newest);
+                // An emerging copy's end that is not a death is its turn: it
+                // goes in the frame what it turned into is born here, or at
+                // the bound (`emerge`).
+                let turn = |e: &mut Entry, family: &HashSet<u16>| {
+                    let is_turn = timeline
+                        && newest.is_some()
+                        && !matches!(cause, DespawnCause::Killed { .. })
+                        && family.contains(&e.spawn.object);
+                    if is_turn {
+                        let last = e.track.latest();
+                        e.turn = Some(Turn {
+                            last: last.map(|s| s.time),
+                            at: last.map_or((e.spawn.x, e.spawn.y), |s| (s.pos.x, s.pos.y)),
+                        });
+                        e.despawn_at = newest.map(|n| n + emerge::TURN_BOUND);
+                    }
+                    is_turn
+                };
                 let live = match self.entries.get_mut(&net_id) {
                     Some(e) if matches!(e.state, State::Live { .. }) => {
                         e.despawn = Some(cause);
-                        e.despawn_at = newest.filter(|_| timeline);
+                        if turn(e, &self.emerging) {
+                            // What it turned into may be born here already.
+                            self.turn_born(net_id);
+                        } else {
+                            e.despawn_at = newest.filter(|_| timeline);
+                        }
                         true
                     }
                     // Timeline births: one born and gone unseen is still shown.
@@ -318,7 +429,9 @@ impl ClientWorld {
                             && newest.is_some() =>
                     {
                         e.despawn = Some(cause);
-                        e.despawn_at = newest;
+                        if !turn(e, &self.emerging) {
+                            e.despawn_at = newest;
+                        }
                         true
                     }
                     // Killed before its copy was made: made to die at once.
@@ -362,6 +475,11 @@ impl ClientWorld {
                 if let Some(old) = self.entries.remove(&s.net_id) {
                     self.drop_entry(old);
                 }
+                let frac = if s.hull_max > 0.0 {
+                    s.hull / s.hull_max
+                } else {
+                    1.0
+                };
                 self.entries.insert(
                     s.net_id,
                     Entry {
@@ -371,11 +489,9 @@ impl ClientWorld {
                             t.set_linear_angle(self.linear_angle);
                             t
                         },
-                        hull_frac: if s.hull_max > 0.0 {
-                            s.hull / s.hull_max
-                        } else {
-                            1.0
-                        },
+                        hull_frac: frac,
+                        living_frac: frac,
+                        zero_at: None,
                         target: None,
                         state: State::Pending,
                         despawn: None,
@@ -384,6 +500,11 @@ impl ClientWorld {
                         since: self.frame,
                         shown_seg: None,
                         asleep: false,
+                        held: None,
+                        ran: false,
+                        emerge: None,
+                        turn: None,
+                        took_turn: false,
                     },
                 );
             }
@@ -455,7 +576,9 @@ impl ClientWorld {
             .entries
             .iter()
             .filter_map(|(&n, e)| match &e.state {
-                State::Live { last_tick, id, .. } if *last_tick < prev && !e.asleep => {
+                State::Live { last_tick, id, .. }
+                    if *last_tick < prev && !e.asleep && e.held.is_none() =>
+                {
                     Some((n, id.clone()))
                 }
                 _ => None,
@@ -702,6 +825,17 @@ impl ClientWorld {
         if killed_unmade(e) {
             self.counts.died_unmade += 1;
         }
+        // An emerging copy's emerge is counted from its first sample (where
+        // its first state stands), against the host's shown frames.
+        if self.timeline && self.emerging.contains(&e.spawn.object) {
+            e.emerge = e
+                .track
+                .first()
+                .map(|s| s.time)
+                .or(self.render_time)
+                .map(emerge::Clock::new);
+        }
+        let other = self.timeline && !self.emerging.contains(&e.spawn.object);
         e.state = State::Live {
             key,
             id,
@@ -711,6 +845,78 @@ impl ClientWorld {
         };
         self.by_key.insert(key, net_id);
         self.fresh.insert(key);
+        if other {
+            self.take_turn(net_id);
+        }
+    }
+
+    /// A copy outside the emerging family was born (`born`): the turned
+    /// emerging copy it is the solid enemy of, the nearest within
+    /// [`emerge::TURN_PX`] of its first sample whose last sample came before
+    /// that, goes at its tick this frame (the family's ticks come after the
+    /// births, before the Draw). Each birth takes one, once.
+    fn take_turn(&mut self, born: NetId) {
+        let Some(b) = self.entries.get(&born) else {
+            return;
+        };
+        if b.took_turn {
+            return;
+        }
+        let first = b.track.first();
+        let at = first.map_or((b.spawn.x, b.spawn.y), |s| (s.pos.x, s.pos.y));
+        let since = first.map(|s| s.time);
+        let turned = self.entries.iter().flat_map(|(&n, e)| {
+            let t = e.turn.filter(|t| match (since, t.last) {
+                (Some(s), Some(l)) => s > l,
+                _ => true,
+            });
+            t.map(|t| turned_at(e, t, since).map(|p| (n, p, at)))
+                .into_iter()
+                .flatten()
+        });
+        if let Some(n) = emerge::nearest_turned(turned, self.field) {
+            self.turn_taken(n, born);
+        }
+    }
+
+    /// An emerging copy's turn came (`turned`): a copy born here already
+    /// that is what it turned into (the nearest such newborn, its host life
+    /// begun after the turned copy's last sample) takes it now.
+    fn turn_born(&mut self, turned: NetId) {
+        let Some(t) = self.entries.get(&turned).and_then(|e| e.turn) else {
+            return;
+        };
+        let Some(e) = self.entries.get(&turned) else {
+            return;
+        };
+        let born = self.entries.iter().flat_map(|(&n, b)| {
+            let newborn = matches!(b.state, State::Live { .. })
+                && !b.took_turn
+                && !self.emerging.contains(&b.spawn.object);
+            let first = b
+                .track
+                .first()
+                .filter(|f| newborn && t.last.is_none_or(|l| f.time > l));
+            first
+                .map(|f| turned_at(e, t, Some(f.time)).map(|p| (n, p, (f.pos.x, f.pos.y))))
+                .into_iter()
+                .flatten()
+        });
+        if let Some(b) = emerge::nearest_turned(born, self.field) {
+            self.turn_taken(turned, b);
+        }
+    }
+
+    /// `born` is what `turned` turned into: the turned copy goes at its
+    /// next tick.
+    fn turn_taken(&mut self, turned: NetId, born: NetId) {
+        if let Some(e) = self.entries.get_mut(&turned) {
+            e.turn = None;
+            e.despawn_at = Some(Duration::ZERO);
+        }
+        if let Some(b) = self.entries.get_mut(&born) {
+            b.took_turn = true;
+        }
     }
 
     /// A spawn is not created here (no recipe, or the create failed).
@@ -760,13 +966,19 @@ impl ClientWorld {
             || self.dropping.contains_key(&key)
     }
 
-    /// The host's last hull for the copy at `key` while the host's instance
-    /// lives (above 0, no despawn); `None` otherwise.
+    /// The host's last hull above 0 for the copy at `key` (at least 0.01)
+    /// while the host's instance lives as this game shows it: its hull above
+    /// 0, or its death not reached on the timeline. `None` otherwise, and for
+    /// no copy here (a part, one dropping) or one without a hull.
     #[must_use]
     pub fn host_hull_alive(&self, key: usize) -> Option<f32> {
         let e = self.entries.get(self.by_key.get(&key)?)?;
-        (e.spawn.has_hull() && e.hull_frac > 0.0 && e.despawn.is_none())
-            .then(|| e.hull_frac.min(1.0) * e.spawn.hull_max)
+        let shown_alive = e.despawn.is_some()
+            || e.hull_frac > 0.0
+            || e.zero_at
+                .is_some_and(|z| self.render_time.is_some_and(|t| t < z));
+        (e.spawn.has_hull() && shown_alive)
+            .then(|| (e.living_frac.max(0.0) * e.spawn.hull_max).max(0.01))
     }
 
     /// An `oSolid` at `key` ticked.
@@ -842,7 +1054,7 @@ impl ClientWorld {
         if let Some(t) = render_time {
             e.track.prune_before(t);
         }
-        let host_hull = e.hull_frac.clamp(0.0, 1.0) * e.spawn.hull_max;
+        let host_hull = e.hull_frac.max(0.0) * e.spawn.hull_max;
         let mut vel = None;
         let mut host_vel = None;
         if let State::Live {
@@ -879,12 +1091,13 @@ impl ClientWorld {
         })
     }
 
-    /// The instances of the live copies not asleep with the host's.
+    /// The instances of the live copies not asleep with the host's, nor
+    /// held ([`Self::update_held`]).
     #[must_use]
     pub fn awake_ids(&self) -> Vec<Value> {
         self.entries
             .values()
-            .filter(|e| !e.asleep)
+            .filter(|e| !e.asleep && e.held.is_none())
             .filter_map(|e| match &e.state {
                 State::Live { id, .. } => Some(id.clone()),
                 _ => None,
@@ -905,17 +1118,77 @@ impl ClientWorld {
             .collect()
     }
 
-    /// Copies whose host instance is asleep (deactivated there).
+    /// Copies whose host instance is asleep (deactivated there), and copies
+    /// held ([`Self::update_held`]): kept deactivated.
     #[must_use]
     pub fn asleep_ids(&self) -> Vec<Value> {
         self.entries
             .values()
-            .filter(|e| e.asleep)
+            .filter(|e| e.asleep || e.held.is_some())
             .filter_map(|e| match &e.state {
                 State::Live { id, .. } => Some(id.clone()),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Held copies not asleep with the host's: activated for the run step,
+    /// so their first state and references can be written (the world
+    /// deactivates the ones still held at the step's end, before any of
+    /// their events run).
+    #[must_use]
+    pub fn held_ids(&self) -> Vec<Value> {
+        self.entries
+            .values()
+            .filter(|e| e.held.is_some() && !e.asleep)
+            .filter_map(|e| match &e.state {
+                State::Live { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Copies born out of order: a copy just made whose net id is in
+    /// `incomplete` (its first state not applied yet, or a reference of it
+    /// waiting for a copy not made yet) is held, deactivated, so its own
+    /// events do not run on a state no host instance had (a hard shield's End
+    /// Step destroys it while its `leader` is not there). Let go when
+    /// complete, or at [`HOLD_FRAMES`]; a copy that has run is never held
+    /// again. A copy asleep with the host's stays asleep when let go.
+    pub fn update_held(&mut self, incomplete: &HashSet<NetId>) -> HeldChange {
+        let frame = self.frame;
+        let mut out = HeldChange::default();
+        for (&net, e) in &mut self.entries {
+            let State::Live { id, .. } = &e.state else {
+                continue;
+            };
+            let want = incomplete.contains(&net) && !e.ran;
+            match (e.held, want) {
+                (None, true) => {
+                    e.held = Some(frame);
+                    out.hold.push(id.clone());
+                    out.started += 1;
+                }
+                (Some(since), true) if frame.saturating_sub(since) >= HOLD_FRAMES => {
+                    e.held = None;
+                    e.ran = true;
+                    out.spent.push(net);
+                    if !e.asleep {
+                        out.released.push(id.clone());
+                    }
+                }
+                (Some(_), true) => out.hold.push(id.clone()),
+                (Some(_), false) => {
+                    e.held = None;
+                    e.ran = true;
+                    if !e.asleep {
+                        out.released.push(id.clone());
+                    }
+                }
+                (None, false) => e.ran = true,
+            }
+        }
+        out
     }
 
     /// These puppets failed `instance_exists` (gone locally): forget them.
@@ -936,6 +1209,19 @@ impl ClientWorld {
         self.entries.get(self.by_key.get(&key)?)?.target
     }
 
+    /// The host's snapshots taken (distinct stamps) and the newest one's
+    /// stamp (its clock, ms); `(0, 0)` before the first.
+    #[must_use]
+    pub fn host_snapshots(&self) -> (u64, u32) {
+        self.host_snaps
+    }
+
+    /// Copies made and live (no walk).
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Counts for the overlay.
     #[must_use]
     pub fn counts(&self) -> Counts {
@@ -954,12 +1240,63 @@ impl ClientWorld {
     /// handed over); settings are kept.
     pub fn clear(&mut self) {
         let (regular, timeline, linear_angle) = (self.regular, self.timeline, self.linear_angle);
+        let emerging = std::mem::take(&mut self.emerging);
+        let field = self.field;
         *self = Self {
             regular,
             timeline,
             linear_angle,
+            emerging,
+            field,
             ..Self::default()
         };
+    }
+
+    /// The field's size (`viewWidth`, `viewHeight`): a turn's birth is
+    /// matched across its wrap ([`emerge::turn_distance`]).
+    pub fn set_field(&mut self, width: f64, height: f64) {
+        #[allow(clippy::cast_possible_truncation)] // a field's size in px
+        let size = (width as f32, height as f32);
+        let known = size.0 > 0.0 && size.1 > 0.0 && size.0.is_finite() && size.1.is_finite();
+        self.field = known.then_some(size);
+    }
+
+    /// The objects that emerge from the background ([`super::emerge`]).
+    pub fn set_emerging(&mut self, objects: impl IntoIterator<Item = u16>) {
+        self.emerging = objects.into_iter().collect();
+    }
+
+    /// Whether `net_id` is a copy of an enemy that emerges from the
+    /// background.
+    #[must_use]
+    pub fn is_emerging(&self, net_id: NetId) -> bool {
+        self.entries
+            .get(&net_id)
+            .is_some_and(|e| self.emerging.contains(&e.spawn.object))
+    }
+
+    /// The emerging copy at `key`: whether its emerge runs this Step
+    /// ([`emerge::step`]); `None` for any other instance.
+    pub fn emerge_step(&mut self, key: usize) -> Option<emerge::Step> {
+        let net = *self.by_key.get(&key)?;
+        let t = self.render_time;
+        let e = self.entries.get_mut(&net)?;
+        let last = e.track.latest().map(|s| s.time);
+        let known = e.despawn.is_some();
+        let clock = e.emerge.as_mut()?;
+        Some(emerge::step(clock, &self.snaps, t, last, known))
+    }
+
+    /// An age-stamped repair (`age` frames after the host's first tick) is
+    /// written to `net_id`'s copy now.
+    pub fn emerge_repaired(&mut self, net_id: NetId, age: u64) {
+        if let Some(c) = self
+            .entries
+            .get_mut(&net_id)
+            .and_then(|e| e.emerge.as_mut())
+        {
+            c.repaired(age);
+        }
     }
 }
 
@@ -1213,6 +1550,60 @@ mod tests {
         assert!(p.pos.x > 400.5 && p.pos.x < 410.0, "{}", p.pos.x);
     }
 
+    /// A copy born incomplete is held until it is complete, and at the
+    /// bound whatever it lacks; a copy that has run is never held again (a
+    /// later repair's reference does not stop it); a copy asleep with the
+    /// host's stays asleep when let go.
+    #[test]
+    fn a_copy_born_incomplete_is_held_until_complete_or_the_bound() {
+        let mut c = live_world();
+        let both: HashSet<NetId> = [1].into_iter().collect();
+        let none = HashSet::new();
+        let h = c.update_held(&both);
+        assert_eq!(h.hold, vec![id(1)]);
+        assert!(c.asleep_ids().contains(&id(1)) && c.awake_ids().is_empty());
+        assert_eq!(c.held_ids(), vec![id(1)], "activated for the run step");
+        c.begin_frame(None);
+        assert_eq!(c.update_held(&both).hold, vec![id(1)], "still incomplete");
+        let h = c.update_held(&none);
+        assert_eq!(
+            (h.hold.len(), h.released.clone(), h.spent.len()),
+            (0, vec![id(1)], 0)
+        );
+        assert!(c.asleep_ids().is_empty() && c.awake_ids() == vec![id(1)]);
+        assert!(
+            c.update_held(&both).hold.is_empty(),
+            "run: never held again"
+        );
+        // Complete at its first check: never held.
+        let mut c = live_world();
+        assert!(c.update_held(&none).hold.is_empty());
+        assert!(c.update_held(&both).hold.is_empty());
+        // Incomplete to the bound: let go then, and never held again.
+        let mut c = live_world();
+        let _ = c.update_held(&both);
+        for _ in 0..HOLD_FRAMES {
+            c.begin_frame(None);
+        }
+        let h = c.update_held(&both);
+        assert_eq!(
+            (h.released, h.spent),
+            (vec![id(1)], vec![1]),
+            "let go at the bound"
+        );
+        assert!(c.update_held(&both).hold.is_empty(), "never held again");
+        // Asleep with the host's: let go, not woken.
+        let mut c = live_world();
+        let _ = c.update_held(&both);
+        c.on_message(Message::Asleep {
+            net_id: 1,
+            asleep: true,
+        });
+        assert!(c.held_ids().is_empty(), "not activated for the step");
+        let h = c.update_held(&none);
+        assert!(h.released.is_empty() && c.asleep_ids() == vec![id(1)]);
+    }
+
     #[test]
     fn the_hosts_hull_says_whether_a_copy_may_die_by_its_own_step() {
         let mut c = live_world();
@@ -1237,7 +1628,335 @@ mod tests {
             net_id: 1,
             cause: DespawnCause::Killed { by: None },
         });
-        assert_eq!(c.host_hull_alive(11), None, "the host's despawn");
+        assert!(
+            near(c.host_hull_alive(11), 25.0),
+            "a despawn still to come: the host's last hull"
+        );
+    }
+
+    /// The host's death is shown on the timeline: a state with its hull at
+    /// 0 counts once the render time reaches it, and a despawn once it has
+    /// been played (the copy gone); until then the copy's own Step runs on
+    /// the host's last hull above 0 (an asteroid's Step destroys it on
+    /// `hull <= 0`).
+    #[test]
+    fn a_copys_own_step_waits_for_the_hosts_death_on_the_timeline() {
+        let mut c = live_world();
+        let near = |v: Option<f32>, want: f32| v.is_some_and(|h| (h - want).abs() < 1e-3);
+        c.on_message(snap(1000, 1, 300.0, 0.4, None));
+        c.on_message(snap(1033, 1, 300.0, 0.0, None));
+        c.begin_frame(Some(Duration::from_millis(1010)));
+        let _ = c.tick(11);
+        assert!(
+            near(c.host_hull_alive(11), 40.0),
+            "the hull at 0 not shown yet: {:?}",
+            c.host_hull_alive(11)
+        );
+        c.begin_frame(Some(Duration::from_millis(1040)));
+        let _ = c.tick(11);
+        assert_eq!(c.host_hull_alive(11), None, "the hull at 0 reached");
+        // Healed back over 0 (a repair): alive again, the zero forgotten.
+        c.on_message(snap(1066, 1, 300.0, 0.1, None));
+        assert!(near(c.host_hull_alive(11), 10.0));
+        // A despawn after a living state: held until it is played.
+        c.on_message(Message::Despawn {
+            net_id: 1,
+            cause: DespawnCause::Killed { by: None },
+        });
+        assert!(
+            near(c.host_hull_alive(11), 10.0),
+            "its despawn still to come"
+        );
+        c.begin_frame(Some(Duration::from_millis(1100)));
+        assert!(puppet(c.tick(11)).is_some_and(|p| p.despawn.is_some()));
+        assert_eq!(c.host_hull_alive(11), None, "played: no copy");
+    }
+
+    /// A world on the timeline where object 545 emerges from the
+    /// background, its net 1 live as key 11 from its first sample at 1000.
+    fn emerging_world() -> ClientWorld {
+        let mut c = ClientWorld::default();
+        c.set_timing(false, true);
+        c.set_emerging([545]);
+        c.on_message(spawn(1, 545));
+        c.on_message(snap(1000, 1, 300.0, 1.0, None));
+        c.player_stepped();
+        assert!(c.begin_frame(Some(Duration::from_millis(1000))).running);
+        assert!(c.is_due(1));
+        c.spawned(1, 11, id(1));
+        c
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // a frame's render time, as `begin_frame` takes it
+    fn ms(n: u64) -> Option<Duration> {
+        Some(Duration::from_millis(n))
+    }
+
+    /// A snapshot at `ms` of each `(net, x, y)`.
+    fn snap_at(ms: u32, of: &[(NetId, f32, f32)]) -> Message {
+        Message::EnemySnapshot(EnemySnapshot {
+            time_ms: ms,
+            part: 0,
+            parts: 1,
+            enemies: of
+                .iter()
+                .map(|&(net_id, x, y)| EnemyState {
+                    seg: 0,
+                    net_id,
+                    x,
+                    y,
+                    angle: 20.0,
+                    hull_frac: 1.0,
+                    target: None,
+                })
+                .collect(),
+        })
+    }
+
+    /// The host's turn of net `turned`: the solid enemy's spawn (net `born`,
+    /// object 542) and the emerging one's despawn.
+    fn turn(c: &mut ClientWorld, turned: NetId, born: NetId) {
+        c.on_message(spawn(born, 542));
+        c.on_message(Message::Despawn {
+            net_id: turned,
+            cause: DespawnCause::Destroyed,
+        });
+    }
+
+    /// A joining game's frame at `t`: the due copies of `born` made (as keys
+    /// 10 + net), then the emerging copies' ticks (the End Step's). Whether
+    /// each of `emerging` (net, key) is still shown after its tick.
+    fn turn_frame(
+        c: &mut ClientWorld,
+        t: u64,
+        born: &[NetId],
+        emerging: &[(NetId, usize)],
+    ) -> Vec<bool> {
+        c.player_stepped();
+        c.begin_frame(ms(t));
+        for &n in born {
+            if c.is_due(n) {
+                c.spawned(n, 10 + usize::from(n), id(u32::from(n)));
+            }
+        }
+        emerging
+            .iter()
+            .map(|&(n, k)| c.is_known(n) && puppet(c.tick(k)).is_some_and(|p| p.despawn.is_none()))
+            .collect()
+    }
+
+    /// The turn on the joining screen: the emerging copy goes in the frame
+    /// the solid enemy its host instance made is born, whether that one's
+    /// first sample is the next snapshot after the emerging one's last, or
+    /// one or two later (its despawn word before or after them): never a
+    /// frame with neither, never one with both.
+    #[test]
+    fn the_turned_copy_goes_in_the_frame_its_solid_enemy_is_born() {
+        for later in 0..=2u32 {
+            for word_first in [false, true] {
+                let mut c = emerging_world();
+                c.on_message(snap_at(1033, &[(1, 300.0, 200.0)]));
+                c.on_message(snap_at(1066, &[(1, 300.0, 200.0)]));
+                let first = 1100 + 33 * later;
+                // The solid enemy's spawn comes before its first sample.
+                c.on_message(spawn(2, 542));
+                if word_first {
+                    turn(&mut c, 1, 2);
+                }
+                for t in (1100..first).step_by(33) {
+                    c.on_message(snap_at(t, &[]));
+                }
+                c.on_message(snap_at(first, &[(2, 304.0, 205.0)]));
+                if !word_first {
+                    turn(&mut c, 1, 2);
+                }
+                let mut t = 1070;
+                while t < u64::from(first) {
+                    let shown = turn_frame(&mut c, t, &[2], &[(1, 11)]);
+                    assert!(!c.is_known(2) || c.is_pending(2), "{later} {t}: not born");
+                    assert_eq!(shown, [true], "{later} {word_first} {t}: shown till then");
+                    t += 16;
+                }
+                let shown = turn_frame(&mut c, u64::from(first), &[2], &[(1, 11)]);
+                assert!(c.id_of(2).is_some(), "{later}: born at its first sample");
+                assert_eq!(
+                    shown,
+                    [false],
+                    "{later} {word_first}: and the emerging copy goes in it"
+                );
+            }
+        }
+        // A death is not a turn: it goes at the newest snapshot.
+        let mut c = emerging_world();
+        c.on_message(snap(1033, 1, 302.0, 1.0, None));
+        c.on_message(Message::Despawn {
+            net_id: 1,
+            cause: DespawnCause::Killed { by: None },
+        });
+        c.player_stepped();
+        c.begin_frame(ms(1033));
+        assert!(puppet(c.tick(11)).is_some_and(|p| p.despawn.is_some()));
+    }
+
+    /// The solid enemy's first sample dropped: a snapshot with neither comes
+    /// first. The emerging copy is not taken by that snapshot's time; it
+    /// stays to the solid one's birth a snapshot on.
+    #[test]
+    fn the_solid_enemys_first_sample_dropped_keeps_the_emerging_copy_to_its_birth() {
+        let mut c = emerging_world();
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0)]));
+        turn(&mut c, 1, 2);
+        c.on_message(snap_at(1066, &[(3, 900.0, 900.0)])); // without either
+        c.on_message(snap_at(1100, &[(2, 306.0, 203.0)]));
+        for t in [1040, 1066, 1083, 1099] {
+            assert_eq!(turn_frame(&mut c, t, &[2], &[(1, 11)]), [true], "{t}");
+        }
+        assert_eq!(turn_frame(&mut c, 1100, &[2], &[(1, 11)]), [false]);
+        assert!(c.id_of(2).is_some());
+    }
+
+    /// Two emerging copies turning side by side in the same frames: each
+    /// birth takes one, the nearest, once; the other stays to its own.
+    #[test]
+    fn two_emerging_copies_turning_side_by_side_go_one_birth_each() {
+        let mut c = emerging_world();
+        c.on_message(spawn(3, 545));
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0), (3, 340.0, 200.0)]));
+        c.player_stepped();
+        c.begin_frame(ms(1033));
+        assert!(c.is_due(3));
+        c.spawned(3, 13, id(3));
+        turn(&mut c, 1, 2);
+        turn(&mut c, 3, 4);
+        // Net 4 (by net 3) first, born at the snapshot after; net 2 (by net
+        // 1, 22 px from net 3 as well) a snapshot later.
+        c.on_message(snap_at(1066, &[(4, 338.0, 200.0)]));
+        c.on_message(snap_at(1100, &[(2, 318.0, 200.0), (4, 336.0, 200.0)]));
+        let both = [(1, 11), (3, 13)];
+        assert_eq!(turn_frame(&mut c, 1050, &[2, 4], &both), [true, true]);
+        assert_eq!(
+            turn_frame(&mut c, 1066, &[2, 4], &both),
+            [true, false],
+            "net 4 takes net 3, the nearer"
+        );
+        assert_eq!(turn_frame(&mut c, 1083, &[2, 4], &both[..1]), [true]);
+        assert_eq!(
+            turn_frame(&mut c, 1100, &[2, 4], &both[..1]),
+            [false],
+            "net 2 takes net 1: net 3 is taken already"
+        );
+        // Born in the same frame: one each.
+        let mut c = emerging_world();
+        c.on_message(spawn(3, 545));
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0), (3, 340.0, 200.0)]));
+        c.player_stepped();
+        c.begin_frame(ms(1033));
+        c.spawned(3, 13, id(3));
+        turn(&mut c, 1, 2);
+        turn(&mut c, 3, 4);
+        c.on_message(snap_at(1066, &[(2, 325.0, 200.0), (4, 330.0, 200.0)]));
+        assert_eq!(turn_frame(&mut c, 1066, &[2, 4], &both), [false, false]);
+    }
+
+    /// No birth at all (the host's solid enemy gone before a sample of it,
+    /// or no solid enemy): the emerging copy goes at the bound past the
+    /// newest snapshot when its despawn came, not before.
+    #[test]
+    fn a_turn_without_a_birth_goes_at_the_bound() {
+        let mut c = emerging_world();
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0)]));
+        c.on_message(Message::Despawn {
+            net_id: 1,
+            cause: DespawnCause::Destroyed,
+        });
+        for t in [1066, 1200, 1500, 1532] {
+            c.on_message(snap_at(u32::try_from(t).unwrap(), &[]));
+            assert_eq!(turn_frame(&mut c, t, &[], &[(1, 11)]), [true], "{t}");
+        }
+        let bound = 1033 + u64::try_from(emerge::TURN_BOUND.as_millis()).unwrap();
+        assert_eq!(turn_frame(&mut c, bound, &[], &[(1, 11)]), [false]);
+    }
+
+    /// The solid enemy made past the field's edge wraps in its first Step:
+    /// its birth still takes the emerging copy; and one born before the
+    /// despawn word is taken at the word.
+    #[test]
+    fn a_birth_across_the_wrap_or_before_the_word_takes_the_turn() {
+        let mut c = emerging_world();
+        c.set_field(2000.0, 1200.0);
+        c.on_message(snap_at(1033, &[(1, 900.0, -60.0)]));
+        turn(&mut c, 1, 2);
+        c.on_message(snap_at(1066, &[(2, 903.0, 1250.0)]));
+        assert_eq!(turn_frame(&mut c, 1050, &[2], &[(1, 11)]), [true]);
+        assert_eq!(turn_frame(&mut c, 1066, &[2], &[(1, 11)]), [false]);
+        // Born before the word came.
+        let mut c = emerging_world();
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0)]));
+        c.on_message(spawn(2, 542));
+        c.on_message(snap_at(1066, &[(2, 302.0, 200.0)]));
+        assert_eq!(turn_frame(&mut c, 1066, &[2], &[(1, 11)]), [true]);
+        assert!(c.id_of(2).is_some());
+        c.on_message(Message::Despawn {
+            net_id: 1,
+            cause: DespawnCause::Destroyed,
+        });
+        assert_eq!(turn_frame(&mut c, 1083, &[2], &[(1, 11)]), [false]);
+        // A copy born far away takes nothing.
+        let mut c = emerging_world();
+        c.on_message(snap_at(1033, &[(1, 300.0, 200.0)]));
+        turn(&mut c, 1, 2);
+        c.on_message(snap_at(1066, &[(2, 700.0, 200.0)]));
+        assert_eq!(turn_frame(&mut c, 1066, &[2], &[(1, 11)]), [true]);
+    }
+
+    /// An emerging copy drifting past the bottom edge, its last sample two
+    /// frames before its turn; the solid enemy made there wraps down and
+    /// back up in its first two Steps, its first sample farther than
+    /// [`emerge::TURN_PX`] from the copy's last place but nearer to where the
+    /// copy was by then. Its birth takes the turn.
+    #[test]
+    fn a_drifting_copy_is_matched_where_it_was_at_the_birth() {
+        let mut c = emerging_world();
+        c.set_field(2000.0, 1200.0);
+        c.on_message(snap_at(1033, &[(1, 1500.0, 1310.0)]));
+        c.on_message(snap_at(1066, &[(1, 1492.0, 1306.0)]));
+        turn(&mut c, 1, 2);
+        c.on_message(snap_at(1133, &[(2, 1475.0, 1243.0)]));
+        let last = (1492.0, 1306.0);
+        assert!(emerge::turn_distance(last, (1475.0, 1243.0), c.field) > emerge::TURN_PX);
+        assert_eq!(turn_frame(&mut c, 1100, &[2], &[(1, 11)]), [true]);
+        assert_eq!(
+            turn_frame(&mut c, 1133, &[2], &[(1, 11)]),
+            [false],
+            "taken in the Hive's birth frame"
+        );
+    }
+
+    /// The copy's emerge runs only behind the host's shown frames: held at
+    /// its birth, then a Step a frame while the host's snapshots come.
+    #[test]
+    fn an_emerging_copys_emerge_runs_behind_the_hosts() {
+        let mut c = emerging_world();
+        assert_eq!(c.emerge_step(11), Some(emerge::Step::Hold), "at its birth");
+        for i in 1..=10u32 {
+            c.on_message(snap(1000 + 33 * i, 1, 300.0, 1.0, None));
+        }
+        let mut ran = 0;
+        for f in 1..=12u64 {
+            c.player_stepped();
+            c.begin_frame(ms(1000 + 17 * f));
+            let _ = c.tick(11);
+            if c.emerge_step(11) == Some(emerge::Step::Run) {
+                ran += 1;
+            }
+        }
+        // Held to 1068 ms (two snapshots shown), then one a frame: at 1204
+        // ms (six snapshots after its first, 12 host frames) 9 have run,
+        // 3 behind the host's.
+        assert_eq!(ran, 9);
+        assert_eq!(c.emerge_step(12), None, "no copy there");
+        let mut other = live_world();
+        assert_eq!(other.emerge_step(11), None, "not an emerging copy");
     }
 
     #[test]

@@ -443,7 +443,7 @@ mod tests {
     fn sites_are_read_from_the_runner_message() {
         let t = "ERROR in action number 1\nof  Alarm Event for alarm 0\nfor object oTracerShot:\n\n\
                  Variable oTracerShot.enemySizeModifier(100734, -2147483648) not set before reading it.\n \
-                 at gml_Object_oTracerShot_Alarm_0 (line 3) - scaler = 0.6 * enemySizeModifier\n";
+                 at gml_Object_oTracerShot_Alarm_0 (line 3) - w = 2 * enemySizeModifier\n";
         let s = Site::parse(t);
         assert_eq!(s.object, "oTracerShot");
         assert_eq!(s.event, "gml_Object_oTracerShot_Alarm_0");

@@ -20,38 +20,29 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Kill effects and the status channel: hooks and game calls (see
-//! [`crate::damage::fx`] and [`ndml_net::status`]). Both are off
-//! ([`crate::damage::DamageSettings::kill_fx_on`], `status_on`).
+//! The status channel: hooks and game calls (see [`ndml_net::status`]). It
+//! is off ([`crate::damage::DamageSettings::status_on`]). The parts of a
+//! death that come from a player's build follow the on-death table
+//! ([`crate::damage::fx::ON_DEATH`], the world's on-death glue).
 //!
-//! * **Kill effects** (host): a death path of an enemy at `hull <= 0` pushes
-//!   a context with its kill credit; a killer-build part
-//!   ([`fx::KILLER_BUILD`]) inside a death credited to a partner is skipped.
 //! * **Status channel**: the joining side reports the status changes its
 //!   player made on copies ([`crate::damage::status_cause`]); the host
 //!   applies each increase to the real enemy (held while frozen or
 //!   deactivated) and acknowledges it.
+//!
+//! No stun bracket: the game never calls `stun` or `stunOther`, so a stun
+//! build stuns nothing in a solo game either.
 
 #![forbid(unsafe_code)]
-
-use std::sync::Arc;
 
 use ndml_net::msg::{Message, NetId, PeerId};
 use ndml_net::status::{Marks, StatusEntry, StatusMsg};
 use ndml_sdk::{Call, Instance, ModContext, Script, Value, Variable};
 
 use super::{DamageHooks, ROLE_CLIENT, ROLE_HOST};
+use crate::damage::DamageSettings;
 use crate::damage::status_cause::{self, Vals};
-use crate::damage::{DamageSettings, fx};
 
-/// The death paths whose context the killer-build parts are judged in.
-const DEATH_PATHS: [&str; 5] = [
-    "gml_Script_checkDestroy",
-    "gml_Script_checkDestroyReduced",
-    "gml_Script_checkDestroyNoExplosion",
-    "gml_Script_checkDestroyQuiet",
-    "gml_Script_enemyDestroyed",
-];
 const SPAWN_HIT_PULSE: &str = "gml_Script_spawnHitPulse";
 /// `stunOther`'s floor on `enemySpeed`.
 const SPEED_FLOOR: f64 = 0.25;
@@ -124,48 +115,8 @@ pub struct StatusCounts {
 }
 
 impl DamageHooks {
-    fn kill_fx(&self) -> bool {
-        DamageSettings::kill_fx_on() && self.role() == ROLE_HOST
-    }
-
     fn status_on(&self, role: u8) -> bool {
         DamageSettings::status_on() && self.role() == role
-    }
-
-    /// Before a death path: a context when the enemy is at `hull <= 0`.
-    fn death_before(&self, call: &Call<'_>) -> bool {
-        if !self.kill_fx() {
-            return false;
-        }
-        let (Some(me), Some(hv)) = (call.instance(), self.hull) else {
-            return false;
-        };
-        if me.get_f64(hv).is_none_or(|h| h > 0.0) {
-            return false;
-        }
-        // The world's credit, under its lock and not this one (never both).
-        let credited = self.kill_credit.get().and_then(|f| (f.0)(me.key()));
-        self.lock().deaths.push(credited);
-        true
-    }
-
-    fn death_after(&self, pushed: bool) {
-        if pushed {
-            self.lock().deaths.pop();
-        }
-    }
-
-    /// Before a killer-build part: skipped inside a partner's kill.
-    fn killer_part(&self, call: &mut Call<'_>) {
-        if !self.kill_fx() {
-            return;
-        }
-        let mut st = self.lock();
-        if st.deaths.last().copied().flatten().is_some() {
-            st.kills.skipped();
-            drop(st);
-            call.skip_original();
-        }
     }
 
     /// A copy's tick: the status changes the player's side made on it since
@@ -358,36 +309,4 @@ impl DamageHooks {
             .map(Message::Status)
             .collect()
     }
-}
-
-/// Register the effects' hooks. Returns how many sites were hooked.
-pub fn register(ctx: &ModContext, d: &Arc<DamageHooks>) -> usize {
-    let mut n = 0;
-    let mut ok = |name: &str, r: Result<(), ndml_sdk::Error>| match r {
-        Ok(()) => n += 1,
-        Err(e) => log::warn!("co-op effects: {name}: {e}"),
-    };
-    if DamageSettings::kill_fx_on() {
-        for name in DEATH_PATHS {
-            let (a, b) = (Arc::clone(d), Arc::clone(d));
-            ok(
-                name,
-                ctx.hook(
-                    name,
-                    move |call| a.death_before(call),
-                    move |_call, pushed| b.death_after(pushed),
-                ),
-            );
-        }
-        for (part, _) in fx::KILLER_BUILD {
-            let name = format!("gml_Script_{part}");
-            let a = Arc::clone(d);
-            ok(
-                &name,
-                ctx.hook_before(&name, move |call| a.killer_part(call)),
-            );
-        }
-    }
-    // No stun bracket: the game never calls `stun` or `stunOther`.
-    n
 }

@@ -294,10 +294,50 @@ impl Freezer {
         *self = Self::default();
     }
 
+    /// The game is paused by the hold (it showed its pause screen).
+    #[must_use]
+    pub fn made_pause(&self) -> bool {
+        self.made_pause
+    }
+
     /// Keep its pause as a player's pause; `true` if there was one.
     pub fn adopt(&mut self) -> bool {
         self.last_call = None;
         std::mem::take(&mut self.made_pause)
+    }
+}
+
+/// An upgrade screen the game asked for before the start gate let the run
+/// go, asked for again at the release. Draft calls `gotoUpgrade` from
+/// `oPowers`' Create. The gate's first-step `pressPause` replaces that
+/// deferred screen, so the game never makes it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartAsk {
+    asked: bool,
+}
+
+impl StartAsk {
+    /// The game called `gotoUpgrade`. `true` if kept for the release.
+    pub fn note(&mut self, linked: bool, released: bool) -> bool {
+        if linked && !released {
+            self.asked = true;
+        }
+        self.asked && !released
+    }
+
+    /// `true` once, on the first `ready` frame (released and not paused), if
+    /// `wanted`. Dropped at that frame otherwise.
+    pub fn due(&mut self, ready: bool, wanted: bool) -> bool {
+        if !self.asked || !ready {
+            return false;
+        }
+        self.asked = false;
+        wanted
+    }
+
+    /// Forget it (the run left).
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -354,6 +394,36 @@ mod tests {
     fn has_go(outs: &[Out]) -> bool {
         outs.iter()
             .any(|o| matches!(o, Out::Broadcast(Message::Go { .. })))
+    }
+
+    #[test]
+    fn a_screen_asked_for_before_the_release_is_asked_again_once_after_it() {
+        let mut a = StartAsk::default();
+        // Draft's Create: linked, the gate not yet released.
+        assert!(a.note(true, false));
+        // Held, then released but still paused (the deferred unpause).
+        assert!(!a.due(false, true));
+        assert!(!a.due(false, true));
+        // The first unpaused frame after the release: once.
+        assert!(a.due(true, true));
+        assert!(!a.due(true, true));
+    }
+
+    #[test]
+    fn no_ask_without_a_link_after_the_release_or_with_a_screen_open() {
+        let mut a = StartAsk::default();
+        // A solo run, or a call in play after the release: nothing kept.
+        assert!(!a.note(false, false));
+        assert!(!a.note(true, true));
+        assert!(!a.due(true, true));
+        // The screen came anyway, or the run is not a co-op run: dropped.
+        assert!(a.note(true, false));
+        assert!(!a.due(true, false));
+        assert!(!a.due(true, true));
+        // A run left before its release forgets it.
+        assert!(a.note(true, false));
+        a.reset();
+        assert!(!a.due(true, true));
     }
 
     #[test]

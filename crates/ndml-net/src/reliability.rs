@@ -234,6 +234,10 @@ struct SentPacket {
     time: Duration,
     reliable: Vec<u16>,
     acked: bool,
+    /// Counted lost after `PACKET_GIVE_UP`, its messages handed back for a
+    /// resend. Kept until [`PACKET_FORGET`]: a late ack delivers what it
+    /// carried and is an RTT sample.
+    given_up: bool,
 }
 
 /// What an incoming ack resolved.
@@ -243,9 +247,10 @@ pub struct AckOutcome {
     pub delivered: Vec<u16>,
     /// RTT sample from the newest acked packet, if it was newly acked.
     pub rtt: Option<Duration>,
-    /// Packets newly acked.
+    /// Packets newly acked, not those already counted in `lost`.
     pub acked: u32,
-    /// Packets given up on (fell out of the ack window unacked).
+    /// Packets given up on (fell out of the ack window unacked, or unacked
+    /// after `PACKET_GIVE_UP`).
     pub lost: u32,
     /// The reliable ids they carried, with their packet's send time.
     pub lost_reliable: Vec<(u16, Duration)>,
@@ -256,6 +261,9 @@ pub struct AckOutcome {
 pub struct SendWindow {
     next_seq: u16,
     sent: VecDeque<SentPacket>,
+    /// How many records at the front are past `PACKET_GIVE_UP` (given up
+    /// or acked): the records are in send order, so these are a prefix.
+    given: usize,
 }
 
 impl Default for SendWindow {
@@ -263,23 +271,41 @@ impl Default for SendWindow {
         Self {
             next_seq: 1,
             sent: VecDeque::new(),
+            given: 0,
         }
     }
 }
 
-/// Unacked packets older than this are counted lost even without newer acks.
+/// Unacked packets older than this are counted lost even without newer acks
+/// (their reliable messages are due again at once).
 const PACKET_GIVE_UP: Duration = Duration::from_secs(2);
+
+/// A packet record is kept this long (the link's own timeout), so an ack
+/// that comes after `PACKET_GIVE_UP` still delivers and measures the round
+/// trip over a path that holds seconds of data.
+const PACKET_FORGET: Duration = Duration::from_secs(10);
+
+/// Most packet records kept, below half the 16-bit seq space (the records
+/// are found by seq distance from the oldest).
+const MAX_RECORDS: usize = 32_768;
 
 impl SendWindow {
     /// Allocate the next seq and remember what the packet carried.
     pub fn record(&mut self, now: Duration, reliable: Vec<u16>) -> u16 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        if self.sent.len() >= MAX_RECORDS {
+            // Only a sender that never hears an ack gets here. Its reliable
+            // messages stay with it and are resent on its timeout.
+            self.sent.pop_front();
+            self.given = self.given.saturating_sub(1);
+        }
         self.sent.push_back(SentPacket {
             seq,
             time: now,
             reliable,
             acked: false,
+            given_up: false,
         });
         seq
     }
@@ -304,7 +330,9 @@ impl SendWindow {
                 && !p.acked
             {
                 p.acked = true;
-                out.acked += 1;
+                if !p.given_up {
+                    out.acked += 1;
+                }
                 out.delivered.append(&mut p.reliable);
                 if newest {
                     out.rtt = Some(now.saturating_sub(p.time));
@@ -321,29 +349,46 @@ impl SendWindow {
                 }
             }
         }
-        // Drop resolved records from the front: acked, out of the window, or old.
+        // Give up on records unacked past PACKET_GIVE_UP: lost, their
+        // messages due again, the record kept for a late ack.
+        while let Some(p) = self.sent.get_mut(self.given) {
+            if now.saturating_sub(p.time) <= PACKET_GIVE_UP {
+                break;
+            }
+            if !p.acked && !p.given_up {
+                p.given_up = true;
+                out.lost += 1;
+                let t = p.time;
+                out.lost_reliable
+                    .extend(p.reliable.iter().map(|&id| (id, t)));
+            }
+            self.given += 1;
+        }
+        // Drop resolved records from the front: acked, out of the window
+        // (lost, unless given up already), or past PACKET_FORGET.
         while let Some(front) = self.sent.front() {
             let out_of_window = trusted && seq_diff(ack, front.seq) > 32;
-            let too_old = now.saturating_sub(front.time) > PACKET_GIVE_UP;
-            if front.acked {
-                self.sent.pop_front();
-            } else if out_of_window || too_old {
-                out.lost += 1;
-                if let Some(p) = self.sent.pop_front() {
-                    out.lost_reliable
-                        .extend(p.reliable.into_iter().map(|id| (id, p.time)));
-                }
-            } else {
+            let forget = now.saturating_sub(front.time) > PACKET_FORGET;
+            if !(front.acked || out_of_window || forget) {
                 break;
+            }
+            let Some(p) = self.sent.pop_front() else {
+                break;
+            };
+            self.given = self.given.saturating_sub(1);
+            if !p.acked && !p.given_up {
+                out.lost += 1;
+                out.lost_reliable
+                    .extend(p.reliable.into_iter().map(|id| (id, p.time)));
             }
         }
         out
     }
 
-    /// Packets sent but not yet resolved.
+    /// Packets sent but not yet resolved (neither acked nor given up).
     #[must_use]
     pub fn in_flight(&self) -> usize {
-        self.sent.iter().filter(|p| !p.acked).count()
+        self.sent.iter().filter(|p| !p.acked && !p.given_up).count()
     }
 }
 
@@ -762,6 +807,65 @@ mod tests {
         let late = s.on_ack(ms(5000), 39, 0);
         assert_eq!(late.lost, 32);
         assert_eq!(s.in_flight(), 0);
+    }
+
+    /// A packet past the give-up is counted lost once and its messages handed
+    /// back. A late ack delivers them and measures the round trip. The records
+    /// are forgotten after `PACKET_FORGET`.
+    #[test]
+    fn an_ack_after_the_give_up_still_delivers_and_measures() {
+        let ms = Duration::from_millis;
+        let mut s = SendWindow::default();
+        for i in 0..10u16 {
+            // seq i + 1 carries id i, sent at i * 10 ms.
+            s.record(ms(u64::from(i) * 10), vec![i]);
+        }
+        // Nothing heard for 2.05 s: seqs 1..=6 (sent up to 50 ms) are past
+        // the give-up, lost, their messages due again.
+        let out = s.on_ack(ms(2_055), 0, 0);
+        assert_eq!(out.lost, 6);
+        assert_eq!(
+            out.lost_reliable,
+            (0..6u16)
+                .map(|i| (i, ms(u64::from(i) * 10)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(s.in_flight(), 4);
+        // The ack of seq 5 (and 3) comes at 3 s: delivered and an RTT
+        // sample, not counted lost again.
+        let out = s.on_ack(ms(3_000), 5, 0b10);
+        assert_eq!(out.delivered, vec![4, 2]);
+        assert_eq!(out.rtt, Some(ms(2_960)));
+        assert_eq!(
+            (out.acked, out.lost),
+            (0, 4),
+            "counted lost once (seqs 7..=10 given up now), not acked as well"
+        );
+        assert!(out.lost_reliable.iter().all(|&(id, _)| id >= 6));
+        assert_eq!(s.in_flight(), 0);
+        // Long after, the records are gone and nothing is counted twice.
+        let out = s.on_ack(ms(20_000), 5, 0);
+        assert_eq!((out.acked, out.lost), (0, 0));
+        assert!(s.on_ack(ms(20_001), 9, 0).delivered.is_empty());
+        assert!(s.sent.is_empty());
+    }
+
+    /// A sender that never hears an ack keeps at most `MAX_RECORDS` records,
+    /// and the seq lookup stays right past the cap.
+    #[test]
+    fn the_packet_records_are_capped() {
+        let ms = Duration::from_millis;
+        let mut s = SendWindow::default();
+        let n = MAX_RECORDS as u64 + 100;
+        let mut last = 0;
+        for i in 0..n {
+            // All within PACKET_GIVE_UP of the end.
+            last = s.record(ms(i / 100), vec![(i % 60_000) as u16]);
+        }
+        assert_eq!(s.sent.len(), MAX_RECORDS);
+        let out = s.on_ack(ms(n / 100), last, 0);
+        assert_eq!(out.delivered, vec![((n - 1) % 60_000) as u16]);
+        assert_eq!(out.rtt, Some(ms(0)));
     }
 
     /// A lost packet's messages are resent at once where it was their latest

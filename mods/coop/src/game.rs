@@ -40,6 +40,25 @@ use ndml_sdk::{Builtin, Call, Instance, ModContext, Script, Value, Variable};
 use crate::names::{self, builtin_fn as bf};
 use crate::player::sprite_value;
 
+/// `path` as a log line names it: from the game folder's `ndml` folder on
+/// (`ndml/coop/sounds`), never the folders above it. A path under no `ndml`
+/// folder: its last part.
+#[must_use]
+pub fn shown_path(path: &std::path::Path) -> String {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let from = parts
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("ndml"))
+        .unwrap_or(parts.len().saturating_sub(1));
+    parts.get(from..).unwrap_or_default().join("/")
+}
+
 /// Lock `m`; when it is already held, log it once per `name` (with a
 /// backtrace) before waiting: on the game's thread that wait never ends.
 pub fn lock_or_report<'a, T>(m: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
@@ -425,6 +444,30 @@ pub fn draw_sprite(call: &Call<'_>, b: &Builtins, s: &crate::render::ShipDraw) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_path_starts_at_the_game_folders_ndml() {
+        use std::path::Path;
+        let cases = [
+            (
+                "C:/Users/Ann/Steam/Nova Drift/ndml/coop/sounds",
+                "ndml/coop/sounds",
+            ),
+            (
+                "D:/Games/Nova Drift/ndml/coop/sounds/extra",
+                "ndml/coop/sounds/extra",
+            ),
+            (
+                "C:/Users/ndml/Nova Drift/ndml/config/ndmod_coop.toml",
+                "ndml/config/ndmod_coop.toml",
+            ),
+            ("C:/Users/Ann/x/ndmod_coop.toml", "ndmod_coop.toml"),
+            ("", ""),
+        ];
+        for (path, shown) in cases {
+            assert_eq!(shown_path(Path::new(path)), shown, "{path}");
+        }
+    }
 
     /// A hook the game calls while the caller holds the lock.
     fn hook_inside_game_call(m: &Mutex<u32>) {

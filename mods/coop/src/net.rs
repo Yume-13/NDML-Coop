@@ -44,7 +44,7 @@ use crate::config::Settings;
 
 /// Co-op mod protocol version in `Hello`; both players must match exactly.
 /// Bump it when co-op behaviour changes in a way an older partner cannot follow.
-pub const COOP_VERSION: u32 = 2;
+pub const COOP_VERSION: u32 = 3;
 
 /// Something the pure logic wants sent.
 #[derive(Debug, Clone, PartialEq)]

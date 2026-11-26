@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_the_events_we_use() {
+    fn decodes_the_events_the_mod_uses() {
         let f = [
             ("success", Value::Bool(true)),
             ("lobby_id", Value::Int(0x0186_0000_0000_0042)),

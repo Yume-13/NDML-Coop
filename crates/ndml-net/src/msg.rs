@@ -163,7 +163,9 @@ pub struct EnemyState {
     pub y: f32,
     /// Facing, degrees in `[0, 360)`.
     pub angle: f32,
-    /// `hull / hull_max`, in `[0, 1]`.
+    /// `hull / hull_max`, at least 0. Above 1 when the hull rose past its
+    /// spawn's base (`buildEnemyPart` scales a part's hull after its create).
+    /// The fine snapshot carries it exactly, the coarse encoding clamps it to 1.
     pub hull_frac: f32,
     /// The peer this enemy is attacking (gates its local fire on that peer).
     pub target: Option<PeerId>,
@@ -187,6 +189,14 @@ fn quant_angle(deg: f32) -> u8 {
     }
     let turns = deg.rem_euclid(360.0) / 360.0;
     ((turns * 256.0).round() as u32 % 256) as u8
+}
+
+/// The most a hull carried as [`EnemyState::hull_frac`] (a 16-bit fraction
+/// of `hull_max`) can be off once decoded: half a step, `hull_max / 131070`.
+/// A hull of 31 with a max of 160 decodes as 30.99901.
+#[must_use]
+pub fn hull_frac_carry(hull_max: f32) -> f32 {
+    hull_max.abs() * 0.5 / 65535.0
 }
 
 fn quant_frac(f: f32) -> u16 {
@@ -292,7 +302,10 @@ pub struct EnemySpawn {
     pub angle: f32,
     /// Hull now.
     pub hull: f32,
-    /// Maximum hull (after the health multiplier, rarity and size).
+    /// Maximum hull (after the health multiplier, rarity and size), or the
+    /// hull at the first spawn when above it. The base of the snapshot hull
+    /// fractions, the same in every later spawn of the enemy. The instance's
+    /// own `hullMax` goes with its state.
     pub hull_max: f32,
     /// [`EnemySpawn::DEPENDENCY`], [`EnemySpawn::NO_HULL`] (bits 1 and 2 are
     /// unused).
@@ -354,7 +367,7 @@ pub enum DespawnCause {
 pub enum Message {
     /// Version handshake (both directions).
     Hello(Hello),
-    /// Host to a new client: your id and the session size.
+    /// Host to a new client: the client's id and the session size.
     Welcome {
         /// The receiver's peer id.
         peer: PeerId,
@@ -438,12 +451,16 @@ pub enum Message {
         /// Upgrade round (a counter), so simultaneous opens merge.
         round: u16,
     },
-    /// A peer finished choosing (the host accepts it for any peer).
+    /// A peer finished choosing (request to host, confirmed by host). The
+    /// host accepts a request only for its sender.
     UpgradeDone {
         /// Who finished.
         peer: PeerId,
         /// Round finished.
         round: u16,
+        /// Set on the host's relay that releases the round when the resume
+        /// count runs ([`crate::session::UPGRADE_COUNT_AFTER`]).
+        count: bool,
     },
     /// A peer was downed (report to host; host confirms with the timer).
     Downed {
@@ -553,13 +570,13 @@ pub enum Message {
     },
     /// Wire tag 39: status effects on enemies ([`crate::status`]). Unreliable.
     Status(crate::status::StatusMsg),
-    /// Wire tag 40. Reserved: not sent by this build; ignored on receipt.
+    /// Wire tag 40. Reserved: never sent; ignored on receipt.
     ReportInfo(ReportInfo),
-    /// Wire tag 41. Reserved: not sent by this build; ignored on receipt.
+    /// Wire tag 41. Reserved: never sent; ignored on receipt.
     ReportMark(ReportMark),
-    /// Wire tag 42. Reserved: not sent by this build; ignored on receipt.
+    /// Wire tag 42. Reserved: never sent; ignored on receipt.
     ReportDigest(ReportDigest),
-    /// Wire tag 43. Reserved: not sent by this build; ignored on receipt.
+    /// Wire tag 43. Reserved: never sent; ignored on receipt.
     ReportTransfer(ReportTransfer),
     /// Wire tag 44. A ship's changing alpha, scale and blend, sent each frame
     /// while it changes and interpolated like the position. Unreliable.
@@ -614,21 +631,21 @@ pub enum Message {
     /// Arc Barrier), on change and every 2 s. Reliable.
     CoverState(CoverState),
     /// Wire tag 59. Host to a joining game on link: the session settings it
-    /// uses instead of its own (multipliers, plays-on, upgrade wait, respawn
-    /// seconds). Reliable.
+    /// uses instead of its own (multipliers, respawn seconds); `plays_on_s` is
+    /// the host's fixed plays-on time, only logged. Reliable.
     SessionSettings {
         health_mult: f32,
         damage_mult: f32,
         plays_on_s: f32,
-        upgrade_wait_s: f32,
         respawn_s: f32,
     },
-    /// Wire tag 60. A player left the co-op run while still linked; the
-    /// other plays on alone. Reliable.
+    /// Wire tag 60. A player left the co-op run while still linked. A
+    /// receiver past its start gate ends its run too; one still at its gate
+    /// takes it as the run before's and ignores it. Reliable.
     RunLeft { peer: PeerId },
     /// Wire tag 61. Host: its run settings for both games (`mods`: one bit
     /// per `gameMod*` flag; `daily`), on link and change (`start` false) and
-    /// at its run start (`start` true); `on_loadout`: it is on its loadout
+    /// at its run start (`start` true); `on_loadout`: it is on its new game
     /// screen. Reliable.
     RunRules {
         start: bool,
@@ -659,6 +676,73 @@ pub enum Message {
         kind: u8,
         /// Who picked it up.
         by: PeerId,
+    },
+    /// Wire tag 67. The game's on-enemy-death world effects (Rupture,
+    /// Spontaneous Generation): which of them each game's player has, and the
+    /// host's word that a death's effect is a joining player's to play. An
+    /// effect is in force for every death if either player has it, never twice.
+    /// Reliable, a `Given` before its enemy's `Despawn`.
+    OnDeath(OnDeathMsg),
+    /// Wire tag 68. The sender's player is ready on its new game screen
+    /// (`ready` true: Start, which reads Ready while linked) or not. Both
+    /// directions: a linked run starts once both players are ready. A new link
+    /// starts unready on both sides. Reliable, in order with `RunRules`.
+    Ready { ready: bool },
+    /// Wire tag 69. `peer` is choosing again in `round` after it was done
+    /// (Ataraxia, then its own upgrade screen with Space): the round waits for
+    /// it. A request to the host, which relays it to all while that round is
+    /// open. Reliable, counted with the rules messages.
+    UpgradeChoosing {
+        /// Who chooses again.
+        peer: PeerId,
+        /// The open round.
+        round: u16,
+    },
+    /// Wire tag 70. The run's start count on the new game screen (3, 2, 1,
+    /// go) once both players are ready. The host starts only after the joining
+    /// game's `Ack` of its `Go`, so a Ready taken back on either side before
+    /// its go stops the run on both (`coop::loadout`). `round` names the count.
+    /// Reliable, in order with `Ready` and `RunRules`.
+    StartCount {
+        /// The count.
+        round: u16,
+        /// Its step.
+        step: StartStep,
+    },
+}
+
+/// See [`Message::StartCount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartStep {
+    /// Host: both players are ready; the count begins now.
+    Begin,
+    /// Host: the count is called off (a Ready taken back, the screen left,
+    /// no answer to its go): nobody starts.
+    Cancel,
+    /// Host: its count is over; it starts once the joining game answers.
+    Go,
+    /// Joining game: the host's go taken while ready. It follows the host's
+    /// start and takes no Ready back.
+    Ack,
+}
+
+/// See [`Message::OnDeath`]. A part is its index among the world effects of
+/// the co-op mod's on-death table (`coop::damage::fx::ON_DEATH`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OnDeathMsg {
+    /// The parts the sender's player has (bit `1 << part`), on a change and
+    /// every 2 s.
+    Has { peer: PeerId, parts: u8 },
+    /// Host: `part` of `net_id`'s death is `by`'s, played by `by`'s game on
+    /// its copy with its own build. `args`: the first `argc` arguments of
+    /// the host's call. An argument the table marks as the player's own is
+    /// read on the playing game.
+    Given {
+        net_id: NetId,
+        by: PeerId,
+        part: u8,
+        argc: u8,
+        args: [f32; 4],
     },
 }
 
@@ -716,6 +800,9 @@ impl RulesState {
     pub const GAME_OVER: u8 = 1;
     pub const HOLD: u8 = 2;
     pub const DOWN: u8 = 4;
+    /// Host: the last released upgrade round ended with the resume count
+    /// ([`Message::UpgradeDone::count`] in the statement).
+    pub const COUNTED: u8 = 8;
 }
 
 /// See [`Message::LureState`].
@@ -1080,6 +1167,24 @@ impl From<[u8; FINE_STATE_BYTES]> for FineState {
     }
 }
 
+/// An enemy of an [`EnemySnapshotFine`] whose `hull_frac` is over 1, which the
+/// 16-bit fraction cannot hold: its fraction as an `f32`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HullOver {
+    pub net_id: NetId,
+    pub hull_frac: f32,
+}
+
+/// The bytes of one part's enemies at most. A [`HullOver`] takes room from them.
+const FINE_PART_BYTES: usize = ENEMIES_PER_PART * FINE_STATE_BYTES;
+/// A [`HullOver`] on the wire at most (a 3-byte varint and an `f32`).
+const HULL_OVER_BYTES: usize = 7;
+
+/// Whether a fraction is over 1 by more than the 16-bit fraction's half step.
+fn hull_over(frac: f32) -> bool {
+    frac > 1.0 + 0.5 / 65535.0
+}
+
 /// See [`Message::EnemySnapshotFine`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnemySnapshotFine {
@@ -1087,31 +1192,82 @@ pub struct EnemySnapshotFine {
     pub part: u8,
     pub parts: u8,
     pub enemies: Vec<FineState>,
+    /// The enemies of this part whose hull is above their spawn's base, at
+    /// full precision (their [`FineState`] holds 1).
+    pub over: Vec<HullOver>,
 }
 
 impl EnemySnapshotFine {
-    /// [`EnemySnapshot::split`] in the fine encoding.
+    /// [`EnemySnapshot::split`] in the fine encoding. A part holds at most
+    /// [`ENEMIES_PER_PART`] enemies, and no more bytes than that many take.
     #[must_use]
     pub fn split(time_ms: u32, enemies: &[EnemyState]) -> Vec<Self> {
-        EnemySnapshot::split(time_ms, enemies)
+        let mut chunks: Vec<(Vec<FineState>, Vec<HullOver>)> = Vec::new();
+        let mut bytes = FINE_PART_BYTES;
+        for e in enemies {
+            let cost = FINE_STATE_BYTES
+                + if hull_over(e.hull_frac) {
+                    HULL_OVER_BYTES
+                } else {
+                    0
+                };
+            if bytes + cost > FINE_PART_BYTES
+                || chunks.last().is_none_or(|c| c.0.len() >= ENEMIES_PER_PART)
+            {
+                if chunks.len() == 255 {
+                    // Past 255 parts extra enemies are dropped (as in
+                    // EnemySnapshot::split).
+                    break;
+                }
+                chunks.push((Vec::new(), Vec::new()));
+                bytes = 0;
+            }
+            bytes += cost;
+            let Some(c) = chunks.last_mut() else { break };
+            c.0.push(FineState(*e));
+            if hull_over(e.hull_frac) {
+                c.1.push(HullOver {
+                    net_id: e.net_id,
+                    hull_frac: e.hull_frac,
+                });
+            }
+        }
+        if chunks.is_empty() {
+            chunks.push((Vec::new(), Vec::new()));
+        }
+        let parts = chunks.len() as u8;
+        chunks
             .into_iter()
-            .map(|s| Self {
-                time_ms: s.time_ms,
-                part: s.part,
-                parts: s.parts,
-                enemies: s.enemies.into_iter().map(FineState).collect(),
+            .enumerate()
+            .map(|(i, (enemies, over))| Self {
+                time_ms,
+                part: i as u8,
+                parts,
+                enemies,
+                over,
             })
             .collect()
     }
 
-    /// The same snapshot as an [`EnemySnapshot`] (values at full precision).
+    /// The same snapshot as an [`EnemySnapshot`], values at full precision.
     #[must_use]
     pub fn into_snapshot(self) -> EnemySnapshot {
+        let over = self.over;
         EnemySnapshot {
             time_ms: self.time_ms,
             part: self.part,
             parts: self.parts,
-            enemies: self.enemies.into_iter().map(|f| f.0).collect(),
+            enemies: self
+                .enemies
+                .into_iter()
+                .map(|f| {
+                    let mut e = f.0;
+                    if let Some(o) = over.iter().find(|o| o.net_id == e.net_id) {
+                        e.hull_frac = o.hull_frac;
+                    }
+                    e
+                })
+                .collect(),
         }
     }
 }
@@ -1187,8 +1343,10 @@ pub struct InstanceStateIx {
 }
 
 impl InstanceStateIx {
-    /// Split a state into parts within [`MAX_MESSAGE`] (built-ins and alarms
-    /// first); an oversized variable becomes `Unsupported(255)`.
+    /// Split a state into parts within [`MAX_MESSAGE`]: alarms and built-ins
+    /// first, the built-ins past the first part's room next, then the
+    /// variables. A receiver takes a state's built-ins from all its parts. An
+    /// oversized variable or built-in becomes `Unsupported(255)`.
     #[must_use]
     pub fn split(
         net_id: NetId,
@@ -1209,13 +1367,25 @@ impl InstanceStateIx {
             builtins: Vec::new(),
             alarms: Vec::new(),
         };
-        let mut parts = vec![Self {
-            builtins,
-            alarms,
-            ..empty(0)
-        }];
+        let mut parts = vec![Self { alarms, ..empty(0) }];
         let mut used = postcard::to_allocvec(&Message::InstanceStateIx(parts[0].clone()))
             .map_or(usize::MAX, |b| b.len());
+        for (i, value) in builtins {
+            let one = postcard::to_allocvec(&(i, &value)).map_or(usize::MAX, |b| b.len());
+            let (value, one) = if one > budget - 16 {
+                (StateValue::Unsupported(255), 4)
+            } else {
+                (value, one)
+            };
+            if used + one > budget {
+                parts.push(empty(parts.len()));
+                used = 24;
+            }
+            used += one;
+            if let Some(p) = parts.last_mut() {
+                p.builtins.push((i, value));
+            }
+        }
         for (ix, value) in vars {
             let one = postcard::to_allocvec(&(ix, &value)).map_or(usize::MAX, |b| b.len());
             let (value, one) = if one > budget - 16 {
@@ -1534,6 +1704,7 @@ mod tests {
                     places: vec![(4, 402, 100.5, -20.0)],
                     place_fills: vec![(0, 7, StateValue::Real(55.0))],
                     replaces: true,
+                    links: vec![(5, 70_001)],
                 }],
             }),
             Message::ShotGone(crate::shots::ShotGone {
@@ -1608,7 +1779,6 @@ mod tests {
                 health_mult: 1.8,
                 damage_mult: 1.0,
                 plays_on_s: 15.0,
-                upgrade_wait_s: 60.0,
                 respawn_s: 45.0,
             },
             Message::RunLeft { peer: p },
@@ -1633,6 +1803,24 @@ mod tests {
                 orb_id: 513,
                 kind: 8,
                 by: p,
+            },
+            Message::OnDeath(OnDeathMsg::Has { peer: p, parts: 3 }),
+            Message::OnDeath(OnDeathMsg::Given {
+                net_id: 65_000,
+                by: p,
+                part: 1,
+                argc: 4,
+                args: [12.0, -0.025, 0.25, 8.0],
+            }),
+            Message::Ready { ready: true },
+            Message::Ready { ready: false },
+            Message::StartCount {
+                round: 7,
+                step: StartStep::Begin,
+            },
+            Message::StartCount {
+                round: 65_535,
+                step: StartStep::Ack,
             },
             Message::RulesState(RulesState {
                 peer: p,
@@ -1766,7 +1954,11 @@ mod tests {
             Message::Pause { by: p },
             Message::Unpause { by: p },
             Message::UpgradeOpen { round: 4 },
-            Message::UpgradeDone { peer: p, round: 4 },
+            Message::UpgradeDone {
+                peer: p,
+                round: 4,
+                count: true,
+            },
             Message::Downed {
                 peer: p,
                 respawn_ms: 45_000,
@@ -1906,6 +2098,7 @@ mod tests {
             part: 0,
             parts: 1,
             enemies: Vec::new(),
+            over: Vec::new(),
         });
         assert_eq!(tag(&fine), 31);
         assert_eq!(
@@ -2044,7 +2237,6 @@ mod tests {
                 health_mult: 1.8,
                 damage_mult: 1.0,
                 plays_on_s: 0.0,
-                upgrade_wait_s: 0.0,
                 respawn_s: 45.0,
             }),
             59
@@ -2060,6 +2252,16 @@ mod tests {
             61
         );
         assert_eq!(tag(&Message::Retired64), 64, "retired");
+        let choosing = Message::UpgradeChoosing {
+            peer: PeerId(1),
+            round: 3,
+        };
+        assert_eq!(tag(&choosing), 69);
+        assert_eq!(choosing.channel(), Channel::Reliable);
+        assert_eq!(
+            Message::decode(&choosing.encode().unwrap()).unwrap(),
+            choosing
+        );
         assert_eq!(
             tag(&Message::PickupShared {
                 orb_id: 1,
@@ -2068,6 +2270,26 @@ mod tests {
             }),
             66
         );
+        assert_eq!(
+            tag(&Message::OnDeath(OnDeathMsg::Has {
+                peer: PeerId(1),
+                parts: 1,
+            })),
+            67
+        );
+        assert_eq!(tag(&Message::Ready { ready: true }), 68);
+        assert_eq!(Message::Ready { ready: false }.channel(), Channel::Reliable);
+        for step in [
+            StartStep::Begin,
+            StartStep::Cancel,
+            StartStep::Go,
+            StartStep::Ack,
+        ] {
+            let m = Message::StartCount { round: 2, step };
+            assert_eq!(tag(&m), 70);
+            assert_eq!(m.channel(), Channel::Reliable);
+            assert_eq!(Message::decode(&m.encode().unwrap()).unwrap(), m);
+        }
         let rules = all.iter().find(|m| matches!(m, Message::RulesState(_)));
         assert_eq!(rules.map(&tag), Some(65));
         assert_eq!(
@@ -2227,6 +2449,57 @@ mod tests {
         assert!((e.quantized().angle - 123.456).abs() > 0.1);
     }
 
+    /// A hull five times its spawn's base crosses the wire exactly beside ones
+    /// at or under the base. Every part fits a message, also with all of them
+    /// above the base.
+    #[test]
+    fn a_hull_above_its_base_crosses_the_fine_snapshot_exactly() {
+        let base = 400.0_f32;
+        let at = |net_id: u16, hull: f32| EnemyState {
+            hull_frac: hull / base,
+            ..enemy(net_id)
+        };
+        let sent = [at(1, 2000.0), at(2, 200.0), at(3, base)];
+        let parts = EnemySnapshotFine::split(5, &sent);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].over.len(), 1, "only the one above its base");
+        let bytes = Message::EnemySnapshotFine(parts[0].clone())
+            .encode()
+            .unwrap();
+        let Message::EnemySnapshot(s) = Message::decode(&bytes).unwrap().normalized() else {
+            unreachable!("normalized to EnemySnapshot")
+        };
+        for (e, d) in sent.iter().zip(&s.enemies) {
+            let (h, got) = (e.hull_frac * base, d.hull_frac * base);
+            assert!(
+                (h - got).abs() <= hull_frac_carry(base),
+                "{h} decoded {got}"
+            );
+        }
+        let many: Vec<_> = (0..1000).map(|i| at(i, 5.0 * base)).collect();
+        let parts = EnemySnapshotFine::split(9, &many);
+        let mut seen = 0;
+        for (i, p) in parts.iter().enumerate() {
+            assert_eq!(
+                (usize::from(p.part), usize::from(p.parts)),
+                (i, parts.len())
+            );
+            assert_eq!(p.over.len(), p.enemies.len());
+            let n = Message::EnemySnapshotFine(p.clone())
+                .encode()
+                .unwrap()
+                .len();
+            assert!(n <= MAX_MESSAGE, "part {i} is {n} bytes");
+            seen += p.enemies.len();
+        }
+        assert_eq!(seen, 1000);
+        assert_eq!(
+            EnemySnapshotFine::split(1, &[]).len(),
+            1,
+            "an empty one still goes"
+        );
+    }
+
     #[test]
     fn compact_values_round_trip_and_shrink() {
         let v = StateValue::Array(vec![
@@ -2263,6 +2536,27 @@ mod tests {
             assert_eq!(Message::decode(&m.encode().unwrap()).unwrap(), m);
         }
         assert_eq!(parts.iter().map(|p| p.vars.len()).sum::<usize>(), 300);
+        // Built-ins past one datagram go on in the next parts, in order.
+        let big = |i: u8| {
+            (
+                i,
+                StateValue::Array(
+                    (0..60)
+                        .map(|k| StateValue::Real(f64::from(k) + 0.1))
+                        .collect(),
+                ),
+            )
+        };
+        let builtins: Vec<(u8, StateValue)> = (0..6).map(big).collect();
+        let parts = InstanceStateIx::split(3, 9, 0, Vec::new(), builtins.clone(), vec![(0, 5)]);
+        assert!(parts.len() > 1, "{} parts", parts.len());
+        for p in &parts {
+            assert!(Message::InstanceStateIx(p.clone()).encode().is_ok());
+            assert_eq!(usize::from(p.parts), parts.len());
+        }
+        let back: Vec<(u8, StateValue)> = parts.iter().flat_map(|p| p.builtins.clone()).collect();
+        assert_eq!(back, builtins);
+        assert_eq!(parts[0].alarms, vec![(0, 5)]);
         let names = StateNames::split(9, 4, (0..500).map(|i| format!("name{i}")).collect());
         assert!(names.len() > 1);
         assert_eq!(
@@ -2341,6 +2635,33 @@ mod tests {
         assert!((wild.angle - 270.0).abs() < 1.5);
         assert!((wild.hull_frac - 1.0).abs() < f32::EPSILON);
         assert_eq!(wild.target, None);
+    }
+
+    #[test]
+    fn a_hull_carried_as_a_fraction_is_off_by_at_most_half_a_step() {
+        // 31 of 160 and 13 of 80 decode as 30.99901 and 12.99947: within half
+        // a step under the host's.
+        for (hull, max, shown) in [(31.0_f32, 160.0_f32, 30.99901_f32), (13.0, 80.0, 12.99947)] {
+            let q = EnemyState {
+                seg: 0,
+                net_id: 1,
+                x: 0.0,
+                y: 0.0,
+                angle: 0.0,
+                hull_frac: hull / max,
+                target: None,
+            }
+            .quantized();
+            let decoded = q.hull_frac * max;
+            assert!((decoded - shown).abs() < 1e-4, "{decoded}");
+            assert!(hull - decoded > 0.0);
+            assert!(
+                hull - decoded <= hull_frac_carry(max),
+                "{} > {}",
+                hull - decoded,
+                hull_frac_carry(max)
+            );
+        }
     }
 
     #[test]

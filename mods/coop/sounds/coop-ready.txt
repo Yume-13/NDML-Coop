@@ -1,0 +1,1 @@
+coop-ready.wav: 16-bit PCM WAV, the format the game loads. Licence: CC0.

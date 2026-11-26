@@ -59,11 +59,23 @@ pub enum Writes {
     /// The player's own objects, its ship, `oPowers` or its own effects:
     /// each game's own (the reason).
     Own(&'static str),
+    /// Enemies, but only a status `world::state::STATUS_OWNED` keeps per
+    /// game (the variable, the reason): each game writes its own value on
+    /// its own enemies or copies, and the generic repair never carries it.
+    StatusOwned(&'static str, &'static str),
+    /// Display only: each screen's own setting applied to what this game
+    /// holds (the reason); nothing reaches the other game and nothing in
+    /// play depends on it.
+    Look(&'static str),
 }
 
 /// Every function the ship's, riders', shields' and `oPowers`' Steps reach
 /// (four calls deep) that writes the instance a `with` block runs on, and
 /// what it writes.
+///
+/// The basis of every `Own` row: on either game the partner's things are
+/// inert `oPlayerAttack` instances (`crate::mirror`, `crate::render`), so a
+/// `with (object)` naming any other object reaches only this game's own.
 pub const SCAN: &[(&str, Writes)] = &[
     ("gml_Script_applyTemporal", Writes::Enemies),
     (
@@ -179,6 +191,258 @@ pub const SCAN: &[(&str, Writes)] = &[
     (
         "gml_Script_wrapPlayer",
         Writes::Own("the ship's own followers moved with it at the arena's edge"),
+    ),
+    // Every instance each `with` below runs on, except in the last two rows
+    // (which reach enemies and trails), is the player's own or one the
+    // function has just made; on either game the partner's ship, shots and
+    // constructs are inert `oPlayerAttack` instances, which no `with (object)`
+    // here names.
+    (
+        "gml_Script_bastionWave",
+        Writes::Own(
+            "the player's own Bastion (`oShieldBastion`) and the `oBurstGrowDamaging` bursts it makes",
+        ),
+    ),
+    (
+        "gml_Script_breakConstructs",
+        Writes::Own(
+            "the player's own constructs and swords breaking (`oConstructMine`, `oConstructTurret`, `oConstructDrone`, `oConstructAlly`, `oBlade`, `oSwordObject`: `hull`)",
+        ),
+    ),
+    (
+        "gml_Script_createAllyTrails",
+        Writes::Own(
+            "the ally's own trails it makes (`oTrailR`, `oTrailL`, held in `trailR`, `trailL`)",
+        ),
+    ),
+    (
+        "gml_Script_createBastion",
+        Writes::Own("the `oShieldBastion` and `oShieldBastionGlow` it makes"),
+    ),
+    (
+        "gml_Script_createBastionPlayer",
+        Writes::Own("the `oShieldBastionGlow` it makes"),
+    ),
+    (
+        "gml_Script_createChargedObjects",
+        Writes::Own("the instance it makes (of the object its caller names)"),
+    ),
+    (
+        "gml_Script_createMine",
+        Writes::Own("the `oConstructMine` it makes"),
+    ),
+    (
+        "gml_Script_createRainbowEffect",
+        Writes::Own("the `oRainbowEffect` it makes"),
+    ),
+    (
+        "gml_Script_createScopes",
+        Writes::Own("the `oScope` sights it makes"),
+    ),
+    (
+        "gml_Script_createShieldObjects",
+        Writes::Own(
+            "the shield objects it makes (`oShield`, `oShieldHalo`, `oShieldAmp`, `oShieldReflect`, `oShieldTemporal`, `oShieldWarp`, `oShieldHelix`, `oShieldSiphon`, `oShieldShockwave`, `oShieldWeaponized`, their indicators, glows and controllers)",
+        ),
+    ),
+    (
+        "gml_Script_deployAlly",
+        Writes::Own(
+            "the `oConstructAllyStandard` it makes and the player's own allies (`instance_find(oConstructAllyStandard)`)",
+        ),
+    ),
+    (
+        "gml_Script_deployDrone",
+        Writes::Own("the `oConstructDrone` it makes and the player's own drones"),
+    ),
+    (
+        "gml_Script_deploySwarm",
+        Writes::Own("the `oConstructSwarm` it makes"),
+    ),
+    (
+        "gml_Script_deployTurret",
+        Writes::Own("the `oConstructTurret` it makes"),
+    ),
+    (
+        "gml_Script_dischargeSpawn",
+        Writes::Own("the `oChain` lightning it makes"),
+    ),
+    (
+        "gml_Script_dronePursuitPositions",
+        Writes::Own("the player's own drones (`instance_find(oConstructDrone)`)"),
+    ),
+    (
+        "gml_Script_droneWrap",
+        Writes::Own(
+            "the player's own drones and allies (`oConstructDrone`, `oConstructAllyStandard`) moved with it at the arena's edge",
+        ),
+    ),
+    (
+        "gml_Script_hyperchargeThings",
+        Writes::Own(
+            "the colour of the player's own constructs, swords and Bastion (`instance_find` over `oConstructMine`, `oConstructTurret`, `oConstructDrone`, `oConstructAlly`, `oConstructSwarm`, `oSwordObject`; `oShieldBastion`) and a sword's own trail",
+        ),
+    ),
+    (
+        "gml_Script_mgmtTemporaryCloneSwords@swordManagement@swordManagement",
+        Writes::Own("the `oSwordObject` clones it makes"),
+    ),
+    (
+        "gml_Script_orbWrap",
+        Writes::Own(
+            "the player's own Discord orbs (`oDiscordOrb`) moved with it at the arena's edge",
+        ),
+    ),
+    (
+        "gml_Script_playerBlink",
+        Writes::Own("the ship's own blink effects it makes and its reticle (`oBlinkReticle`)"),
+    ),
+    (
+        "gml_Script_playerPhantomStrike",
+        Writes::Own(
+            "the `oGhost`s `spawnGhost` makes for it and the `oBurstGrow` effects it makes",
+        ),
+    ),
+    (
+        "gml_Script_pressStabilize",
+        Writes::Own("the `oLanceEffect`, `oCelestialSurge` and `oBurstThrust` it makes"),
+    ),
+    (
+        "gml_Script_pressStrafe",
+        Writes::Own("the ship's reticle (`oBlinkReticle`) and the `oBurstThrustDamaging` it makes"),
+    ),
+    (
+        "gml_Script_refreshLeviathanBody",
+        Writes::Own("the ship's own Leviathan segments (`oPlayerSegment`)"),
+    ),
+    (
+        "gml_Script_releaseShoot",
+        Writes::Own("the ship's own `alarm` (`with (oPlayer)`)"),
+    ),
+    (
+        "gml_Script_resetLeafOnTheWind",
+        Writes::Own("the player's own Leaf on the Wind effect (`oLeaf`)"),
+    ),
+    (
+        "gml_Script_retaliationShield",
+        Writes::Own("the `oBurstRetaliate` and `oRetaliateBurst` it makes"),
+    ),
+    (
+        "gml_Script_reticleControl",
+        Writes::Own(
+            "the player's own Warp targeting (`oWarpTargetController`, `oWarpTarget`, `oWarpCircle`)",
+        ),
+    ),
+    (
+        "gml_Script_shieldedConstructsCount",
+        Writes::Own("`oPowers`' counts of the player's own shielded constructs"),
+    ),
+    (
+        "gml_Script_shoot3",
+        Writes::Own("the shot it makes (`instance_create` of the weapon's projectile)"),
+    ),
+    (
+        "gml_Script_shootSpecialCases2",
+        Writes::Own("the `oTorrentPulse` it makes"),
+    ),
+    (
+        "gml_Script_showPlayerEffects",
+        Writes::Own(
+            "the visibility of the player's own effects (`oForceArmor`, `oPlayerSegment`, `oArmorStack`, `oLance`, `oScope`, `oBlinkReticle`, `oLeaf`, `oWarpathStack`, `oSkirmishBoost`, `oAegis`, `oCalibrate`, `oCalibrateCenter`, `oBladeAttached`, `oPlayerGlow`, `oSanctuaryEffect`, `oDyingStarEffect`, `oCausticBarrier`, `oThermalLanceCharged` and its charge effects, `oThermalLanceCurl`, `oVortexCharge`, `oCharge`, `oMaelstrom`, `oPlayerVisibility`, `oSwordObject`)",
+        ),
+    ),
+    (
+        "gml_Script_spawnDynamicTrail",
+        Writes::Own("the `oDynamicTrail` it makes"),
+    ),
+    (
+        "gml_Script_spawnDynamicTrailBlade",
+        Writes::Own("the `oBladeTrail` it makes"),
+    ),
+    (
+        "gml_Script_spawnFadeEffect",
+        Writes::Own("the `oFlash` it makes"),
+    ),
+    (
+        "gml_Script_spawnGhost",
+        Writes::Own("the `oGhost` it makes"),
+    ),
+    (
+        "gml_Script_spawnHitPulsePlayer",
+        Writes::Own("the `oHitFlash` it makes"),
+    ),
+    (
+        "gml_Script_spawnMaelstrom",
+        Writes::Own("the `oMaelstrom` it makes (held in `maelstromLarge`)"),
+    ),
+    (
+        "gml_Script_spawnPlayerEffect",
+        Writes::Own("the `oBurstGrowAngle` it makes"),
+    ),
+    (
+        "gml_Script_spawnRailgunMuzzleShard",
+        Writes::Own("the `oShardDamaging` it makes"),
+    ),
+    (
+        "gml_Script_swordSetROF",
+        Writes::Own("the player's own swords (`oSwordObject`)"),
+    ),
+    (
+        "gml_Script_swordsAttackCommand",
+        Writes::Own("the player's own swords (`oSwordObject`)"),
+    ),
+    (
+        "gml_Script_toggleFormations",
+        Writes::Own("`oPowers`' and the player's own drones' formation (`oConstructDrone`)"),
+    ),
+    (
+        "gml_Script_triggerGalvanicOutburst",
+        Writes::Own("the `oChain` lightning it makes"),
+    ),
+    (
+        "gml_Script_triggerOutrageModule",
+        Writes::Own("the player's own swords (`oSwordObject`)"),
+    ),
+    (
+        "gml_Script_triggerRebuke",
+        Writes::Own("the player's own armour stacks (`oArmorStack`) and the `oBurstGrow` it makes"),
+    ),
+    (
+        "gml_Script_triggerRetribution",
+        Writes::Own(
+            "the player's own mine (`instance_find(oConstructMine)`) and the `oConstructMine` it makes",
+        ),
+    ),
+    (
+        "gml_Script_triggerSalvoRepeat",
+        Writes::Own("`oPowers`' salvo state"),
+    ),
+    (
+        "gml_Script_triggerScorchingWake",
+        Writes::Own("the `oScorchingWake` it makes"),
+    ),
+    (
+        "gml_Script_triggerShieldBreakEffects",
+        Writes::Own(
+            "the effects it makes (`oWarpTarget`, `oWarpCircle`, `oBurstGrow`, one of an object chosen at run time)",
+        ),
+    ),
+    (
+        "gml_Script_triggerTempestBreak",
+        Writes::Own("the `oChain` lightning it makes"),
+    ),
+    (
+        "gml_Script_stopSatFireShooting",
+        Writes::StatusOwned(
+            "satFireHits",
+            "every enemy's Saturation Fire count reset as the player stops shooting (`with (oSolid)`)",
+        ),
+    ),
+    (
+        "gml_Script_updateJetTrailVisibility",
+        Writes::Look(
+            "each screen's own display setting (jet trails): shows or hides every `oTrail` this game holds, enemies' and copies' included; nothing reaches the other game and nothing in play depends on it (the partner's own trails are proxies here, so they follow the owner's setting, not the viewer's)",
+        ),
     ),
 ];
 
@@ -671,5 +935,25 @@ mod tests {
             .map(|(f, _)| *f)
             .collect();
         assert_eq!(family, vec![APPLY_TEMPORAL]);
+    }
+
+    /// A row that writes enemies but only a per-game owned status stands
+    /// only while `world::state` keeps that status per game.
+    #[test]
+    fn status_owned_rows_are_owned_statuses() {
+        let rows: Vec<&str> = SCAN
+            .iter()
+            .filter_map(|(_, w)| match w {
+                Writes::StatusOwned(v, _) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, vec!["satFireHits"]);
+        for v in rows {
+            assert!(
+                crate::world::state::status_owned(v),
+                "{v} is no longer in STATUS_OWNED: its SCAN row is then an area effect on enemies to classify again"
+            );
+        }
     }
 }

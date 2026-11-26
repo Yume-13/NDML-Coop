@@ -51,13 +51,9 @@ pub const CHECK_DESTROY: [&str; 3] = [
     "gml_Script_checkDestroyNoExplosion",
 ];
 /// What a death runs that belongs to the host's game (boss drops and run
-/// save, achievements, on-kill procs). Skipped on a client while a copy dies.
-pub const HOST_DEATH_ONLY: [&str; 4] = [
-    "gml_Script_bossDrops",
-    "gml_Script_getCheevo",
-    "gml_Script_procEffectsOnDestroy",
-    "gml_Script_spontaneousGeneration",
-];
+/// save, achievements). Skipped on a client while a copy dies. The on-kill
+/// procs follow the on-death table instead (`crate::damage::fx::ON_DEATH`).
+pub const HOST_DEATH_ONLY: [&str; 2] = ["gml_Script_bossDrops", "gml_Script_getCheevo"];
 /// The wave director's alarms (1 wave tick, 2 threat, 3 heist train, 4 black
 /// holes and comets, 7 Hostile Universe, 8 Serpentine Drift). Skipped on a
 /// client; skipped alarms don't re-arm themselves.
@@ -77,12 +73,6 @@ pub const CREATE_EXPLOSION: &str = "gml_Script_createExplosion";
 /// on the joining side (which runs it).
 pub const SERPENT_CHAIN: &str = "gml_Object_oSerpent_Other_11";
 
-/// Asteroid Steps, which destroy an asteroid once `hull <= 0`; a client
-/// holds its copies' hull above 0 here.
-pub const ASTEROID_STEPS: [&str; 2] = [
-    "gml_Object_oAsteroid_Step_0",
-    "gml_Object_oAsteroidSmall_Step_0",
-];
 /// Instance variables.
 pub mod var {
     pub const RARITY: &str = "rarity";
@@ -103,6 +93,10 @@ pub mod var {
     pub const BUFFER: &str = "buffer";
     /// `oEnemyPortal`: the announced enemy object (size) and its rarity (colour).
     pub const ENEMY_TYPE: &str = "enemyType";
+    /// An enemy beam's or charge-up's shooter (`oEnemyBeamFront_Step_0`
+    /// aims it along `shooter.image_angle`; `enemyChargeUp` sets it on its
+    /// `chargeUpObject`): what a wind-up follows.
+    pub const SHOOTER: &str = "shooter";
 }
 
 /// Built-in variables (through the runner's getters and setters).

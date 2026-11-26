@@ -31,7 +31,7 @@
 //!   or `KillRefused`); a copy refused at 0 is not claimed again until the
 //!   host's hull rises.
 //! * [`HostDamage`]: the host's ledger and kill verdicts.
-//! * [`audit`]: an independent count of every hull write (off in this build).
+//! * [`audit`]: an independent count of every hull write (off).
 //! * [`glue`]: hooks and game calls.
 
 #![forbid(unsafe_code)]
@@ -45,7 +45,7 @@ pub mod status_cause;
 use std::collections::HashMap;
 
 use ndml_net::damage::{EPS, Ledger, Reporter};
-use ndml_net::msg::{DamageReport, DespawnCause, Message, NetId, PeerId};
+use ndml_net::msg::{DamageReport, DespawnCause, Message, NetId, PeerId, hull_frac_carry};
 
 /// A copy at `hull <= 0` for this many frames (the host's with hull) is
 /// "stuck" on the client.
@@ -108,12 +108,12 @@ struct ResyncWait {
 /// The shared damage switches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DamageSettings {
-    /// The independent count (client; off in this build).
+    /// The independent count (client; off).
     pub audit: bool,
 }
 
 impl DamageSettings {
-    /// Kill effects for deaths credited to a partner ([`fx::KILLER_BUILD`]): off.
+    /// The kill-effects counts (contested kills, [`fx::HostKills`]): off.
     #[must_use]
     pub const fn kill_fx_on() -> bool {
         false
@@ -149,6 +149,9 @@ pub struct ClientCounts {
     /// Measurement events (frames where a copy lost hull) and their sum.
     pub drops: u64,
     pub reported: f64,
+    /// Copies of an object that regains hull whose view reached 0: not
+    /// predicted dead here, left to the host's word.
+    pub heal_held: u64,
     /// Copies whose view reached 0 here.
     pub claims: u64,
     /// Of those, copies that died here through the game's path.
@@ -291,6 +294,13 @@ pub struct ClientDamage {
     no_claim: HashMap<NetId, u64>,
     /// After a resync, until its spawns are in: see [`Self::resync`].
     resync_wait: Option<ResyncWait>,
+    /// Copies whose view reached 0 held for the host's word (`host_word`;
+    /// counted once each).
+    heal_held: std::collections::HashSet<NetId>,
+    /// Enemies whose claim the host refused above 0: their next kill shows
+    /// at the host's word, never predicted here again, so one enemy cannot
+    /// die twice on the joining screen.
+    host_word: std::collections::HashSet<NetId>,
     /// Kills claimed here before a resync that sent the enemy again: no copy
     /// while the claim is open; `Some(frame)`: confirmed, held until then.
     held: HashMap<NetId, Option<u64>>,
@@ -494,7 +504,7 @@ impl ClientDamage {
                 self.written.insert(net_id, h);
                 return self.host_dead_out(net_id, h, drop);
             }
-            self.rep.add(net_id, drop);
+            self.rep.add(net_id, drop, host_hull);
             self.counts.drops += 1;
             self.counts.reported += f64::from(drop);
         }
@@ -520,8 +530,28 @@ impl ClientDamage {
                 overkill: true,
             };
         }
-        let dying =
+        let predicted =
             view <= 0.0 && self.rep.unacked(net_id) > EPS && !self.no_claim.contains_key(&net_id);
+        if predicted && self.host_word.contains(&net_id) {
+            // An enemy whose claim the host refused above 0 (`host_word`):
+            // it dies by the host's word, one round trip later, the copy
+            // keeping the host's hull meanwhile; shown dead here once, never
+            // twice.
+            if self.heal_held.insert(net_id) {
+                self.counts.heal_held += 1;
+            }
+            let write = host_hull.max(view);
+            self.written.insert(net_id, write);
+            self.zero_since.remove(&net_id);
+            return TickOut {
+                write,
+                drop,
+                dying: false,
+                remove: false,
+                overkill: false,
+            };
+        }
+        let dying = predicted;
         if dying {
             self.dying.insert(
                 net_id,
@@ -548,6 +578,14 @@ impl ClientDamage {
             dying,
             remove: false,
             overkill: false,
+        }
+    }
+
+    /// A despawn ends the enemy's holds for the host's word.
+    fn note_despawn(&mut self, msg: &Message) {
+        if let Message::Despawn { net_id, .. } = msg {
+            self.heal_held.remove(net_id);
+            self.host_word.remove(net_id);
         }
     }
 
@@ -614,6 +652,7 @@ impl ClientDamage {
         self.written.remove(&net_id);
         self.zero_since.remove(&net_id);
         self.host_dead.remove(&net_id);
+        self.heal_held.remove(&net_id);
         let Some(d) = self.dying.remove(&net_id) else {
             return false;
         };
@@ -637,6 +676,7 @@ impl ClientDamage {
 
     /// A host message about damage or enemy lifetimes.
     pub fn on_message(&mut self, me: PeerId, msg: &Message) {
+        self.note_despawn(msg);
         match msg {
             Message::DamageAck(a) => self.rep.on_ack(me, a),
             // A refusal names its claim; one of an older claim than the
@@ -667,9 +707,7 @@ impl ClientDamage {
                 } else {
                     false
                 };
-                if *hull <= 0.0 {
-                    self.no_claim.insert(*net_id, self.frame);
-                }
+                self.after_refusal(*net_id, *hull);
                 // The host keeps what it applied: the total stays, the claim
                 // is over.
                 self.rep.unclaim(*net_id);
@@ -795,6 +833,18 @@ impl ClientDamage {
         self.zero_since.clear();
         self.resync_wait = None;
         self.held.clear();
+        self.heal_held.clear();
+        self.host_word.clear();
+    }
+
+    /// After a refusal: one at 0 is not claimed again until the host's hull
+    /// rises; one above 0 dies here only at the host's word (`host_word`).
+    fn after_refusal(&mut self, net_id: NetId, hull: f32) {
+        if hull <= 0.0 {
+            self.no_claim.insert(net_id, self.frame);
+        } else {
+            self.host_word.insert(net_id);
+        }
     }
 }
 
@@ -876,6 +926,23 @@ pub struct HostCounts {
     /// Refused enemies that died within 2 s of the refusal (a copy sent
     /// again only to die again).
     pub refused_then_killed: u64,
+    /// Claims whose enemy the reports left above 0 by no more than the
+    /// carrying error ([`HostDamage::carried_short`]): written to 0, kills.
+    pub carried: u64,
+    /// Refusals with the enemy above 0: by more than a crumb (the claimant
+    /// saw less hull than there was), and by under [`CRUMB_REST`] (only
+    /// rounding leaves that; none once [`HostDamage::carried_short`] holds).
+    pub refused_more: u64,
+    pub refused_crumb: u64,
+    /// Claims honoured past a repair the claimer could not have seen
+    /// ([`HostDamage::honour`]): the hull the repairs left, written to 0
+    /// (the lost repair, its own class in the read-back, never a mismatch).
+    pub honoured: u64,
+    pub lost_repair: f64,
+    /// Repairs the host saw (`recordHealing` on an enemy): those the rule
+    /// counts, and those it never does ([`repair_counts`]).
+    pub repairs_counted: u64,
+    pub repairs_uncounted: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -916,8 +983,84 @@ pub struct HostDamage {
     refused_killed_by: HashMap<u16, u64>,
     /// Refusals at `hull <= 0` (alive at 0 by the game's own code), by object.
     refused_zero_by: HashMap<u16, u64>,
+    /// The frame of each enemy's first tick here (its set-up runs then).
+    born: HashMap<NetId, u64>,
+    /// Repairs on each enemy in the last [`HONOUR_CAP_FRAMES`].
+    repairs: HashMap<NetId, Vec<Repair>>,
+    /// An honoured claim's rest, for its read-back ([`Self::applied`]).
+    honoured_rest: HashMap<NetId, f64>,
     frame: u64,
     counts: HostCounts,
+}
+
+/// A repair the host saw: frame, amount, whether the rule counts it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Repair {
+    frame: u64,
+    amount: f64,
+    counted: bool,
+}
+
+/// The honour rule: a claim that would be refused above 0 is honoured when
+/// the hull left is no more than the host's repairs on that enemy within the
+/// claimer's round trip ([`honour_window`]), plus the carrying error. The
+/// window is never more than this many running frames.
+pub const HONOUR_CAP_FRAMES: u64 = 15;
+
+/// The honour window in running frames for a claimer whose round trip is
+/// `rtt` (the link's smoothed RTT; `None` or zero: no repair counts):
+/// `min(ceil(60 * rtt + SNAPSHOT_EVERY) - 1, HONOUR_CAP_FRAMES)`, with
+/// [`crate::world::host::SNAPSHOT_EVERY`] the most a snapshot waits for its
+/// send.
+#[must_use]
+pub fn honour_window(rtt: Option<std::time::Duration>) -> Option<u64> {
+    let rtt = rtt.filter(|r| !r.is_zero())?;
+    #[allow(clippy::cast_precision_loss)] // a small frame count
+    let x = rtt.as_secs_f64() * 60.0 + crate::world::host::SNAPSHOT_EVERY as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole frames, small
+    let w = (x.ceil() as u64).saturating_sub(1);
+    Some(w.min(HONOUR_CAP_FRAMES))
+}
+
+/// The largest single repair the rule counts: a Constructor drone's
+/// (`oConstructorDrone_Alarm_1`: `hull + 25`, capped at `hullMax`).
+pub const HONOUR_REPAIR_MAX: f64 = 25.0;
+
+/// The largest share of the enemy's max hull a counted repair may be: a
+/// larger one is part of the fight.
+pub const HONOUR_REPAIR_SHARE: f64 = 0.25;
+
+/// Frames after an enemy's first tick here in which no repair counts: its
+/// set-up (`scaleEnemyStats`, rarity, the spawner's multipliers) is not a
+/// repair, and a healer can reach it then.
+pub const HONOUR_SETTLE_FRAMES: u64 = 30;
+
+/// Whether one repair of `amount` on an enemy of `hull_max` counts toward
+/// the honour rule (before the set-up and type tests).
+#[must_use]
+pub fn repair_counts(amount: f64, hull_max: f64) -> bool {
+    amount > 0.0 && amount <= HONOUR_REPAIR_MAX && amount <= HONOUR_REPAIR_SHARE * hull_max
+}
+
+/// An honoured claim, for its log line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Honour {
+    /// The hull the claim left, written to 0.
+    pub rest: f64,
+    /// The counted repairs in the window and their sum.
+    pub repairs: usize,
+    pub repaired: f64,
+    /// The window that applied, in running frames ([`honour_window`]).
+    pub window: u64,
+}
+
+/// The repairs on an enemy in the window, for a refusal's log line:
+/// counted (number, sum) and not counted (number).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RepairsSeen {
+    pub counted: usize,
+    pub sum: f64,
+    pub uncounted: usize,
 }
 
 fn by_count(m: &HashMap<u16, u64>) -> Vec<(u16, u64)> {
@@ -928,6 +1071,18 @@ fn by_count(m: &HashMap<u16, u64>) -> Vec<(u16, u64)> {
 
 /// Frames in 2 s (the "refused then killed" window).
 const REFUSED_KILLED_FRAMES: u64 = 120;
+
+/// A refused enemy's rest under this is a crumb: less than any hit takes,
+/// left only by how numbers were carried or rounded.
+pub const CRUMB_REST: f64 = 0.01;
+
+/// The most hull a claim can leave on its enemy that the claimant could not
+/// see: half a step of the snapshot's hull fraction plus the reporter's
+/// noise floor ([`HostDamage::carried_short`]). 0.0022 for a max of 160.
+#[must_use]
+pub fn carry_bound(hull_max: f32) -> f64 {
+    f64::from(hull_frac_carry(hull_max)) + f64::from(EPS)
+}
 
 impl HostDamage {
     /// A fresh host side.
@@ -952,6 +1107,90 @@ impl HostDamage {
             .collect()
     }
 
+    /// A claim `a` left its enemy at `hull_after` (applied, before judging):
+    /// whether that rest is only what carrying the hull to the claimant
+    /// lost, so the glue writes 0 and the kill stands (counted). The bound
+    /// is [`carry_bound`]: the snapshot's 16-bit hull fraction is off by up
+    /// to [`hull_frac_carry`], and the reporter drops changes under [`EPS`].
+    pub fn carried_short(&mut self, a: &Apply, hull_after: f64, hull_max: f32) -> bool {
+        let short = a.claim > 0 && hull_after > 0.0 && hull_after <= carry_bound(hull_max);
+        self.counts.carried += u64::from(short);
+        short
+    }
+
+    /// The host's game repaired `net_id` by `amount` (`recordHealing` with
+    /// the enemy as self): kept for [`HONOUR_CAP_FRAMES`], counted by
+    /// the rule when [`repair_counts`], past the set-up and not `excluded`.
+    pub fn repaired(&mut self, net_id: NetId, amount: f64, hull_max: f64, excluded: bool) {
+        let frame = self.frame;
+        let settled = self
+            .born
+            .get(&net_id)
+            .is_some_and(|b| frame.saturating_sub(*b) >= HONOUR_SETTLE_FRAMES);
+        let counted = settled && !excluded && repair_counts(amount, hull_max);
+        if counted {
+            self.counts.repairs_counted += 1;
+        } else {
+            self.counts.repairs_uncounted += 1;
+        }
+        let v = self.repairs.entry(net_id).or_default();
+        v.retain(|r| frame.saturating_sub(r.frame) <= HONOUR_CAP_FRAMES);
+        v.push(Repair {
+            frame,
+            amount,
+            counted,
+        });
+    }
+
+    /// The repairs on `net_id` within `window` frames ([`honour_window`];
+    /// `None`, no round-trip measure: those within the cap, none counted).
+    #[must_use]
+    pub fn repairs_seen(&self, net_id: NetId, window: Option<u64>) -> RepairsSeen {
+        let mut out = RepairsSeen::default();
+        for r in self.repairs.get(&net_id).into_iter().flatten() {
+            if self.frame.saturating_sub(r.frame) > window.unwrap_or(HONOUR_CAP_FRAMES) {
+                continue;
+            }
+            if r.counted && window.is_some() {
+                out.counted += 1;
+                out.sum += r.amount;
+            } else {
+                out.uncounted += 1;
+            }
+        }
+        out
+    }
+
+    /// A claim `a` left its enemy at `hull_after` (applied, before judging;
+    /// not [`Self::carried_short`]): whether the honour rule makes it a kill
+    /// within `window` ([`honour_window`] of the claimer's round trip). The
+    /// glue then writes 0: the enemy dies by the game's own path as the
+    /// claimer's confirmed kill.
+    pub fn honour(
+        &mut self,
+        a: &Apply,
+        hull_after: f64,
+        hull_max: f32,
+        window: Option<u64>,
+    ) -> Option<Honour> {
+        if a.claim == 0 || hull_after <= 0.0 {
+            return None;
+        }
+        let window = window?;
+        let seen = self.repairs_seen(a.net_id, Some(window));
+        if seen.counted == 0 || hull_after > seen.sum + carry_bound(hull_max) {
+            return None;
+        }
+        self.counts.honoured += 1;
+        self.honoured_rest.insert(a.net_id, hull_after);
+        Some(Honour {
+            rest: hull_after,
+            repairs: seen.counted,
+            repaired: seen.sum,
+            window,
+        })
+    }
+
     /// The glue applied `a`: hull read before and after (`None`: the enemy
     /// is gone here), its max hull and object.
     pub fn applied(&mut self, a: &Apply, read: Option<(f64, f64)>, hull_max: f32, object: u16) {
@@ -966,7 +1205,19 @@ impl HostDamage {
             return;
         };
         let lost = before - after;
-        if (lost - f64::from(a.delta)).abs() > 0.01 {
+        // A claim the glue wrote to 0 ([`Self::carried_short`]) lost its rest
+        // as well: no mismatch (over 0.01 for a max above about 1,200).
+        let extra = lost - f64::from(a.delta);
+        let carried = a.claim > 0 && after <= 0.0 && extra > 0.0 && extra <= carry_bound(hull_max);
+        // An honoured claim's rest, written to 0 ([`Self::honour`]): the
+        // lost repair, counted as its own class.
+        let honoured = self
+            .honoured_rest
+            .remove(&a.net_id)
+            .filter(|r| a.claim > 0 && after <= 0.0 && (extra - r).abs() <= 0.01);
+        if let Some(r) = honoured {
+            self.counts.lost_repair += r;
+        } else if !carried && extra.abs() > 0.01 {
             self.counts.mismatched += 1;
         }
         let acct = self.accts.entry(a.net_id).or_default();
@@ -1012,6 +1263,10 @@ impl HostDamage {
         if hull <= 0.0 {
             self.refused_zero.insert(net_id);
             *self.refused_zero_by.entry(object).or_default() += 1;
+        } else if hull < CRUMB_REST {
+            self.counts.refused_crumb += 1;
+        } else {
+            self.counts.refused_more += 1;
         }
         self.refused_at.insert(net_id, (self.frame, object));
     }
@@ -1056,6 +1311,7 @@ impl HostDamage {
     /// Returns the enemy when this tick counts it stuck.
     pub fn watch(&mut self, net_id: NetId, hull: f32) -> Option<Stuck> {
         let frame = self.frame;
+        self.born.entry(net_id).or_insert(frame);
         if hull > 0.0 {
             self.refused_zero.remove(&net_id);
         }
@@ -1088,6 +1344,9 @@ impl HostDamage {
         self.pending.remove(&net_id);
         self.refused_zero.remove(&net_id);
         self.objects.remove(&net_id);
+        self.born.remove(&net_id);
+        self.repairs.remove(&net_id);
+        self.honoured_rest.remove(&net_id);
         if let Some((at, object)) = self.refused_at.remove(&net_id)
             && killed
             && self.frame.saturating_sub(at) <= REFUSED_KILLED_FRAMES
@@ -1131,6 +1390,9 @@ impl HostDamage {
         self.refused_zero.clear();
         self.refused_at.clear();
         self.objects.clear();
+        self.born.clear();
+        self.repairs.clear();
+        self.honoured_rest.clear();
     }
 }
 
@@ -1140,6 +1402,14 @@ mod tests {
     use ndml_net::msg::{AckEntry, DamageAck, DamageEntry};
 
     const ME: PeerId = PeerId(1);
+
+    /// Every status tick is a bracketed hull writer.
+    #[test]
+    fn status_sites_are_hull_writers() {
+        for s in super::glue::STATUS_SITES {
+            assert!(super::glue::AUDIT_SITES.contains(s), "{s}");
+        }
+    }
 
     fn ack(net_id: NetId, applied: f32, hull: f32, frame: u32) -> Message {
         Message::DamageAck(DamageAck {
@@ -1427,6 +1697,103 @@ mod tests {
         let _ = c.begin_frame();
         assert!(c.tick(3, 30, 5.0, Some(-1.0)).dying);
         assert_eq!(c.counts().claims, 2);
+    }
+
+    #[test]
+    fn an_enemy_refused_above_zero_dies_here_only_at_the_hosts_word() {
+        // After a refusal above 0 an enemy's kill waits for the host. One
+        // refused at 0 keeps the no-claim rule. Another enemy is predicted.
+        let mut c = ClientDamage::new();
+        for (net, object) in [(2, 300), (3, 300)] {
+            c.on_message(
+                ME,
+                &Message::EnemySpawn(ndml_net::msg::EnemySpawn::new(
+                    net, object, 0.0, 0.0, 0.0, 600.0,
+                )),
+            );
+            let _ = c.begin_frame();
+            let _ = c.tick(net, 40 + usize::from(net), 100.0, Some(100.0));
+        }
+        let _ = c.begin_frame();
+        assert!(c.tick(2, 42, 100.0, Some(-5.0)).dying, "the first claim");
+        assert!(c.gone(2));
+        let claim = c.rep.last_claim(2);
+        c.on_message(
+            ME,
+            &Message::KillRefused {
+                net_id: 2,
+                peer: ME,
+                hull: 20.0,
+                claim,
+            },
+        );
+        // Made again from the host's word, at its hull, and hit again.
+        c.baseline(2, 20.0);
+        let _ = c.begin_frame();
+        let _ = c.tick(2, 46, 20.0, Some(20.0));
+        let _ = c.begin_frame();
+        let t = c.tick(2, 46, 20.0, Some(-3.0));
+        assert!(!t.dying && (t.write - 20.0).abs() < 1e-3, "{t:?}");
+        let _ = c.begin_frame();
+        assert!(c.tick(3, 43, 100.0, Some(-5.0)).dying, "another enemy");
+    }
+
+    #[test]
+    fn the_first_repair_of_a_type_can_race_the_joining_players_kill_and_comes_back_once() {
+        // An enemy repaired 25 on the host while this player's kill was in
+        // flight: claimed here at 0, refused at 20. No type waits for the
+        // host's word before a refusal, so the first claim goes; the refusal
+        // that follows is plain and once (`host_word`).
+        let mut c = ClientDamage::new();
+        c.clear();
+        c.on_message(
+            ME,
+            &Message::EnemySpawn(ndml_net::msg::EnemySpawn::new(2, 301, 0.0, 0.0, 0.0, 600.0)),
+        );
+        let _ = c.begin_frame();
+        let _ = c.tick(2, 40, 100.0, Some(100.0));
+        let _ = c.begin_frame();
+        assert!(
+            c.tick(2, 40, 100.0, Some(-5.0)).dying,
+            "claimed: no rise seen yet"
+        );
+        assert!(c.gone(2));
+        let claim = c.rep.last_claim(2);
+        c.on_message(
+            ME,
+            &Message::KillRefused {
+                net_id: 2,
+                peer: ME,
+                hull: 20.0,
+                claim,
+            },
+        );
+        c.baseline(2, 20.0);
+        let _ = c.begin_frame();
+        let _ = c.tick(2, 41, 20.0, Some(20.0));
+        let _ = c.begin_frame();
+        assert!(!c.tick(2, 41, 20.0, Some(-3.0)).dying, "once");
+        assert_eq!((c.counts().claims, c.counts().heal_held), (1, 1));
+    }
+
+    #[test]
+    fn an_enemy_that_regains_hull_is_predicted_like_any_other() {
+        // An enemy its drones repair 25 at a time dies here at once like
+        // any enemy; nothing waits for the host's word.
+        let mut c = ClientDamage::new();
+        c.on_message(
+            ME,
+            &Message::EnemySpawn(ndml_net::msg::EnemySpawn::new(
+                21, 367, 0.0, 0.0, 0.0, 2376.0,
+            )),
+        );
+        for h in [100.0, 2376.0, 50.0, 50.0, 75.0] {
+            let _ = c.begin_frame();
+            let _ = c.tick(21, 210, h, None);
+        }
+        let _ = c.begin_frame();
+        assert!(c.tick(21, 210, 75.0, Some(-5.0)).dying);
+        assert_eq!((c.counts().heal_held, c.counts().claims), (0, 1));
     }
 
     fn spawn_msg(net_id: NetId, hull_max: f32) -> Message {
@@ -2024,7 +2391,7 @@ mod tests {
             // The shooter: 2 a frame for the first 15 s; its view at 0 claims
             // once (the claim rule: never again without a hull rise).
             if f < 900 {
-                rep.add(8, 2.0);
+                rep.add(8, 2.0, seen as f32);
             }
             if !claimed && rep.view(8, seen as f32) <= 0.0 {
                 rep.claim_kill(8);
@@ -2109,5 +2476,298 @@ mod tests {
             );
             assert!(n.claims >= 1);
         }
+    }
+
+    #[test]
+    fn a_claim_short_only_by_the_carried_hull_is_a_kill() {
+        // An enemy at 31 of a max of 160 is seen on the joining side as
+        // 30.99901 (the snapshot's 16-bit fraction); a report of that leaves
+        // the host's at 0.00099, which is no hull the claimant could see. The
+        // same for 13 of 80 seen as 12.99947.
+        for (hull, max, reported) in [(31.0_f64, 160.0_f32, 30.99901_f32), (13.0, 80.0, 12.99947)] {
+            let mut h = HostDamage::new();
+            let applies = h.on_report(&DamageReport {
+                by: PeerId(1),
+                entries: vec![DamageEntry {
+                    net_id: 7,
+                    total: reported,
+                    claim: 1,
+                }],
+            });
+            let a = applies[0];
+            let after = hull - f64::from(a.delta);
+            assert!(after > 0.0 && after < 0.002, "{after}");
+            assert!(
+                h.carried_short(&a, after, max),
+                "{after} within {}",
+                carry_bound(max)
+            );
+            h.applied(&a, Some((hull, 0.0)), max, 300);
+            assert_eq!(h.judge(&a, Some(0.0)), Verdict::Confirm);
+            assert_eq!(h.counts().carried, 1);
+            assert_eq!(h.counts().refused, 0);
+            assert_eq!(h.counts().mismatched, 0);
+        }
+        // Not without a claim, and not a rest the claimant could see.
+        let mut h = HostDamage::new();
+        let a = Apply {
+            net_id: 7,
+            by: PeerId(1),
+            delta: 25.0,
+            claim: 1,
+        };
+        assert!(!h.carried_short(&a, 11.0, 160.0));
+        assert!(!h.carried_short(&a, 0.003, 160.0));
+        assert!(!h.carried_short(&Apply { claim: 0, ..a }, 0.0011, 160.0));
+        assert!(!h.carried_short(&a, 0.0, 160.0), "dead already");
+        assert_eq!(h.counts().carried, 0);
+        // A large max carries more: 612,000 gives 4.67. Its rest written to
+        // 0 is no mismatch; the same extra loss without a claim, or past the
+        // bound, still is one.
+        let max = 612_000.0;
+        assert!(
+            (carry_bound(max) - 4.670_0).abs() < 0.001,
+            "{}",
+            carry_bound(max)
+        );
+        let mut h = HostDamage::new();
+        let a = Apply {
+            net_id: 7,
+            by: PeerId(1),
+            delta: 999.0,
+            claim: 1,
+        };
+        assert!(h.carried_short(&a, 1.0, max));
+        h.applied(&a, Some((1000.0, 0.0)), max, 768);
+        assert_eq!(h.counts().mismatched, 0);
+        h.applied(&Apply { claim: 0, ..a }, Some((1000.0, 0.0)), max, 768);
+        assert_eq!(h.counts().mismatched, 1, "no claim");
+        h.applied(&a, Some((1010.0, 0.0)), max, 768);
+        assert_eq!(h.counts().mismatched, 2, "past the bound");
+    }
+
+    /// A host with enemy 4 settled (past [`HONOUR_SETTLE_FRAMES`]).
+    fn settled_host() -> HostDamage {
+        let mut h = HostDamage::new();
+        let _ = h.watch(2, 100.0);
+        frames(&mut h, HONOUR_SETTLE_FRAMES);
+        h
+    }
+
+    fn frames(h: &mut HostDamage, n: u64) {
+        for _ in 0..n {
+            let _ = h.acks(|_| None, true);
+        }
+    }
+
+    /// The honour window at a 170 ms round trip: 12 frames.
+    const W: Option<u64> = Some(12);
+
+    #[test]
+    fn the_honour_window_is_one_round_trip_and_a_snapshot_capped_at_250_ms() {
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        // 170 ms + 33 ms is 12.2 frames: a repair 12 frames before counts,
+        // 13 does not.
+        assert_eq!(honour_window(ms(170)), W);
+        assert_eq!(
+            honour_window(ms(150)),
+            Some(10),
+            "11 frames is 183 ms, past 150 + 33"
+        );
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 12);
+        assert!(
+            h.honour(&JOINING_KILL, 20.0, 600.0, W).is_some(),
+            "just inside"
+        );
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 13);
+        assert_eq!(
+            h.honour(&JOINING_KILL, 20.0, 600.0, W),
+            None,
+            "just outside"
+        );
+        // No measure yet (no link, or none sampled): nothing counts.
+        assert_eq!(honour_window(None), None);
+        assert_eq!(honour_window(ms(0)), None);
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 2);
+        assert_eq!(h.honour(&JOINING_KILL, 20.0, 600.0, None), None);
+        assert_eq!(
+            h.repairs_seen(2, None),
+            RepairsSeen {
+                counted: 0,
+                sum: 0.0,
+                uncounted: 1
+            }
+        );
+        // The cap, 250 ms: a 400 ms round trip still counts no repair over
+        // 15 frames before; one 200 ms before counts, one 300 ms before does
+        // not.
+        let wide = honour_window(ms(400));
+        assert_eq!(wide, Some(HONOUR_CAP_FRAMES));
+        assert_eq!(honour_window(ms(5000)), Some(HONOUR_CAP_FRAMES));
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 12);
+        assert!(
+            h.honour(&JOINING_KILL, 20.0, 600.0, wide).is_some(),
+            "200 ms"
+        );
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 18);
+        assert_eq!(h.honour(&JOINING_KILL, 20.0, 600.0, wide), None, "300 ms");
+    }
+
+    /// The joining player's killing claim on enemy 2 (max 600): the hit
+    /// took 100.
+    const JOINING_KILL: Apply = Apply {
+        net_id: 2,
+        by: PeerId(2),
+        delta: 100.0,
+        claim: 1,
+    };
+
+    #[test]
+    fn a_kill_racing_a_repair_the_claimer_could_not_see_is_honoured() {
+        // +25 on the enemy, the claim 8 frames (136 ms) later left 20 of
+        // 600.
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 8);
+        let got = h.honour(&JOINING_KILL, 20.0, 600.0, W);
+        assert_eq!(
+            got,
+            Some(Honour {
+                rest: 20.0,
+                repairs: 1,
+                repaired: 25.0,
+                window: 12
+            })
+        );
+        // The glue writes 0: the rest is the lost repair, not a mismatch,
+        // and the claim is an ordinary confirmed kill of the claimer's.
+        h.applied(&JOINING_KILL, Some((120.0, 0.0)), 600.0, 301);
+        assert_eq!(h.judge(&JOINING_KILL, Some(0.0)), Verdict::Confirm);
+        assert_eq!(h.confirmed_claim(2), Some(PeerId(2)));
+        let c = h.counts();
+        assert_eq!((c.honoured, c.mismatched, c.refused), (1, 0, 0));
+        assert!((c.lost_repair - 20.0).abs() < 1e-6, "{}", c.lost_repair);
+        // Two repairs in the window add up.
+        let mut h = settled_host();
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 10);
+        h.repaired(2, 25.0, 600.0, false);
+        assert!(h.honour(&JOINING_KILL, 40.0, 600.0, W).is_some());
+    }
+
+    #[test]
+    fn a_kill_short_of_more_than_the_repairs_in_the_window_is_refused() {
+        // No repair at all.
+        let mut h = settled_host();
+        assert_eq!(h.honour(&JOINING_KILL, 20.0, 600.0, W), None);
+        // The repair more than the window before the claim.
+        h.repaired(2, 25.0, 600.0, false);
+        frames(&mut h, 12 + 1);
+        assert_eq!(h.honour(&JOINING_KILL, 20.0, 600.0, W), None);
+        assert_eq!(h.repairs_seen(2, W), RepairsSeen::default());
+        // More left than the repairs gave back.
+        h.repaired(2, 25.0, 600.0, false);
+        assert_eq!(h.honour(&JOINING_KILL, 25.5, 600.0, W), None);
+        assert_eq!(
+            h.repairs_seen(2, W),
+            RepairsSeen {
+                counted: 1,
+                sum: 25.0,
+                uncounted: 0
+            }
+        );
+        // No claim, or already dead: nothing to honour.
+        assert_eq!(
+            h.honour(
+                &Apply {
+                    claim: 0,
+                    ..JOINING_KILL
+                },
+                10.0,
+                600.0,
+                W
+            ),
+            None
+        );
+        assert_eq!(h.honour(&JOINING_KILL, 0.0, 600.0, W), None);
+        // The rest written off without an honour is still a mismatch.
+        h.applied(&JOINING_KILL, Some((120.0, 0.0)), 600.0, 301);
+        let c = h.counts();
+        assert_eq!((c.honoured, c.mismatched), (0, 1));
+        assert!(c.lost_repair.abs() < 1e-9);
+    }
+
+    #[test]
+    fn refills_set_up_rises_and_bosses_are_never_honoured() {
+        // A phase refill: one rise past the largest repair.
+        let mut h = settled_host();
+        h.repaired(2, 286.0, 9000.0, false);
+        assert_eq!(h.honour(&JOINING_KILL, 10.0, 9000.0, W), None);
+        // A repair that is a large share of the enemy (25 of 60).
+        h.repaired(2, 25.0, 60.0, false);
+        assert_eq!(h.honour(&JOINING_KILL, 10.0, 60.0, W), None);
+        // A boss, or a boss's part.
+        h.repaired(2, 25.0, 30_000.0, true);
+        assert_eq!(h.honour(&JOINING_KILL, 10.0, 30_000.0, W), None);
+        assert_eq!(
+            h.repairs_seen(2, W),
+            RepairsSeen {
+                counted: 0,
+                sum: 0.0,
+                uncounted: 3
+            }
+        );
+        // A rise in its set-up frames: enemy 5, just seen.
+        let _ = h.watch(5, 50.0);
+        frames(&mut h, HONOUR_SETTLE_FRAMES - 1);
+        h.repaired(5, 25.0, 600.0, false);
+        assert_eq!(
+            h.honour(
+                &Apply {
+                    net_id: 5,
+                    ..JOINING_KILL
+                },
+                10.0,
+                600.0,
+                W
+            ),
+            None
+        );
+        // Never seen ticking here: no set-up known, never counted.
+        h.repaired(6, 25.0, 600.0, false);
+        assert_eq!(
+            h.honour(
+                &Apply {
+                    net_id: 6,
+                    ..JOINING_KILL
+                },
+                10.0,
+                600.0,
+                W
+            ),
+            None
+        );
+        let c = h.counts();
+        assert_eq!(
+            (c.repairs_counted, c.repairs_uncounted, c.honoured),
+            (0, 5, 0)
+        );
+        // Gone: its repairs go with it.
+        h.repaired(2, 25.0, 600.0, false);
+        h.gone(2, true, true);
+        let _ = h.watch(2, 100.0);
+        assert_eq!(h.repairs_seen(2, W), RepairsSeen::default());
+        assert!(repair_counts(25.0, 100.0) && !repair_counts(25.0, 99.0));
+        assert!(!repair_counts(25.5, 1000.0) && !repair_counts(0.0, 1000.0));
     }
 }

@@ -33,7 +33,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
@@ -43,7 +43,7 @@ use super::layout::{self, MenuGeom, RunStyle};
 use super::menu::{self, Route, Saved};
 use super::page::{Effect, PageId, PageView, RowId};
 use super::prefs;
-use super::run::{LinkEvent, RunFacts, RunUi};
+use super::run::{RunFacts, RunUi};
 use super::style::{Font, Frame, Measure, Op, TextOp, color};
 use super::text::{self, en};
 use crate::Shared;
@@ -113,6 +113,14 @@ pub struct UiBuiltins {
     pub var_get: Option<Builtin>,
     pub array_get: Option<Builtin>,
     pub array_length: Option<Builtin>,
+    /// `audio_sound_pitch` (the cues' notes).
+    pub pitch: Option<Builtin>,
+    /// The sound folder's files into the game (`make_cue_sounds`).
+    pub buffer_create: Option<Builtin>,
+    pub buffer_delete: Option<Builtin>,
+    pub buffer_from_base64: Option<Builtin>,
+    pub buffer_sound: Option<Builtin>,
+    pub sound_length: Option<Builtin>,
 }
 
 /// Everything the UI resolves at init.
@@ -135,14 +143,141 @@ pub struct UiHandles {
     pub menu_fade: Option<Variable>,
     pub keys: Keys,
     pub play: Option<Script>,
+    /// `playNoStop(snd, vol)`: `play` that leaves the asset's other voices on.
+    pub play_no_stop: Option<Script>,
+    /// `confirmMenu`: Game Start pressed for the player once per link.
+    pub confirm_menu: Option<Script>,
     pub text_box: Option<Script>,
     pub input_pressed: Option<Script>,
     pub pad_pressed: Option<Script>,
     pub b: UiBuiltins,
     assets: Mutex<BTreeMap<&'static str, Option<Value>>>,
+    /// The cues' notes still to play (`play_cue`, `cue_tick`).
+    cues: Mutex<super::cues::Queue>,
+    /// Something is in `cues` (the per-frame tick's fast path).
+    cues_pending: AtomicBool,
+    /// The sound folder's files, until `make_cue_sounds` hands them to the game.
+    cue_files: Mutex<super::cue_files::Loaded>,
+    /// The game's sounds made from them, by cue file name.
+    file_sounds: Mutex<BTreeMap<&'static str, Value>>,
+    /// `make_cue_sounds` ran.
+    cue_files_made: AtomicBool,
+    /// The partner-ready sound's hold-off (`cues::READY_SOUND_HOLD_OFF`).
+    ready_hold_off: Mutex<super::cues::ReadyHoldOff>,
     /// Draws in a row where each font global was not a font.
     font_misses: [AtomicU32; 8],
 }
+
+/// The sound folder (`ndml/coop/sounds/`), made and read at the mod's start.
+fn read_cue_files(ctx: &ModContext) -> super::cue_files::Loaded {
+    let root = ctx.config_dir().parent().unwrap_or(ctx.config_dir());
+    let dir = root.join("coop").join(super::cue_files::FOLDER);
+    let loaded = super::cue_files::load(&dir);
+    log::info!(
+        "co-op sounds: the sound folder {} ({} of {} cue files read)",
+        crate::game::shown_path(&dir),
+        loaded.files.len(),
+        super::cue_files::names().len()
+    );
+    for l in &loaded.lines {
+        log::info!("co-op sounds: {l}");
+    }
+    loaded
+}
+
+/// The first menu frame: each sound-folder file becomes a game sound. A file
+/// the game refuses is logged, and its cue keeps its notes.
+fn make_cue_sounds(call: &Call<'_>, s: &Shared) {
+    if s.ui.cue_files_made.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let files = std::mem::take(
+        &mut s
+            .ui
+            .cue_files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .files,
+    );
+    let valid = |v: &Value| match v {
+        Value::Ref(_) => true,
+        other => other.as_f64().is_some_and(|x| x >= 0.0),
+    };
+    // At most `MAX_BYTES`: exact as a double.
+    #[allow(clippy::cast_precision_loss)]
+    let num = |x: usize| Value::Real(x as f64);
+    for (name, f) in files {
+        let w = f.wav;
+        log::info!(
+            "co-op sounds: {name}.wav into the game ({} bytes)",
+            f.bytes.len()
+        );
+        // A fixed buffer of the file's size: `audio_create_buffer_sound` refuses
+        // a growing one.
+        let made = super::cue_files::buffer_sound_steps(
+            || {
+                call_b(
+                    call,
+                    s.ui.b.buffer_create,
+                    &[num(f.bytes.len()), BUFFER_FIXED.into(), 1.0.into()],
+                )
+                .filter(valid)
+            },
+            |buf| {
+                call_b(
+                    call,
+                    s.ui.b.buffer_from_base64,
+                    &[
+                        buf.clone(),
+                        super::cue_files::base64(&f.bytes).into(),
+                        0.0.into(),
+                    ],
+                )
+                .is_some()
+            },
+            |buf| {
+                let fmt = if w.bits == 16 { BUFFER_S16 } else { BUFFER_U8 };
+                call_b(
+                    call,
+                    s.ui.b.buffer_sound,
+                    &[
+                        buf.clone(),
+                        fmt.into(),
+                        Value::Real(f64::from(w.rate)),
+                        num(w.data_offset),
+                        num(w.data_len),
+                        Value::Real(f64::from(w.channels - 1)),
+                    ],
+                )
+                .filter(valid)
+            },
+            |buf| {
+                let _ = call_b(call, s.ui.b.buffer_delete, &[buf]);
+            },
+        );
+        match made {
+            Ok(snd) => {
+                let len = call_b(call, s.ui.b.sound_length, std::slice::from_ref(&snd))
+                    .and_then(|v| v.as_f64());
+                log::info!(
+                    "co-op sounds: {name}.wav is the game's sound {snd:?} ({len:?} s): it plays as its cue"
+                );
+                s.ui.file_sounds
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name, snd);
+            }
+            Err(why) => log::info!(
+                "co-op sounds: {name}.wav not taken by the game ({why}); the built-in cue plays"
+            ),
+        }
+    }
+}
+
+/// `buffer_fixed` (a buffer type), `buffer_u8`, `buffer_s16` (data types).
+const BUFFER_FIXED: f64 = 0.0;
+const BUFFER_U8: f64 = 1.0;
+const BUFFER_S16: f64 = 4.0;
 
 /// Draws without a font before the warning (a few seconds at 60 frames).
 const FONT_WARN_DRAWS: u32 = 600;
@@ -150,13 +285,49 @@ const FONT_WARN_DRAWS: u32 = 600;
 /// Asset names looked up at runtime.
 mod asset {
     pub const MOVE: &str = "cursorMove";
-    pub const SELECT: &str = "cursorSelect";
+    pub const SELECT: &str = super::super::cues::SELECT;
     /// The hint bar `drawTextBox` draws.
     pub const TEXT_BOX: &str = "sTutorialBarWide";
     /// The backdrop Settings draws behind its items.
     pub const GRADIENT: &str = "sGUIGradient";
     pub const WAVE_ALERT: &str = "oWaveAlert";
     pub const MENU_CURSOR: &str = "oMenuCursor2";
+    /// The high-score name entry and table after a run.
+    pub const NAME_ENTRY: &str = "oHighscoreEntry";
+    pub const SCORE_TABLE: &str = "oHighscoresDynamic";
+}
+
+impl UiBuiltins {
+    fn resolve(ctx: &ModContext) -> Self {
+        let b = |n| game::builtin(ctx, n);
+        Self {
+            set_font: b("draw_set_font"),
+            get_font: b("draw_get_font"),
+            font_exists: b("font_exists"),
+            kb_pressed: b("keyboard_check_pressed"),
+            kb_down: b("keyboard_check"),
+            mouse_x: b("device_mouse_x_to_gui"),
+            mouse_y: b("device_mouse_y_to_gui"),
+            point_in_rect: b("point_in_rectangle"),
+            alarm_get: b("alarm_get"),
+            asset_get_index: b("asset_get_index"),
+            instance_exists: b("instance_exists"),
+            sprite_get_height: b("sprite_get_height"),
+            sprite_get_width: b("sprite_get_width"),
+            deck_check: b("steam_utils_is_steam_running_on_steam_deck"),
+            deck_show: b("steam_show_floating_gamepad_text_input"),
+            deck_dismiss: b("steam_dismiss_floating_gamepad_text_input"),
+            var_get: b("variable_instance_get"),
+            array_get: b("array_get"),
+            array_length: b("array_length"),
+            pitch: b("audio_sound_pitch"),
+            buffer_create: b("buffer_create"),
+            buffer_delete: b("buffer_delete"),
+            buffer_from_base64: b("buffer_base64_decode_ext"),
+            buffer_sound: b("audio_create_buffer_sound"),
+            sound_length: b("audio_sound_length"),
+        }
+    }
 }
 
 impl UiHandles {
@@ -164,7 +335,6 @@ impl UiHandles {
     #[must_use]
     pub fn resolve(ctx: &ModContext) -> Self {
         let v = |n| game::var(ctx, n);
-        let b = |n| game::builtin(ctx, n);
         let sc = |n| game::script(ctx, n);
         Self {
             menu: MenuVars {
@@ -214,31 +384,19 @@ impl UiHandles {
                 pad_pause: v("gamepadTogglePause"),
             },
             play: sc("play"),
+            play_no_stop: sc("playNoStop"),
+            confirm_menu: sc(crate::names::CONFIRM_MENU),
             text_box: sc("drawTextBox"),
             input_pressed: sc("inputButtonPressed"),
             pad_pressed: sc("gamepadPressed"),
-            b: UiBuiltins {
-                set_font: b("draw_set_font"),
-                get_font: b("draw_get_font"),
-                font_exists: b("font_exists"),
-                kb_pressed: b("keyboard_check_pressed"),
-                kb_down: b("keyboard_check"),
-                mouse_x: b("device_mouse_x_to_gui"),
-                mouse_y: b("device_mouse_y_to_gui"),
-                point_in_rect: b("point_in_rectangle"),
-                alarm_get: b("alarm_get"),
-                asset_get_index: b("asset_get_index"),
-                instance_exists: b("instance_exists"),
-                sprite_get_height: b("sprite_get_height"),
-                sprite_get_width: b("sprite_get_width"),
-                deck_check: b("steam_utils_is_steam_running_on_steam_deck"),
-                deck_show: b("steam_show_floating_gamepad_text_input"),
-                deck_dismiss: b("steam_dismiss_floating_gamepad_text_input"),
-                var_get: b("variable_instance_get"),
-                array_get: b("array_get"),
-                array_length: b("array_length"),
-            },
+            b: UiBuiltins::resolve(ctx),
             assets: Mutex::new(BTreeMap::new()),
+            cues: Mutex::new(super::cues::Queue::default()),
+            cues_pending: AtomicBool::new(false),
+            cue_files: Mutex::new(read_cue_files(ctx)),
+            file_sounds: Mutex::new(BTreeMap::new()),
+            cue_files_made: AtomicBool::new(false),
+            ready_hold_off: Mutex::new(super::cues::ReadyHoldOff::default()),
             font_misses: Default::default(),
         }
     }
@@ -325,13 +483,137 @@ impl UiHandles {
     }
 }
 
+/// The game's `play(snd, 1)` for a menu sound, as its own menus call it.
 fn play(call: &Call<'_>, s: &Shared, sound: &'static str) {
     let (Some(script), Some(snd)) = (s.ui.play, s.ui.asset(call, sound)) else {
         return;
     };
-    if let Err(e) = call.call_script(script, &[snd.clone(), snd]) {
+    if let Err(e) = call.call_script(script, &[snd, Value::Real(1.0)]) {
         warn_once("ui-play", &format!("co-op UI: play: {e}"));
     }
+}
+
+/// Start `cue`: its file's sound, else its first note now (as `call`'s
+/// instance) and the rest from [`cue_tick`]. Never sent.
+pub(crate) fn play_cue(call: &Call<'_>, s: &Shared, cue: super::cues::Cue, now: Instant) {
+    if cue == super::cues::Cue::PartnerReady {
+        let asked =
+            s.ui.ready_hold_off
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ask(now);
+        if let Err(ago) = asked {
+            log::info!(
+                "co-op UI: the partner-ready sound held back (it played {:.1} s ago)",
+                ago.as_secs_f64()
+            );
+            cue_tick(call, s, now);
+            return;
+        }
+    }
+    let file = super::cue_files::lookup(
+        &s.ui
+            .file_sounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        cue,
+    );
+    if let Some(snd) = file {
+        log::info!(
+            "co-op UI: cue: {} (the sound folder's {}.wav)",
+            cue.name(),
+            cue.file_name()
+        );
+        play_sound(call, s, cue.file_name(), snd, 1.0);
+        cue_tick(call, s, now);
+        return;
+    }
+    log::info!("co-op UI: cue: {}", cue.name());
+    {
+        let mut q = s.ui.cues.lock().unwrap_or_else(PoisonError::into_inner);
+        q.start(cue, now);
+    }
+    s.ui.cues_pending.store(true, Ordering::Relaxed);
+    cue_tick(call, s, now);
+}
+
+/// One frame of a count the caller runs (the run's start): each number's tick
+/// and the go's cue. Returns the view (`None` from the go on) and whether this
+/// frame is the go. A count called off is not handed in.
+pub(crate) fn count_frame(
+    call: &Call<'_>,
+    s: &Shared,
+    count: &mut crate::rules::countdown::Countdown,
+    kind: super::run::CountKind,
+    now: Instant,
+) -> (Option<super::run::CountView>, bool) {
+    use crate::rules::countdown::Step;
+    let step = count.step(now);
+    let view = count.number(now).map(|n| super::run::CountView {
+        kind,
+        number: n,
+        // 0..=1000.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        phase_pm: (count.phase(now) * 1000.0).round() as u16,
+    });
+    let wall = crate::rules::glue::wall_ms();
+    match step {
+        Step::Tick(n) => {
+            log::info!("co-op UI: {} count: {n} at wall {wall} ms", kind.name());
+            play_cue(call, s, super::cues::Cue::Tick(n), now);
+            (view, false)
+        }
+        Step::Go => {
+            log::info!("co-op UI: {} count: go at wall {wall} ms", kind.name());
+            play_cue(call, s, super::cues::Cue::Go, now);
+            (None, true)
+        }
+        Step::Wait => {
+            cue_tick(call, s, now);
+            (view, false)
+        }
+    }
+}
+
+/// The cues' notes due now, each frame from the run tick and the menu tick.
+pub(crate) fn cue_tick(call: &Call<'_>, s: &Shared, now: Instant) {
+    if !s.ui.cues_pending.load(Ordering::Relaxed) {
+        return;
+    }
+    let notes = {
+        let mut q = s.ui.cues.lock().unwrap_or_else(PoisonError::into_inner);
+        let due = q.take_due(now);
+        s.ui.cues_pending.store(!q.is_empty(), Ordering::Relaxed);
+        due
+    };
+    for n in notes {
+        note(call, s, n);
+    }
+}
+
+fn note(call: &Call<'_>, s: &Shared, n: super::cues::Note) {
+    if let Some(snd) = s.ui.asset(call, n.sound) {
+        play_sound(call, s, n.sound, snd, n.pitch);
+    }
+}
+
+/// `snd` (an asset or a sound-folder sound) through `playNoStop(snd, 1)`, at
+/// the player's effects volume.
+fn play_sound(call: &Call<'_>, s: &Shared, label: &str, snd: Value, pitch: f64) {
+    let Some(script) = s.ui.play_no_stop else {
+        return;
+    };
+    let h = match call.call_script(script, &[snd, Value::Real(1.0)]) {
+        Ok(h) => h,
+        Err(e) => {
+            warn_once("ui-cue", &format!("co-op UI: playNoStop: {e}"));
+            return;
+        }
+    };
+    if (pitch - 1.0).abs() > f64::EPSILON {
+        let _ = call_b(call, s.ui.b.pitch, &[h.clone(), pitch.into()]);
+    }
+    let _ = label;
 }
 
 /// The game's menu move sound (a locked row: nothing changes).
@@ -565,18 +847,19 @@ impl<'c, 'a> Painter<'c, 'a> {
         let _ = call_b(self.call, hb.draw_set_valign, &[v.into()]);
     }
 
-    fn text(&self, t: &TextOp) {
+    fn text(&self, t: &TextOp) -> bool {
         self.use_font(t.font);
         self.state(t.color, t.alpha, t.h.gml(), t.v.gml());
         let hb = &self.s.h.b;
         if (t.scale - 1.0).abs() < 1e-6 {
-            let _ = call_b(
+            call_b(
                 self.call,
                 hb.draw_text,
                 &[t.x.into(), t.y.into(), t.text.as_str().into()],
-            );
+            )
+            .is_some()
         } else {
-            let _ = call_b(
+            call_b(
                 self.call,
                 hb.draw_text_transformed,
                 &[
@@ -587,29 +870,33 @@ impl<'c, 'a> Painter<'c, 'a> {
                     t.scale.into(),
                     0.0.into(),
                 ],
-            );
+            )
+            .is_some()
         }
     }
 
-    fn rect(&self, (x1, y1, x2, y2): (f64, f64, f64, f64), c: u32, a: f64, outline: bool) {
+    fn rect(&self, (x1, y1, x2, y2): (f64, f64, f64, f64), c: u32, a: f64, outline: bool) -> bool {
         self.state(c, a, 0.0, 0.0);
-        let _ = call_b(
+        call_b(
             self.call,
             self.s.h.b.draw_rectangle,
             &[x1.into(), y1.into(), x2.into(), y2.into(), outline.into()],
-        );
+        )
+        .is_some()
     }
 
-    fn draw(&self, ops: &[Op], f: Frame) {
+    /// Draws `ops`: `true` when every draw call returned.
+    fn draw(&self, ops: &[Op], f: Frame) -> bool {
+        let mut all = true;
         for op in ops {
-            match op {
+            let ok = match op {
                 Op::Text(t) => self.text(t),
                 Op::TextBox { x, y, text, alpha } => {
                     // drawTextBox sizes the bar with the current font.
                     self.use_font(Font::Small);
                     self.state(color::WHITE, 1.0, 0.0, 0.0);
-                    if let Some(script) = self.s.ui.text_box
-                        && let Err(e) = self.call.call_script(
+                    match self.s.ui.text_box.map(|script| {
+                        self.call.call_script(
                             script,
                             &[
                                 (*x).into(),
@@ -618,8 +905,13 @@ impl<'c, 'a> Painter<'c, 'a> {
                                 (*alpha).into(),
                             ],
                         )
-                    {
-                        warn_once("ui-textbox", &format!("co-op UI: drawTextBox: {e}"));
+                    }) {
+                        Some(Ok(_)) => true,
+                        Some(Err(e)) => {
+                            warn_once("ui-textbox", &format!("co-op UI: drawTextBox: {e}"));
+                            false
+                        }
+                        None => false,
                     }
                 }
                 Op::Rect {
@@ -635,7 +927,7 @@ impl<'c, 'a> Painter<'c, 'a> {
                 Op::Triangle { pts, color, alpha } => {
                     self.state(*color, *alpha, 0.0, 0.0);
                     let [(ax, ay), (bx, by), (cx, cy)] = *pts;
-                    let _ = call_b(
+                    call_b(
                         self.call,
                         self.s.h.b.draw_triangle,
                         &[
@@ -647,20 +939,32 @@ impl<'c, 'a> Painter<'c, 'a> {
                             cy.into(),
                             false.into(),
                         ],
-                    );
+                    )
+                    .is_some()
                 }
                 Op::Sprite(ship) => {
                     self.state(color::WHITE, 1.0, 0.0, 0.0);
-                    let _ = game::draw_sprite(self.call, &self.s.h.b, ship);
+                    game::draw_sprite(self.call, &self.s.h.b, ship).is_some()
                 }
                 Op::Backdrop { y, w, h, alpha } => self.backdrop(*y, *w, *h, *alpha),
-            }
+            };
+            all &= ok;
         }
+        all
     }
 
-    fn backdrop(&self, y: f64, w: f64, h: f64, a: f64) {
+    /// Draws each piece. Returns the pieces whose draw calls all returned.
+    fn draw_groups(&self, groups: &[layout::Group], f: Frame) -> Vec<String> {
+        groups
+            .iter()
+            .filter(|g| self.draw(&g.ops, f))
+            .map(|g| g.part.clone())
+            .collect()
+    }
+
+    fn backdrop(&self, y: f64, w: f64, h: f64, a: f64) -> bool {
         let Some(spr) = self.s.ui.asset(self.call, asset::GRADIENT) else {
-            return;
+            return false;
         };
         let exists = call_b(
             self.call,
@@ -670,7 +974,7 @@ impl<'c, 'a> Painter<'c, 'a> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
         if !exists {
-            return;
+            return false;
         }
         let size = |b| {
             call_b(self.call, b, std::slice::from_ref(&spr))
@@ -681,10 +985,10 @@ impl<'c, 'a> Painter<'c, 'a> {
             size(self.s.ui.b.sprite_get_width),
             size(self.s.ui.b.sprite_get_height),
         ) else {
-            return;
+            return false;
         };
         self.state(color::WHITE, 1.0, 0.0, 0.0);
-        let _ = call_b(
+        call_b(
             self.call,
             self.s.h.b.draw_sprite_ext,
             &[
@@ -698,7 +1002,8 @@ impl<'c, 'a> Painter<'c, 'a> {
                 f64::from(color::WHITE).into(),
                 a.clamp(0.0, 1.0).into(),
             ],
-        );
+        )
+        .is_some()
     }
 }
 
@@ -784,10 +1089,23 @@ pub struct MenuState {
     pub row_ok: bool,
     /// The page's question is in the game's `newGameCheck` dialog.
     pub native_confirm: bool,
+    /// Once per link: off to the new game screen.
+    pub to_new_game: menu::ToNewGame,
+    /// A pre-answered Game Start (`confirm_menu_before`), not yet known taken.
+    pub preanswer_pending: bool,
+    /// That press was taken: the next new game screen visit is guarded.
+    pub preanswered_visit: bool,
     /// The typed text feed.
     pub feed: text::TextFeed,
     pub frames: u64,
     pub started: Option<Instant>,
+}
+
+impl MenuState {
+    /// Whether this visit is pre-answered, taken once at the screen's first frame.
+    pub fn take_preanswered(&mut self) -> bool {
+        std::mem::take(&mut self.preanswered_visit)
+    }
 }
 
 /// The `Back` row in the game's own words.
@@ -954,6 +1272,12 @@ fn apply(call: &Call<'_>, s: &Shared, me: &Instance<'_>, effects: Vec<Effect>) {
                     ],
                 );
             }
+            Effect::SetWild(w) => {
+                // Read at the next run's start and its upgrade screens (`wild_glue`).
+                s.lock().settings.wild_mods = w;
+                log::info!("co-op page: Wild Mods {}", w.key());
+                persist(s, &[("wild_mods", prefs::toml_str(w.key()))]);
+            }
         }
     }
 }
@@ -1010,6 +1334,9 @@ pub(crate) fn menu_create_after(call: &mut Call<'_>, s: &Shared) {
         c.menu.raised = false;
         c.menu.game_max = None;
         c.menu.failed_frames = 0;
+        // A new menu: no visit pending from the last one.
+        c.menu.preanswer_pending = false;
+        c.menu.preanswered_visit = false;
         c.menu.row_ok
     };
     if !row_ok {
@@ -1085,9 +1412,11 @@ pub(crate) fn set_run_pieces(s: &Shared) {
     );
 }
 
-/// From the menu tick (`oMenu_Step_0`, as `oMenu`): the page's refresh.
+/// From the menu tick (`oMenu_Step_0`, as `oMenu`): the sound folder loaded
+/// once, the page refreshed, the move to the new game screen.
 pub(crate) fn menu_tick(call: &Call<'_>, s: &Shared) {
     let Some(me) = call.instance() else { return };
+    make_cue_sounds(call, s);
     let lang = language(call, s);
     {
         let mut c = s.lock();
@@ -1098,6 +1427,60 @@ pub(crate) fn menu_tick(call: &Call<'_>, s: &Shared) {
         c.menu.started.get_or_insert_with(Instant::now);
     }
     sync_rows(&me, s);
+    to_new_game(call, s, &me);
+}
+
+/// Once per link, when [`menu::ToNewGame::due`] and `confirmMenu`'s guards
+/// allow: the page closed and the game's Game Start pressed as `oMenu`. A press
+/// the game did not take (`alarm[1]` not set) is tried again next frame.
+fn to_new_game(call: &Call<'_>, s: &Shared, me: &Instance<'_>) {
+    let dialog = truthy(me, s.ui.menu.new_game_check).unwrap_or(true);
+    let (due, page_open) = {
+        let mut c = s.lock();
+        let linked = c.core.linked();
+        c.menu.to_new_game.observe(linked);
+        let facts = menu::NewGameFacts {
+            linked,
+            greeted: c.core.greeted(),
+            host: c.core.is_host(),
+            picks_in: c.loadout.shares() || !c.loadout.enabled(),
+            busy: dialog
+                || c.page.entry().is_some()
+                || c.page.confirm().is_some()
+                || c.menu.native_confirm,
+        };
+        (c.menu.to_new_game.due(&facts), c.page.open.is_some())
+    };
+    if !due || !guards_ok(call, s, me) {
+        return;
+    }
+    let Some(script) = s.ui.confirm_menu else {
+        warn_once(
+            "ui-to-new-game",
+            "co-op UI: confirmMenu not found; linked players go to the new game screen themselves",
+        );
+        s.lock().menu.to_new_game.spent();
+        return;
+    };
+    if page_open {
+        close_page(me, s);
+    }
+    #[allow(clippy::cast_precision_loss)] // a row number
+    set(me, s.ui.menu.pos, menu::START_ROW as f64);
+    if let Err(e) = me.call_script(script, &[]) {
+        warn_once(
+            "ui-to-new-game",
+            &format!("co-op UI: Game Start for the new link failed ({e}); tried again"),
+        );
+        return;
+    }
+    let leaving = call_b(call, s.ui.b.alarm_get, &[1.0.into()])
+        .and_then(|v| v.as_f64())
+        .is_some_and(|a| a >= 0.0);
+    if leaving {
+        s.lock().menu.to_new_game.spent();
+        log::info!("co-op: linked: off to the new game screen (once per link)");
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)] // a copy of independent flags
@@ -1131,6 +1514,12 @@ pub(crate) fn menu_step2_before(call: &mut Call<'_>, s: &Shared) {
             hover_row11(call, s, &me);
         }
         return;
+    }
+    // A page of eleven rows: row 11 is past the game's hit boxes, as the plain
+    // menu's Exit.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // EXTRA_ROW, a small row
+    if !sn.entry && !sn.native_confirm && sn.rows == menu::EXTRA_ROW as usize {
+        hover_row11(call, s, &me);
     }
     if sn.entry {
         call.skip_original();
@@ -1339,7 +1728,40 @@ pub(crate) fn confirm_menu_before(call: &mut Call<'_>, s: &Shared) -> Option<f64
         confirm_row(call, s, &me, pos);
         return None;
     }
-    match menu::route(sn.coop_row, sn.raised, pos.round() as i64) {
+    let row = pos.round() as i64;
+    // Not where co-op runs are off: that run is solo, and the game asks.
+    let linked = {
+        let c = s.lock();
+        c.core.linked() && c.core.coop_runs_on()
+    };
+    let dialog = truthy(&me, s.ui.menu.new_game_check).unwrap_or(true);
+    // Where a read fails, the game asks its own question (`menu::answer_reads`).
+    let reads = || {
+        let alarm = call_b(call, s.ui.b.alarm_get, &[1.0.into()]).and_then(|v| v.as_f64());
+        let read = menu::answer_reads(crate::loadout_glue::loaded_run_value(call), alarm);
+        if let Err(what) = read {
+            warn_once(
+                "preanswer-reads",
+                &format!(
+                    "co-op: Game Start while linked: {what} cannot be read, so the game asks its own saved-run question"
+                ),
+            );
+        }
+        read.is_ok()
+    };
+    if menu::answer_new_game_question(row, linked, dialog) && guards_ok(call, s, &me) && reads() {
+        // The game's YES path, with no question shown. The game's Game Start
+        // plays the select sound before it asks, and YES plays none.
+        set(&me, s.ui.menu.new_game_check, 1.0);
+        set(&me, s.ui.menu.new_game_check_position, 0.0);
+        play(call, s, asset::SELECT);
+        s.lock().menu.preanswer_pending = true;
+        log::info!(
+            "co-op: Game Start while linked: the saved-run question answered for the player (a co-op run leaves the saved run alone)"
+        );
+        return None;
+    }
+    match menu::route(sn.coop_row, sn.raised, row) {
         Route::Original => None,
         Route::OpenCoop => {
             call.skip_original();
@@ -1362,10 +1784,18 @@ pub(crate) fn confirm_menu_before(call: &mut Call<'_>, s: &Shared) -> Option<f64
     }
 }
 
-/// `confirmMenu` after: put a shifted `pos` back.
+/// `confirmMenu` after: put a shifted `pos` back and note whether a
+/// pre-answered Game Start was taken.
 pub(crate) fn confirm_menu_after(call: &mut Call<'_>, s: &Shared, saved: Option<f64>) {
     if let (Some(pos), Some(me)) = (saved, call.instance()) {
         set(&me, s.ui.menu.pos, pos);
+    }
+    // Taken once the game's fade began (`alarm[1]` set). That visit is then
+    // guarded (`loadout::SavedRunGuard`), and so is one with `alarm[1]` unread.
+    let pending = std::mem::take(&mut s.lock().menu.preanswer_pending);
+    if pending {
+        let alarm = call_b(call, s.ui.b.alarm_get, &[1.0.into()]).and_then(|v| v.as_f64());
+        s.lock().menu.preanswered_visit = menu::answered_start_taken(alarm);
     }
 }
 
@@ -1605,15 +2035,36 @@ pub(crate) fn menu_draw_after(call: &mut Call<'_>, s: &Shared, sw: Swapped) {
         }
     };
     let painter = Painter::new(call, s);
-    let ops: Vec<Op> = match &what {
-        What::Page(v) => layout::page_ops(v, &geom, f, &painter),
-        What::Menu(row11, st) => {
-            layout::menu_extras(&geom, row11, en::COOP_ROW, st.as_deref(), f, &painter)
-        }
-        What::Nothing => Vec::new(),
+    let group = match &what {
+        What::Page(v) => Some(layout::Group {
+            part: format!("page {}", v.title),
+            ops: layout::page_ops(v, &geom, f, &painter),
+        }),
+        What::Menu(row11, st) => Some(layout::Group {
+            part: "coop row".into(),
+            ops: layout::menu_extras(&geom, row11, en::COOP_ROW, st.as_deref(), f, &painter),
+        }),
+        What::Nothing => None,
     };
-    painter.draw(&ops, f);
+    let drawn = painter.draw_groups(group.as_slice(), f);
     painter.finish();
+    // The partner ready on its new game screen: the menu and the page say so.
+    let place = if matches!(what, What::Page(_)) {
+        super::run::ReadyPlace::CoopPage
+    } else {
+        super::run::ReadyPlace::Menu
+    };
+    let (bar, alert) = ready_elsewhere(&mut s.lock(), Some(place));
+    let name = if matches!(what, What::Page(_)) {
+        "the Co-op page"
+    } else {
+        "the main menu"
+    };
+    let on = OnScreen {
+        place: name,
+        before: drawn,
+    };
+    paint_note(call, s, on, bar, alert, None, None);
 }
 
 /// `oController_Draw_64` before: this frame's run UI and the pause relabel.
@@ -1633,7 +2084,7 @@ pub(crate) fn run_draw_before(call: &mut Call<'_>, s: &Shared) -> Swapped {
             return sw;
         }
         for ev in std::mem::take(&mut c.run_events) {
-            c.run_msgs.event(ev, now);
+            c.run_msgs.event(ev);
         }
         let status = c.net.lobby_status();
         let peer = status
@@ -1664,7 +2115,10 @@ pub(crate) fn run_draw_before(call: &mut Call<'_>, s: &Shared) -> Swapped {
             host: c.core.hosting(),
             over: c.core.run_over().is_some(),
         };
-        let ui = c.run_msgs.frame(&facts, sw_cfg, now);
+        let mut ui = c.run_msgs.frame(&facts, sw_cfg, now);
+        let traffic = c.link_log.traffic().filter(|_| linked);
+        super::run::add_traffic(&mut ui, sw_cfg, traffic);
+        add_ready(c, &mut ui);
         c.run_ui = ui.clone();
         ui
     };
@@ -1686,7 +2140,8 @@ pub(crate) fn run_draw_before(call: &mut Call<'_>, s: &Shared) -> Swapped {
     sw
 }
 
-/// `oController_Draw_64` after: restore the pause strings, draw the run UI.
+/// `oController_Draw_64` after: restore the pause strings, draw the run UI and
+/// `partner` (labels, markers, draw-path ships).
 pub(crate) fn run_paint(
     call: &Call<'_>,
     s: &Shared,
@@ -1698,10 +2153,23 @@ pub(crate) fn run_paint(
     if s.ui.text_box.is_none() {
         ui.bars.clear(); // no bar without drawTextBox: said at start-up
     }
-    if partner.is_empty() && ui == RunUi::default() {
-        return;
+    let drawn = run_paint_pieces(call, s, &ui, partner);
+    let _ = drawn;
+}
+
+/// [`run_paint`]'s drawing: the pieces drawn (`layout::Group`).
+fn run_paint_pieces(
+    call: &Call<'_>,
+    s: &Shared,
+    ui: &RunUi,
+    partner: Vec<crate::render::DrawItem>,
+) -> Vec<String> {
+    if partner.is_empty() && *ui == RunUi::default() {
+        return Vec::new();
     }
-    let Some(f) = frame_of(call, s) else { return };
+    let Some(f) = frame_of(call, s) else {
+        return Vec::new();
+    };
     let time_alpha = call
         .instance()
         .and_then(|me| num(&me, s.ui.time_alpha))
@@ -1716,72 +2184,238 @@ pub(crate) fn run_paint(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
         });
-    let (hud_corner, t) = {
+    let (hud_corner, t, table) = {
         let mut c = s.lock();
         let t0 = *c.menu.started.get_or_insert_with(Instant::now);
-        (c.settings.ui.hud_corner, t0.elapsed().as_secs_f64())
+        (
+            c.settings.ui.hud_corner,
+            t0.elapsed().as_secs_f64(),
+            c.end_place == Some(super::run::ReadyPlace::ScoreTable),
+        )
     };
     let pause_rows = if paused { pause_rows(call, s) } else { None };
     let painter = Painter::new(call, s);
-    let mut ops = layout::partner_ops(partner, paused);
-    ops.extend(layout::run_ops(
-        &ui,
+    let n = partner.len();
+    let mut groups = vec![layout::Group {
+        part: format!("partner {n}"),
+        ops: layout::partner_ops(partner, paused),
+    }];
+    groups.retain(|g| !g.ops.is_empty());
+    groups.extend(layout::run_groups(
+        ui,
         RunStyle {
             hud_corner,
             time_alpha,
             wave_alert,
             t,
             paused,
+            table,
             pause_rows,
         },
         f,
         &painter,
     ));
-    painter.draw(&ops, f);
+    let mut drawn = painter.draw_groups(&groups, f);
     painter.finish();
+    if ui.pause.is_some() {
+        // The pause screen's rows are the game's own draw of the mod's labels.
+        drawn.push("pause rows".into());
+    }
+    drawn
 }
 
 /// A note outside the run shows only with `drawTextBox`.
-fn shown_note(note: Option<&str>, text_box: bool) -> Option<&str> {
+fn shown_note(note: Option<super::run::Bar>, text_box: bool) -> Option<super::run::Bar> {
     note.filter(|_| text_box)
 }
 
-/// A note bar and the link line on a screen outside the run (the loadout
-/// screen), as the run's bars; either may be absent.
+/// A note bar, the partner's Ready alert and the link line outside the run.
 pub(crate) fn paint_note(
     call: &Call<'_>,
     s: &Shared,
-    note: Option<&str>,
+    on: OnScreen,
+    note: Option<super::run::Bar>,
+    alert: Option<super::run::AlertView>,
     hud: Option<super::run::Hud>,
+    count: Option<super::run::CountView>,
 ) {
-    let note = shown_note(note, s.ui.text_box.is_some());
-    if note.is_none() && hud.is_none() {
-        return;
+    let mut drawn = on.before;
+    drawn.extend(paint_note_pieces(call, s, note, alert, hud, count));
+    let _ = (on.place, drawn);
+}
+
+/// The screen a [`paint_note`] is on, by name, and the pieces already drawn on it this frame.
+pub(crate) struct OnScreen {
+    pub place: &'static str,
+    pub before: Vec<String>,
+}
+
+impl OnScreen {
+    pub fn new(place: &'static str) -> Self {
+        Self {
+            place,
+            before: Vec::new(),
+        }
     }
-    let Some(f) = frame_of(call, s) else { return };
+}
+
+/// [`paint_note`]'s drawing: the pieces drawn.
+fn paint_note_pieces(
+    call: &Call<'_>,
+    s: &Shared,
+    note: Option<super::run::Bar>,
+    alert: Option<super::run::AlertView>,
+    hud: Option<super::run::Hud>,
+    count: Option<super::run::CountView>,
+) -> Vec<String> {
+    let note = shown_note(note, s.ui.text_box.is_some());
+    if note.is_none() && hud.is_none() && alert.is_none() && count.is_none() {
+        return Vec::new();
+    }
+    let Some(f) = frame_of(call, s) else {
+        return Vec::new();
+    };
     let ui = RunUi {
-        bars: note.map(super::run::Bar::new).into_iter().collect(),
+        bars: note.into_iter().collect(),
         hud,
+        alert,
+        count: count.map(super::run::CountView::show),
         ..RunUi::default()
     };
     // The screen's bottom left holds its own score lines.
     let hud_corner = layout::HudCorner::Right;
+    // The pulse's clock, as the run's.
+    let t = {
+        let mut c = s.lock();
+        let t0 = *c.menu.started.get_or_insert_with(Instant::now);
+        t0.elapsed().as_secs_f64()
+    };
     let painter = Painter::new(call, s);
-    let ops = layout::run_ops(
+    let groups = layout::run_groups(
         &ui,
         RunStyle {
             hud_corner,
             time_alpha: 1.0,
             wave_alert: false,
-            t: 0.0,
+            t,
             paused: false,
+            table: false,
             pause_rows: None,
         },
         f,
         &painter,
     );
-    painter.draw(&ops, f);
+    let drawn = painter.draw_groups(&groups, f);
     painter.finish();
+    drawn
+}
+
+/// [`paint_note`] on the new game screen, a lost link's notice in its note's place.
+pub(crate) fn paint_screen_note(
+    call: &Call<'_>,
+    s: &Shared,
+    note: Option<super::run::Bar>,
+    alert: Option<super::run::AlertView>,
+    hud: Option<super::run::Hud>,
+    count: Option<super::run::CountView>,
+) {
+    // A lost link's notice takes the screen note's place.
+    let (note, alert) = match link_notice(&mut s.lock(), super::run::ReadyPlace::NewGameScreen) {
+        (Some(bar), a) => (Some(bar), a.or(alert)),
+        _ => (note, alert),
+    };
+    paint_note(
+        call,
+        s,
+        OnScreen::new("the new game screen"),
+        note,
+        alert,
+        hud,
+        count,
+    );
+}
+
+/// A lost link's notice on `place` this frame, dropped once it is over.
+fn link_notice(
+    c: &mut crate::Coop,
+    place: super::run::ReadyPlace,
+) -> (Option<super::run::Bar>, Option<super::run::AlertView>) {
+    let Some(n) = c.link_notice.as_mut() else {
+        return (None, None);
+    };
+    if n.waits_for_other(place) {
+        return (None, None);
+    }
+    if let Some((bar, alert)) = n.frame(place, Instant::now()) {
+        (Some(bar), alert)
+    } else {
+        c.link_notice = None;
+        log::info!("co-op UI: the lost-link notice is over");
+        (None, None)
+    }
+}
+
+/// The partner's Ready seen from anywhere but this player's new game screen:
+/// the waiting line and the stepped alert, or nothing when it is not ready.
+pub(crate) fn ready_elsewhere(
+    c: &mut crate::Coop,
+    place: Option<super::run::ReadyPlace>,
+) -> (Option<super::run::Bar>, Option<super::run::AlertView>) {
+    if !(c.core.linked() && c.loadout.partner_ready()) {
+        // Not ready: a lost link's notice, if one is up.
+        let place = place.unwrap_or(if c.end_shown.is_some() {
+            super::run::ReadyPlace::EndScreen
+        } else {
+            super::run::ReadyPlace::Run
+        });
+        return link_notice(c, place);
+    }
+    let name = crate::loadout_glue::partner_shown(c);
+    let bar = super::run::ready_bar(crate::loadout::partner_waiting_line(&name));
+    if let Some(p) = place {
+        ready_shown(c, p, &bar.text);
+    }
+    (Some(bar), c.ready_notice.step())
+}
+
+/// The partner ready on its new game screen while this player is in a run or
+/// on its end screen: its bar and alert join the run's UI.
+fn add_ready(c: &mut crate::Coop, ui: &mut RunUi) {
+    let (bar, alert) = ready_elsewhere(c, None);
+    // Kept apart too: the end screen draws this alone (`run_draw`).
+    c.run_ready = RunUi {
+        bars: bar.clone().into_iter().collect(),
+        alert: alert.clone(),
+        ..RunUi::default()
+    };
+    if let Some(b) = bar {
+        ui.bars.push(b);
+        ui.alert = ui.alert.take().or(alert);
+    }
+}
+
+/// The post-run screen up in a run that is over: the name entry, the table
+/// after it, else the end screen. All three draw under `oController_Draw_64`.
+pub(crate) fn end_place(call: &Call<'_>, s: &Shared) -> super::run::ReadyPlace {
+    let up = |name: &'static str| {
+        s.ui.asset(call, name).is_some_and(|o| {
+            call_b(call, s.ui.b.instance_exists, &[o])
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+    };
+    if up(asset::NAME_ENTRY) {
+        super::run::ReadyPlace::NameEntry
+    } else if up(asset::SCORE_TABLE) {
+        super::run::ReadyPlace::ScoreTable
+    } else {
+        super::run::ReadyPlace::EndScreen
+    }
+}
+
+/// The partner's Ready, its bar `text`, is to be drawn on `place` now.
+pub(crate) fn ready_shown(c: &mut crate::Coop, place: super::run::ReadyPlace, text: &str) {
+    let _ = (c, place, text);
 }
 
 /// The `fontSmall` line height for placing partner labels.
@@ -1831,40 +2465,47 @@ fn pause_rows(call: &Call<'_>, s: &Shared) -> Option<layout::PauseRows> {
     })
 }
 
-/// `confirmPause` before: Resume is refused while the relabelled row says why.
+/// `confirmPause` before: Resume is refused while the relabelled row says
+/// why. On a held upgrade card the row opens this player's upgrade screen.
 pub(crate) fn confirm_pause_before(call: &mut Call<'_>, s: &Shared) {
     let Some(me) = call.instance() else { return };
     let pos = num(&me, s.ui.menu.pos);
-    let blocked = {
+    let (blocked, choose) = {
         let c = s.lock();
-        c.run_ui.pause.as_ref().is_some_and(|p| p.row0_blocked)
+        let p = c.run_ui.pause.as_ref();
+        (
+            p.is_some_and(|p| p.row0_blocked),
+            p.is_some_and(|p| p.row0_choose),
+        )
     };
-    if blocked && pos == Some(RESUME_ROW) {
+    if pos != Some(RESUME_ROW) {
+        return;
+    }
+    if choose {
+        // Ataraxia's hold: "Choose Upgrade" (Space) opens this player's own
+        // screen. The rules leave the pause first.
+        call.skip_original();
+        let taken = s.lock().rules.choose_own();
+        play(call, s, if taken { asset::SELECT } else { asset::MOVE });
+    } else if blocked {
         call.skip_original();
         play(call, s, asset::MOVE);
-    }
-}
-
-/// The partner left this run for good: what the run UI should say.
-#[must_use]
-pub fn link_left(name: &str, lang: &str) -> LinkEvent {
-    LinkEvent::Left {
-        name: text::display_name(name, lang, text::FALLBACK_PARTNER),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::run::Bar;
 
-    /// Without `drawTextBox` the loadout screen's note goes.
+    /// Without `drawTextBox` the new game screen's note goes.
     #[test]
-    fn the_loadout_note_goes_with_the_hint_bars() {
+    fn the_new_game_screen_note_goes_with_the_hint_bars() {
         assert_eq!(
-            shown_note(Some("Sam picks the run"), true),
-            Some("Sam picks the run")
+            shown_note(Some(Bar::new("Sam picks the run")), true),
+            Some(Bar::new("Sam picks the run"))
         );
-        assert_eq!(shown_note(Some("Sam picks the run"), false), None);
+        assert_eq!(shown_note(Some(Bar::new("Sam picks the run")), false), None);
         assert_eq!(shown_note(None, true), None);
     }
 
@@ -1922,21 +2563,5 @@ mod tests {
             assert_eq!(at + 1, limit as usize);
             assert!(!streak_warns(u32::MAX, limit));
         }
-    }
-
-    #[test]
-    fn link_events_carry_a_drawable_name() {
-        assert_eq!(
-            link_left("Сэм", "english"),
-            LinkEvent::Left {
-                name: "Player 2".into()
-            }
-        );
-        assert_eq!(
-            link_left("Wing", "english"),
-            LinkEvent::Left {
-                name: "Wing".into()
-            }
-        );
     }
 }

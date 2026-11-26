@@ -36,6 +36,10 @@ pub const CONTROLLER_DRAW_GUI: &str = "gml_Object_oController_Draw_64";
 pub const PLAYER_STEP: &str = "gml_Object_oPlayer_Step_0";
 /// `oPowers` step: hull, shield and flags live there.
 pub const POWERS_STEP: &str = "gml_Object_oPowers_Step_0";
+/// `oPowers` Begin Step: holds `oPowers`' alarms 0-8 and 10 while
+/// `instance_exists(oUpgrade) || oController.pause == 1`.
+/// Parts of `oPowers_Step_0` take the same test.
+pub const POWERS_BEGIN_STEP: &str = "gml_Object_oPowers_Step_1";
 /// End screen setup: every `steam_upload_score` call is inside its
 /// `global.enableLeaderboards == 1` block.
 pub const DRAW_END_SCORE_CREATE: &str = "gml_Object_oDrawEndScore_Create_0";
@@ -76,6 +80,8 @@ pub const VAR_TIME_GAME_START: &str = "timeGameStart";
 pub const VAR_HULL: &str = "hull";
 /// `oPowers` (player) and every enemy: maximum hull.
 pub const VAR_HULL_MAX: &str = "hullMax";
+/// Enemies: set by the spawner on a boss (its `Other_10` reads it).
+pub const VAR_IS_BOSS: &str = "isBoss";
 /// Enemies: last frame's hull; any hull write must set it too.
 pub const VAR_HULL_PREVIOUS: &str = "hullPrevious";
 /// `oPowers`: shield.
@@ -114,7 +120,7 @@ pub const GLOBAL_MODE: [&str; 15] = [
     "baseEnemySpeedFactor",
 ];
 
-/// The run settings (`loadout.rs`): the loadout screen's start, the daily
+/// The run settings (`loadout.rs`): the new game screen's start, the daily
 /// reset, the settings writes, the screen's step, back and GUI draw.
 pub const CONFIRM_LOADOUT: &str = "gml_Script_confirmLoadout";
 pub const RESET_DAILY: &str = "gml_Script_resetDailyChallenges";
@@ -126,18 +132,28 @@ pub const INI_WRITE_BOOL: &str = "gml_Script_ini_write_bool";
 pub const LOADOUT_STEP: &str = "gml_Object_oLoadout_Step_0";
 pub const LEAVE_LOADOUT: &str = "gml_Script_leaveLoadout";
 pub const LOADOUT_DRAW_GUI: &str = "gml_Object_oLoadout_Draw_64";
-/// `oLoadout`'s own: the selected row (0 = Start), the fade a start sets to
-/// 1, the daily's three picks and its name.
+/// `oLoadout`'s own: the selected row (0 = Start), `fade` (1 at a new run's
+/// start), `fadeBlack` (1 at a resumed run's start), the daily's picks and name.
 pub const VAR_LOADOUT_POS: &str = "pos";
 pub const VAR_LOADOUT_FADE: &str = "fade";
+pub const VAR_LOADOUT_FADE_BLACK: &str = "fadeBlack";
 pub const VAR_DAILY_CHOICE: &str = "dailyChoice";
 pub const VAR_DAILY_MOD: &str = "dailyModChoice";
 pub const VAR_DAILY_MOD2: &str = "dailyModChoice2";
 pub const VAR_DAILY_STRING: &str = "dailyString";
-/// The loadout screen's Start label (read only by `oLoadout_Draw_64`).
+/// The new game screen's Start label (read only by `oLoadout_Draw_64`).
 pub const GLOBAL_LOADOUT_START: &str = "strLoadoutStart";
-/// A resumed run (the loadout's Start then resumes instead).
+/// A resumed run (the new game screen's Start then resumes instead).
 pub const GLOBAL_CHOSE_RESUME_RUN: &str = "choseResumeRun";
+/// 1 when a saved run was loaded. `oMenu_Create_0` calls `loadRunFromFile`
+/// each time the menu is made.
+pub const GLOBAL_LOADED_RUN_STATE: &str = "loaded_run_state";
+/// The new game screen's warning line in resume mode, drawn while `rgbB < 255`.
+/// Its colour is `make_colour_rgb(255, rgbG, rgbB)`, both raised by 2.5 a step.
+/// A refused press sets both to 0: red, fading to white.
+pub const GLOBAL_LOADOUT_RESUME_NOTE: &str = "strLoadoutResumeRunNote";
+pub const VAR_LOADOUT_RGB_G: &str = "rgbG";
+pub const VAR_LOADOUT_RGB_B: &str = "rgbB";
 /// Each of the first 12 [`GLOBAL_MODE`] flags' title: the game's localized
 /// string (a global) and the English one.
 pub const MODE_TITLES: [(&str, &str); 12] = [
@@ -155,11 +171,13 @@ pub const MODE_TITLES: [(&str, &str); 12] = [
     ("strUnlocksTitleWildMetamorphosis", "Wild Metamorphosis"),
 ];
 
-/// `wild_mods` (`wild.rs`): the flag, the upgrade screen, the rerolls, and
-/// the screen's wild slots and offers.
+/// `wild_mods` (`wild.rs`): the flag, the upgrade screen, the rerolls and the
+/// two scripts that set `oPowers.wildModCount` (0 unless the flag is on).
 pub const GLOBAL_WILD: &str = "gameModWildMetamorphosis";
 pub const UPGRADE_CREATE: &str = "gml_Object_oUpgrade_Create_0";
 pub const SET_REROLLS: &str = "gml_Script_setRerolls";
+pub const INITIALIZE_LOADOUT: &str = "gml_Script_initializeLoadout";
+pub const REFRESH_WILD: &str = "gml_Script_refreshWild";
 
 /// Built-in variables read from `oPlayer` each step.
 pub mod builtin_var {
@@ -235,6 +253,16 @@ pub const LEAVE_UPGRADE_DEFERRED: &str = "gml_Script_leaveUpgradeDeferred";
 /// `self` = `oPlayer`, from `oPowers_Step_2`: the ship dies when its hull is
 /// out and it is not invulnerable, unless `oPowers.lastStand` revives.
 pub const CHECK_DESTROY_PLAYER: &str = "gml_Script_checkDestroyPlayer";
+/// The ending begins (the Star Eater's last phase; its cutscene moves the ship).
+pub const BEGIN_GAME_ENDING: &str = "gml_Script_beginGameEnding";
+/// A pickup's pull toward the ship (every pickup's Step but
+/// `oBountyFirst`'s).
+pub const POWERUP_ATTRACT: &str = "gml_Script_powerupAttract";
+/// `oBountyFirst`'s pull toward the ship.
+pub const POWERUP_ATTRACT_PERM: &str = "gml_Script_powerupAttractPerm";
+/// A construct's death (`self` = the construct; its second argument, the
+/// build's Reconstitution, drops an armour fragment while `oPlayer` exists).
+pub const DESTROY_CONSTRUCT: &str = "gml_Script_destroyConstruct";
 /// Opens the upgrade screen (as `oController`; needs `global.levelup >= 1`).
 pub const GOTO_UPGRADE: &str = "gml_Script_gotoUpgrade";
 /// Leaves the upgrade screen: the next pending screen, or `leaveUpgradeDeferred`.
@@ -242,10 +270,39 @@ pub const LEAVE_UPGRADE: &str = "gml_Script_leaveUpgrade";
 /// Restores the loadout after a revive. Must run as `oPowers`.
 pub const REFRESH_LOADOUT: &str = "gml_Script_refreshLoadout";
 
+/// Lets go of the trigger (as `oPlayer`, one argument `undefined`): ends a
+/// charge in progress the game's way. The game calls it whenever it takes
+/// control away. A down calls it too.
+pub const RELEASE_SHOOT: &str = "gml_Script_releaseShoot";
+/// Adds an upgrade object to `oPowers.banishMods` when absent (as `oPowers`).
+/// `addModIfValid` refuses a banished mod.
+pub const BANISH_MOD: &str = "gml_Script_banishMod";
+
 /// The Game End event that runs when the game closes during a run.
 pub const GAME_END_IN_RUN: &str = "gml_Object_oSaveRunFileManager_Other_3";
 /// Rebuilds the Leviathan chain.
 pub const REFRESH_DEFENSES: &str = "gml_Script_refreshDefenses";
+/// Esc on the upgrade screen, as `oUpgrade`: backs out, the level stays
+/// pending. Skipped while a screen the partner opened fades in.
+pub const DECLINE_UPGRADE: &str = "gml_Script_declineUpgrade";
+/// The upgrade screen's picks, from its Step. Skipped while a screen the
+/// partner opened fades in. The callers do not use the result.
+pub const CONFIRM_UPGRADE: &str = "gml_Script_confirmUpgrade";
+pub const REROLL_UPGRADE: &str = "gml_Script_rerollUpgrade";
+pub const BANISH_UPGRADE: &str = "gml_Script_banishUpgrade";
+/// The upgrade screen's Step: its fade-in (`alpha` += 0.05 a step up to 1,
+/// `oDimmer.alpha` following), stretched for a screen the partner opened.
+pub const UPGRADE_STEP: &str = "gml_Object_oUpgrade_Step_0";
+/// The upgrade screen's pieces with an `image_alpha` of their own (those
+/// `oUpgrade_Alarm_1` fades). `oGraphic` ramps its own by 0.025 a step to `alphaMax`.
+pub const UPGRADE_PIECES: [&str; 6] = [
+    "oGraphic",
+    "oUnlockGraphic",
+    "oTreeHilightGraphic",
+    "oTutorialReroll",
+    "oTutorialBanish",
+    "oTutorialDecline",
+];
 
 /// Variables the session rules read or write.
 pub mod rules_var {
@@ -277,6 +334,18 @@ pub mod rules_var {
     pub const PLAYER_CONTROL: &str = "playerControl";
     /// `oPowers`: firing allowed.
     pub const CAN_FIRE: &str = "canFire";
+    /// `oPowers`: the Magnetism stat. A pickup farther than a multiple of it
+    /// is not pulled.
+    pub const POWERUP_ATTRACTION: &str = "powerupAttraction";
+    /// `oPowers`: the fire input is held (`gotoUpgradeDeferred` runs
+    /// `releaseShoot` on `oPlayer` while it is set).
+    pub const FIRING: &str = "firing";
+    /// `oPowers.ataraxia`: 1 once the player took Ataraxia.
+    pub const ATARAXIA: &str = "ataraxia";
+    /// `oUpgrade`: the screen's fade (0 to 1).
+    pub const ALPHA: &str = "alpha";
+    /// `oGraphic`: the hex's full alpha.
+    pub const ALPHA_MAX: &str = "alphaMax";
     /// `oPowers`: shield maximum.
     pub const SHIELD_MAX: &str = "shieldMax";
     /// `oPowers`: the other death condition.
@@ -285,11 +354,17 @@ pub mod rules_var {
     pub const LAST_STAND: &str = "lastStand";
     /// Global: the death check runs at all (a debug switch, normally true).
     pub const ALLOW_PLAYER_DEATH: &str = "allowPlayerDeath";
+    /// `oPowers`: the run's banished upgrades (a `ds_list` made at its Create).
+    pub const BANISH_MODS: &str = "banishMods";
+    /// Global: `oPlayer_Alarm_3` (the fly-in) makes no kaleidoscope while
+    /// set (a game setting).
+    pub const DISABLE_KALEIDOSCOPE: &str = "disableKaleidoscope";
 }
 
 /// Objects the session rules reach by name (`asset_get_index`, checked).
 pub mod rules_obj {
     pub const POWERS: &str = "oPowers";
+    pub const CONTROLLER: &str = "oController";
 }
 
 /// Builtins only the session rules call.
@@ -298,4 +373,8 @@ pub mod rules_fn {
     pub const WINDOW_HAS_FOCUS: &str = "window_has_focus";
     pub const ASSET_GET_INDEX: &str = "asset_get_index";
     pub const KEYBOARD_CHECK_PRESSED: &str = "keyboard_check_pressed";
+    /// The banish read back from `oPowers.banishMods`.
+    pub const DS_LIST_FIND_INDEX: &str = "ds_list_find_index";
+    /// The respawn's fly-in: `event_perform(ev_alarm, 3)` as `oPlayer`.
+    pub const EVENT_PERFORM: &str = "event_perform";
 }

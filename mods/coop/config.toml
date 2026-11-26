@@ -24,9 +24,9 @@ enemy_health_mult = 1.8
 # for both players. 0.1-10.
 enemy_damage_mult = 1.0
 
-# Seconds a downed ship waits before it respawns next to the partner. Game
-# time: the count stops while paused. The host's value counts for both
-# players. 5-600.
+# Seconds a downed ship waits before it flies back in from the edge of the
+# screen. Game time: the count stops while paused. The host's value counts
+# for both players. 5-600.
 respawn_seconds = 45
 
 # Show the link state beside the Co-op menu row, and the partner's name and
@@ -68,10 +68,6 @@ partner_tint = "off"
 show_names = false
 show_marker = false
 
-# Seconds the host plays on alone after the link is lost, before it pauses
-# too. The host's value counts for both players. 0-600.
-host_plays_on_seconds = 15
-
 # Your partner's sounds on your screen, as a share of normal volume. 0 = none
 # (and their game sends none). Your own setting only.
 partner_sound_volume = 0.5
@@ -80,6 +76,9 @@ partner_sound_volume = 0.5
 # Where the partner's name and round trip go during a run.
 # options: right, left
 hud_corner = "right"
+# Above the round trip during a run: how much this game sends and receives
+# (KB/s up and down, over the last second). Needs overlay = true.
+show_traffic = false
 # On a Steam Deck, its on-screen keyboard for text entry.
 deck_keyboard = true
 
@@ -105,14 +104,13 @@ steam_lobby = "friends"
 # Losing window focus pauses, as in solo play. false = the run keeps going.
 pause_on_focus_loss = true
 
-# Wild mods on your own upgrade screens. "game": as the run has them (the
-# host's Wild Metamorphosis setting). "off": none are offered to you, even
-# when the host has Wild Metamorphosis on, and you keep the normal number of
-# rerolls. Your partner's upgrades and the run itself stay as they are, and
-# nothing is saved to your game.
-# options: game, off
-wild_mods = "game"
-
-# Seconds of waiting before Esc plays on without your partner. 10-3600;
-# 0 = never. The host's value counts for both players.
-upgrade_wait_seconds = 60
+# Wild mods on your own upgrade screens (the Co-op page's Wild Mods row
+# changes it). "sync": as the run has them (the host's Wild Metamorphosis
+# setting; "game" reads the same). "on": offered to you even when the host
+# has Wild Metamorphosis off, with half the rerolls, as Wild Metamorphosis
+# gives. "off": none are offered to you, even when the host has Wild
+# Metamorphosis on, and you keep the normal number of rerolls. Your
+# partner's upgrades and the run itself stay as they are, and nothing is
+# saved to your game. A change counts from the next run.
+# options: sync, on, off
+wild_mods = "sync"

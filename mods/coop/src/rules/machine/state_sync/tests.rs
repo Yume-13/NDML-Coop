@@ -30,7 +30,7 @@ use ndml_net::rng::Rng;
 use ndml_net::session::PeerSet;
 
 use super::super::{
-    Action, Death, FRAME, Observed, PlayerAct, PowersAct, Rules, RunCtx, UnpauseCall,
+    Action, Death, FRAME, Observed, PlayerAct, PowersAct, RESUME_COUNT, Rules, RunCtx, UnpauseCall,
 };
 use super::{GRACE, PRESS_GRACE, STATE_EVERY, counted};
 use crate::net::Out;
@@ -247,7 +247,6 @@ impl Net {
                 gameplay: !g.blind && !g.paused && g.screen.is_none() && !g.over,
                 game_over: g.over,
                 levelup: Some(1.0),
-                partner: Some((500.0, 300.0, 0.0, 0.0)),
                 ..Observed::default()
             };
             for a in g.r.frame(&o, t) {
@@ -277,7 +276,7 @@ impl Net {
                 }
                 PowersAct::None | PowersAct::HoldDown => {}
             }
-            if matches!(g.r.player_action(), PlayerAct::Revive(_)) {
+            if matches!(g.r.player_action(), PlayerAct::Revive) {
                 g.r.player_applied();
             }
         }
@@ -520,7 +519,7 @@ fn a_lane_that_loses_everything_from_the_round_on_converges() {
     // client, which never heard of it, and ends from the client's statement.
     n.g[0].paused = true;
     let paused_at = n.f;
-    n.until(paused_at + 120 + GRACE_FRAMES + 2 * STATE_EVERY + 2);
+    n.until(paused_at + 120 + GRACE_FRAMES + 2 * STATE_EVERY + 2 + COUNT_FRAMES);
     assert!(n.g.iter().all(|g| !g.paused), "the host's round ended");
     assert_eq!(n.host().pause.holders(), PeerSet::EMPTY);
     assert_eq!(n.client().pause.holders(), PeerSet::EMPTY);
@@ -528,6 +527,10 @@ fn a_lane_that_loses_everything_from_the_round_on_converges() {
 }
 
 const GRACE_FRAMES: u64 = GRACE.as_secs() * 60;
+
+/// The resume count at the end of every shared hold, in frames, and one
+/// either side.
+const COUNT_FRAMES: u64 = RESUME_COUNT.as_secs() * 60 + 2;
 
 /// A statement behind what this machine applied never overrides it.
 #[test]

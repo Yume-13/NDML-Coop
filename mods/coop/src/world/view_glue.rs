@@ -26,11 +26,14 @@
 //! zoom; the background comes from `changeColors` and fades in `colorFade`.
 //!
 //! * **State**: the host sends [`GLOBALS`] every run frame (unreliable, newest
-//!   wins); a joining game writes the targets every frame so its own camera
-//!   and colour fade ease the same way, and snaps `zoomFactor` past [`SNAP`].
+//!   wins); a joining game writes the targets and `slowZoom` every frame so
+//!   its own camera and colour fade ease the same way, and snaps `zoomFactor`
+//!   past [`SNAP`].
 //! * **Calls**: the scripts in [`CALLS`] run on the host are replayed on a
 //!   joining game with the same arguments and inputs ([`CALL_INPUTS`]); its
 //!   own calls of them are skipped.
+//! * **Children**: the wave director's values (`director_glue.rs`) and the
+//!   enemies' phase machines (`phase_glue.rs`).
 //! * **Scheme**: when the host's colour scheme differs from the one the
 //!   joining game built its backdrop with for [`REBUILD_AFTER`] frames,
 //!   `changeColors(host scheme)` runs once.
@@ -38,6 +41,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use ndml_net::msg::{Message, PeerId, StateValue, WorldCall, WorldView};
@@ -45,14 +49,20 @@ use ndml_sdk::{Builtin, Call, ModContext, Script, Value, Variable};
 
 use super::{PartnerView, ROLE_CLIENT, ROLE_HOST, WorldHooks};
 
-/// The world-level globals sent (the order is the wire's).
-pub const GLOBALS: [&str; 17] = [
+/// The wave director's values a joining game reads (sent on change).
+#[path = "director_glue.rs"]
+pub(super) mod director;
+
+/// An enemy's phase machine is the host's word.
+#[path = "phase_glue.rs"]
+pub(super) mod phase;
+
+/// The world-level globals sent (the order is the wire's): what host code a
+/// joining game skips writes, and values whose shared result matters.
+pub const GLOBALS: [&str; 13] = [
     "zoomTarget",
     "zoomBase",
     "slowZoom",
-    "zoomRate",
-    "zoomStiffness",
-    "zoomRateLimit",
     "zoomFactor",
     "tr",
     "tg",
@@ -62,17 +72,13 @@ pub const GLOBALS: [&str; 17] = [
     "gtb",
     "backgroundGlowColor",
     "color",
-    // Whether ships wrap at the battlefield's edges (`wrapPlayer`): the
-    // Crucible turns it off for its fight (`oCrucible_Other_10`, back on in
-    // `oCrucible_CleanUp_0`).
-    "wrapEnabled",
     // The track playing (`playBGMLoop` plays `global.bgmPlaying`): sent as
     // its sound index, never written; a joining game switches to it (see
     // [`MUSIC_SETTLE`]).
     "bgmPlaying",
 ];
 /// Index of `bgmPlaying` in [`GLOBALS`].
-const BGM: usize = 16;
+const BGM: usize = 12;
 /// Running frames the host's track must differ from this game's before it
 /// switches (the host's own switch is a call or two in one frame; the view
 /// is unreliable).
@@ -127,14 +133,12 @@ pub fn in_ship_frame(host: (f64, f64), joining: (f64, f64), angle: f64) -> (f64,
 /// sound ref to take the high bits from.
 const SOUND_REF: u64 = 0x0100_0002_0000_0000;
 /// Index of `zoomFactor` (the eased zoom: snapped, not written every frame).
-const ZOOM_FACTOR: usize = 6;
-/// Index of `zoomRate`, the easing's velocity: sent, never written, so a
-/// joining game's `zoomFactor` eases to the shared target with its own
-/// velocity instead of keeping an offset.
-const ZOOM_RATE: usize = 3;
+const ZOOM_FACTOR: usize = 3;
+/// Index of `zoomBase` (the shield radius part reads the host's by time).
+const ZOOM_BASE: usize = 1;
 /// Index of `color` (the scheme). Written like the targets: between changes
 /// only background code, debug keys and the unsaved run data read it.
-const COLOR: usize = 14;
+const COLOR: usize = 11;
 /// `zoomFactor` is written when off by more than this fraction of the
 /// host's.
 pub const SNAP: f64 = 0.02;
@@ -158,6 +162,13 @@ pub const CALL_INPUTS: [&[&str]; 2] = [&["color", "wave", "dailySerpentineDrift"
 /// value in turn (a joining game that does not know it would pass them on
 /// as extra arguments, which the scripts ignore).
 pub const INPUTS_MARK: &str = "@inputs";
+/// Among a call's inputs: `@made:<object>` with the number of instances of
+/// that object there were before the host's call, for each world spawn (an
+/// instance the host replicates when made: `world_spawn_before`) the call
+/// made. A joining game runs the call in the world the host's ran in: copies
+/// of those instances that arrived before the call are deactivated for its
+/// length. `changeColors` returns while an `oStarEaterBGController` exists.
+pub const MADE_MARK: &str = "@made:";
 /// Running frames the host's scheme must differ from the one this game built
 /// with, with no host call waiting, before the backdrop is rebuilt (a call
 /// on its way, reliable, would rebuild it anyway; the view is unreliable and
@@ -169,9 +180,10 @@ const CALL_AT_START: &str = "gml_Script_changeColors";
 /// The game's easing steps the host's view is written just before.
 pub const EASERS: [&str; 2] = ["gml_Script_cameraZoom", "gml_Script_colorFade"];
 /// The background bodies kept together with the host's ([`WorldHooks::view_bodies_host`]):
+/// the background objects another object's own event makes (world spawns):
 /// the planets' bodies and the final boss's lead-up coils
-/// (`oStarEaterBGObject`, an `oCelestialBody` child the boss controller's
-/// Step destroys at the defeat's whiteout).
+/// (`oStarEaterBGObject`). The nebulae and the starfield follow each
+/// player's `backgroundDetail` and stay each game's own.
 const SYNCED_BODIES: [&str; 4] = [
     "oCelestialBody",
     "oCelestialBodyAdditive",
@@ -220,9 +232,16 @@ struct ViewHandles {
     play_bgm_loop: Option<Script>,
     asset: Option<Builtin>,
     destroy: Option<Builtin>,
+    /// `instance_deactivate_object`, `instance_activate_object` (a
+    /// replayed call's world as the host's: [`MADE_MARK`]).
+    deactivate: Option<Builtin>,
+    activate: Option<Builtin>,
 }
 
 static VH: OnceLock<ViewHandles> = OnceLock::new();
+/// Host: world calls being recorded now (nested), so the creates hook notes
+/// what they make; otherwise it returns after this load.
+static RECORDING: AtomicU32 = AtomicU32::new(0);
 /// The newest world call this game made (any role).
 static LAST_CALL: Mutex<Option<WorldCall>> = Mutex::new(None);
 
@@ -247,6 +266,14 @@ pub(super) struct ViewState {
     out_calls: Vec<WorldCall>,
     /// Client: a host call is running now (its own are skipped otherwise).
     replaying: bool,
+    /// Host: each world call being recorded (nested): its index in
+    /// `out_calls` (a host's), and the world spawns there were before it.
+    recording: Vec<(Option<usize>, HashSet<usize>)>,
+    /// Host: what was made while a call was recorded (key, object).
+    recorded_made: Vec<(usize, u32)>,
+    /// Client: the world spawns the host's last call that built a scheme
+    /// made, with that scheme (the rebuild runs as that call did).
+    made_for: Option<(f64, Vec<(u32, u32)>)>,
     /// Host: the clock of the last frame (for the calls' stamp).
     now_ms: u32,
     /// `oPowers`' object index (resolved once).
@@ -287,6 +314,10 @@ pub(super) struct ViewState {
     host_body_counts: HashMap<i64, usize>,
     body_extra: HashMap<i64, u32>,
     bodies_placed: HashSet<usize>,
+    /// The wave director's values ([`director::DIRECTOR`]).
+    director: director::DirectorState,
+    /// The phase words (`phase`).
+    phase: phase::PhaseState,
 }
 
 /// A track (`bgmPlaying`) as its sound index: a ref's low 32 bits, or a
@@ -320,6 +351,92 @@ pub fn split_inputs(args: &[StateValue]) -> (&[StateValue], Vec<(&str, &StateVal
     (&args[..at], inputs)
 }
 
+/// The world spawns a host call made, from its inputs ([`MADE_MARK`]):
+/// (object, instances before the call).
+#[must_use]
+pub fn made_of(inputs: &[(&str, &StateValue)]) -> Vec<(u32, u32)> {
+    inputs
+        .iter()
+        .filter_map(|(n, v)| {
+            let o: u32 = n.strip_prefix(MADE_MARK)?.parse().ok()?;
+            let before = match v {
+                StateValue::Real(x) if x.is_finite() && *x >= 0.0 => *x,
+                StateValue::Int(x) => f64::from(u32::try_from(*x).ok()?),
+                _ => return None,
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // checked above
+            Some((o, before.min(f64::from(u32::MAX)) as u32))
+        })
+        .collect()
+}
+
+/// Of `ids` (one object's active instances, each with its order key), the
+/// ones a call the host made with `before` of them could not see: the
+/// newest beyond `before` (ids grow with each create).
+#[must_use]
+pub fn beyond<T>(mut ids: Vec<(u64, T)>, before: u32) -> Vec<T> {
+    ids.sort_by_key(|(k, _)| *k);
+    let keep = usize::try_from(before).unwrap_or(usize::MAX).min(ids.len());
+    ids.split_off(keep).into_iter().map(|(_, id)| id).collect()
+}
+
+/// An instance's `id` as an order key: a ref (the runner's instance ids are
+/// refs, one tag over the id's low bits) or a number.
+fn id_order(v: &Value) -> Option<u64> {
+    match v {
+        Value::Ref(p) => Some(*p),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // filtered >= 0
+        other => other.as_f64().filter(|n| *n >= 0.0).map(|n| n as u64),
+    }
+}
+
+/// The active instances of `object`: each `id` as the game gives it (a
+/// ref; read as a number it would be none), with its order key.
+fn active_ids(call: &Call<'_>, object: u32) -> Vec<(u64, Value)> {
+    let mut out = Vec::new();
+    let _ = call.with(&Value::object(object), |inst, _| {
+        if let Ok(id) = inst.builtin_value("id")
+            && let Some(k) = id_order(&id)
+        {
+            out.push((k, id));
+        }
+    });
+    out
+}
+
+/// Before a replayed call: its world spawns' copies it could not have seen
+/// on the host, deactivated (returned, to activate after).
+fn hide_made(call: &Call<'_>, h: &ViewHandles, made: &[(u32, u32)]) -> Vec<Value> {
+    let Some(deactivate) = h.deactivate else {
+        return Vec::new();
+    };
+    let mut hidden = Vec::new();
+    for &(o, before) in made {
+        for id in beyond(active_ids(call, o), before) {
+            match call.call_builtin(deactivate, std::slice::from_ref(&id)) {
+                Ok(_) => hidden.push(id),
+                Err(e) => log::warn!("co-op world view: instance_deactivate_object({id:?}): {e}"),
+            }
+        }
+    }
+    if !hidden.is_empty() {
+        log::info!(
+            "co-op world view: {} copies of what the host's call made kept out of its sight while it runs here (they came before it)",
+            hidden.len()
+        );
+    }
+    hidden
+}
+
+fn show_again(call: &Call<'_>, h: &ViewHandles, hidden: &[Value]) {
+    let Some(activate) = h.activate else { return };
+    for id in hidden {
+        if let Err(e) = call.call_builtin(activate, std::slice::from_ref(id)) {
+            log::warn!("co-op world view: instance_activate_object({id:?}): {e}");
+        }
+    }
+}
+
 /// Resolve the handles (init).
 pub(super) fn resolve(ctx: &ModContext) {
     let _ = VH.set(ViewHandles {
@@ -335,7 +452,11 @@ pub(super) fn resolve(ctx: &ModContext) {
         play_bgm_loop: ctx.script("gml_Script_playBGMLoop").ok(),
         asset: ctx.builtin("asset_get_index").ok(),
         destroy: ctx.builtin("instance_destroy").ok(),
+        deactivate: ctx.builtin("instance_deactivate_object").ok(),
+        activate: ctx.builtin("instance_activate_object").ok(),
     });
+    director::resolve(ctx);
+    phase::resolve(ctx);
 }
 
 fn to_state(v: &Value) -> StateValue {
@@ -388,6 +509,8 @@ impl WorldHooks {
             .map(Message::WorldCall)
             .collect();
         out.extend(self.view_bodies_host(call, now_ms));
+        out.extend(self.director_host(call, now_ms));
+        out.extend(self.phase_host().into_iter().map(Message::WorldCall));
         if let Some(values) = Self::view_read(call) {
             out.push(Message::WorldView(WorldView {
                 time_ms: now_ms,
@@ -560,17 +683,34 @@ impl WorldHooks {
 
     /// Client: take the view messages out of the inbox.
     pub(super) fn view_inbox(&self, inbox: &mut Vec<Message>) {
+        inbox.retain(|m| match m {
+            Message::WorldCall(c) if c.script == phase::PHASE_CALL => {
+                self.phase_take(c);
+                false
+            }
+            Message::WorldCall(c) if c.script == director::DIRECTOR_CALL => {
+                self.director_take(c);
+                false
+            }
+            _ => true,
+        });
         let mut st = self.lock();
         inbox.retain(|m| match m {
             Message::WorldView(v) => {
-                if v.names == names_hash()
-                    && st
+                if v.names == names_hash() {
+                    // Every view's `zoomBase` by its host time, late ones
+                    // too: the own-object parts read the host's at a run.
+                    if let Some(&z) = v.values.get(ZOOM_BASE) {
+                        st.view.director.zoom_seen(v.time_ms, z);
+                    }
+                    if st
                         .view
                         .latest
                         .as_ref()
                         .is_none_or(|l| l.time_ms <= v.time_ms)
-                {
-                    st.view.latest = Some(v.clone());
+                    {
+                        st.view.latest = Some(v.clone());
+                    }
                 }
                 false
             }
@@ -645,9 +785,12 @@ impl WorldHooks {
                 }
             }
             let args: Vec<Value> = args.iter().map(to_value).collect();
+            let made = made_of(&inputs);
             let before = Self::scheme(call);
             self.lock().view.replaying = true;
+            let hidden = hide_made(call, h, &made);
             let r = call.call_script(script, &args);
+            show_again(call, h, &hidden);
             // A call that changed the scheme built a backdrop with it.
             let after = Self::scheme(call);
             let built = after.filter(|a| before.is_none_or(|b| (b - a).abs() >= 0.5));
@@ -662,8 +805,11 @@ impl WorldHooks {
             }
             let mut st = self.lock();
             st.view.replaying = false;
-            if ix == 0 && built.is_some() {
+            if ix == 0
+                && let Some(b) = built
+            {
                 st.view.built = built;
+                st.view.made_for = Some((b, made));
             }
             drop(st);
             if let Err(e) = r {
@@ -1042,8 +1188,18 @@ impl WorldHooks {
         // From the built scheme, so the call sees a change and runs the
         // game's own swap (it does nothing for the scheme it already has).
         let _ = g.set_f64(color, built);
+        let made = {
+            let st = self.lock();
+            st.view
+                .made_for
+                .as_ref()
+                .filter(|(s, _)| (s - host).abs() < 0.5)
+                .map_or_else(Vec::new, |x| x.1.clone())
+        };
         self.lock().view.replaying = true;
+        let hidden = hide_made(call, h, &made);
         let r = call.call_script(script, &[Value::Real(host)]);
+        show_again(call, h, &hidden);
         let now = Self::scheme(call);
         {
             let mut st = self.lock();
@@ -1079,7 +1235,7 @@ impl WorldHooks {
         if let (Some(v), Some(g)) = (latest, call.global()) {
             for (i, (var, value)) in h.vars.iter().zip(&v.values).enumerate() {
                 let Some(var) = var else { continue };
-                if !value.is_finite() || i == ZOOM_RATE || i == BGM {
+                if !value.is_finite() || i == BGM {
                     continue;
                 }
                 if i == ZOOM_FACTOR {
@@ -1142,13 +1298,108 @@ impl WorldHooks {
                     script: script.to_owned(),
                     args,
                 };
-                if role == ROLE_HOST {
+                let at = (role == ROLE_HOST).then(|| {
                     st.view.out_calls.push(made.clone());
-                }
+                    st.view.out_calls.len() - 1
+                });
                 if script == CALL_AT_START {
                     *LAST_CALL.lock().unwrap_or_else(PoisonError::into_inner) = Some(made);
                 }
+                // What the call makes, noted until its end.
+                let before = st.deps.world.clone();
+                st.view.recording.push((at, before));
+                RECORDING.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// After a script in [`CALLS`] (any role but a client's): the world
+    /// spawns it made ([`MADE_MARK`]) go with the call recorded at its start.
+    pub(super) fn view_call_after(&self, call: &Call<'_>, script: &'static str) {
+        // Whatever the role is now: the start pushed a record (a client's
+        // start pushes none).
+        let (at, made) = {
+            let mut st = self.lock();
+            let Some((at, before)) = st.view.recording.pop() else {
+                return;
+            };
+            RECORDING.fetch_sub(1, Ordering::Relaxed);
+            let fresh: Vec<u32> = st
+                .view
+                .recorded_made
+                .iter()
+                .filter(|(k, _)| st.deps.world.contains(k) && !before.contains(k))
+                .map(|x| x.1)
+                .collect();
+            if st.view.recording.is_empty() {
+                st.view.recorded_made.clear();
+            }
+            (at, fresh)
+        };
+        if made.is_empty() {
+            return;
+        }
+        let mut by_object: Vec<(u32, u32)> = Vec::new();
+        for o in made {
+            match by_object.iter_mut().find(|x| x.0 == o) {
+                Some(x) => x.1 += 1,
+                None => by_object.push((o, 1)),
+            }
+        }
+        let pairs: Vec<StateValue> = by_object
+            .iter()
+            .flat_map(|&(o, n)| {
+                let now = active_ids(call, o).len();
+                let before = u32::try_from(now).unwrap_or(u32::MAX).saturating_sub(n);
+                [
+                    StateValue::Str(format!("{MADE_MARK}{o}")),
+                    StateValue::Real(f64::from(before)),
+                ]
+            })
+            .collect();
+        let add = |c: &mut WorldCall| {
+            if !c
+                .args
+                .iter()
+                .any(|a| matches!(a, StateValue::Str(s) if s == INPUTS_MARK))
+            {
+                c.args.push(StateValue::Str(INPUTS_MARK.to_owned()));
+            }
+            c.args.extend(pairs.iter().cloned());
+        };
+        if let Some(i) = at
+            && let Some(c) = self.lock().view.out_calls.get_mut(i)
+        {
+            add(c);
+        }
+        if script == CALL_AT_START
+            && let Some(c) = LAST_CALL
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                .filter(|c| c.script == script)
+        {
+            add(c);
+        }
+    }
+
+    /// After a create while a world call is recorded (host): what it made.
+    pub(super) fn view_create_after(&self, call: &Call<'_>) {
+        if RECORDING.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(id) = call.result() else { return };
+        let mut made = None;
+        let _ = call.with(&id, |inst, _| {
+            made = inst
+                .builtin_value("object_index")
+                .ok()
+                .as_ref()
+                .and_then(super::classify::object_index)
+                .map(|o| (inst.key(), o));
+        });
+        if let Some(m) = made {
+            self.lock().view.recorded_made.push(m);
         }
     }
 
@@ -1360,6 +1611,52 @@ mod tests {
         assert!(inputs.is_empty());
     }
 
+    /// A copy of the background controller came before the host's
+    /// `changeColors(5)`; the call goes with what it made (none of them
+    /// before it), and the joining game's copy is out of the call's sight.
+    #[test]
+    fn a_replayed_call_does_not_see_the_copies_of_what_the_host_s_made() {
+        let s = |t: &str| StateValue::Str(t.to_owned());
+        let args = vec![
+            StateValue::Real(5.0),
+            s(INPUTS_MARK),
+            s("color"),
+            StateValue::Real(1.0),
+            s(&format!("{MADE_MARK}770")),
+            StateValue::Real(0.0),
+            s(&format!("{MADE_MARK}12")),
+            StateValue::Int(2),
+            s("@made:x"),
+            StateValue::Real(1.0),
+        ];
+        let (a, inputs) = split_inputs(&args);
+        assert_eq!(a, &args[..1], "the script's own arguments");
+        assert_eq!(made_of(&inputs), vec![(770, 0), (12, 2)]);
+        // An input of the call that is not one: ignored by the inputs too.
+        assert!(!CALL_INPUTS[0].iter().any(|n| n.starts_with(MADE_MARK)));
+        // The newest beyond the host's count before its call.
+        assert_eq!(beyond(vec![(100_400, 'a')], 0), vec!['a']);
+        assert_eq!(beyond(vec![(9, 'c'), (3, 'a'), (7, 'b')], 2), vec!['c']);
+        assert!(beyond(vec![(3, 'a'), (7, 'b')], 2).is_empty());
+        assert!(
+            beyond(vec![(3, 'a')], 5).is_empty(),
+            "fewer than the host had"
+        );
+        // The runner's ids are refs: each has an order key, the newer id the
+        // larger.
+        let (old, new) = (
+            Value::Ref(0x0400_0000_0001_86A0),
+            Value::Ref(0x0400_0000_0001_86A7),
+        );
+        let ids = vec![
+            (id_order(&new).unwrap(), new.clone()),
+            (id_order(&old).unwrap(), old.clone()),
+        ];
+        assert_eq!(beyond(ids, 1), vec![new]);
+        assert_eq!(id_order(&Value::Real(100_007.0)), Some(100_007));
+        assert_eq!(id_order(&Value::Real(-4.0)), None, "noone");
+    }
+
     #[test]
     fn a_slot_measured_in_the_ship_frame_is_the_slot() {
         for angle in [0.0, 37.0, 90.0, 200.0] {
@@ -1405,5 +1702,15 @@ mod tests {
         assert_eq!(CALLS.len(), CALL_INPUTS.len());
         assert!(CALL_INPUTS[0].contains(&"color"));
         assert_eq!(GLOBALS.iter().position(|n| *n == "color"), Some(COLOR));
+        assert_eq!(GLOBALS[ZOOM_FACTOR], "zoomFactor");
+        assert_eq!(GLOBALS[ZOOM_BASE], "zoomBase");
+    }
+
+    #[test]
+    fn each_global_is_sent_once() {
+        let mut names = GLOBALS.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), GLOBALS.len(), "a global sent twice");
     }
 }

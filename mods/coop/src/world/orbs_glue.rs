@@ -129,6 +129,12 @@ pub(super) struct OrbsGlue {
 }
 
 impl OrbsGlue {
+    /// This game's ship is down, as the last run frame had it (the on-death
+    /// world effects read it too).
+    pub(super) fn own_down(&self) -> bool {
+        self.own_down
+    }
+
     /// The world's notice of a lost link: a host opens the window of what to
     /// send again at the return. Goes by the world's role, which stays the
     /// host's while the link is down (the session's `is_host` does not).

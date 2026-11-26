@@ -34,16 +34,22 @@ use crate::world::present::PartnerTint;
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiSettings {
     pub hud_corner: HudCorner,
+    /// `show_traffic`: KB/s up and down above the HUD line.
+    pub show_traffic: bool,
     /// The Steam Deck's on-screen keyboard for text entry.
     pub deck_keyboard: bool,
     pub tint: PartnerTint,
 }
 
 impl UiSettings {
-    /// The run selector's switches (`overlay = false` turns the HUD line off).
+    /// The run selector's switches. `overlay = false` turns off the HUD line
+    /// and the traffic line.
     #[must_use]
     pub fn switches(&self, overlay: bool) -> Switches {
-        Switches { hud: overlay }
+        Switches {
+            hud: overlay,
+            traffic: overlay && self.show_traffic,
+        }
     }
 }
 
@@ -52,6 +58,7 @@ impl crate::config::Config {
     pub(crate) fn ui_settings(&self) -> UiSettings {
         UiSettings {
             hud_corner: self.hud_corner,
+            show_traffic: self.show_traffic,
             deck_keyboard: self.deck_keyboard,
             tint: self.partner_tint,
         }
@@ -70,6 +77,18 @@ mod tests {
         assert_eq!(s.tint, PartnerTint::Off);
         assert_eq!(s.hud_corner, HudCorner::Right);
         assert!(!s.switches(false).hud);
+        assert!(!s.show_traffic, "the traffic line is off by default");
+        assert!(!s.switches(true).traffic);
+    }
+
+    #[test]
+    fn show_traffic_needs_the_hud_line() {
+        let text =
+            crate::NDML_DEFAULT_CONFIG.replace("show_traffic = false", "show_traffic = true");
+        let c: crate::config::Config = ndml_sdk::config::parse_defaults(&text).unwrap();
+        let s = c.ui_settings();
+        assert!(s.switches(true).traffic);
+        assert!(!s.switches(false).traffic, "overlay = false hides both");
     }
 
     #[test]

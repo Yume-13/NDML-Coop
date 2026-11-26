@@ -98,6 +98,8 @@ pub struct PauseText {
     pub row0: Option<String>,
     /// `confirmPause` on row 0 is refused (with the move sound).
     pub row0_blocked: bool,
+    /// `confirmPause` on row 0 opens this player's own upgrade screen.
+    pub row0_choose: bool,
     /// The last row and its YES/NO question.
     pub quit: Option<(String, String)>,
 }
@@ -134,6 +136,8 @@ pub struct Hud {
     pub detail: Option<String>,
     /// Draw `detail` in the negative colour.
     pub bad: bool,
+    /// The traffic line above it (`show_traffic`): "48 KB/s up  21 KB/s down".
+    pub traffic: Option<String>,
 }
 
 /// P5: the waiting card over a dimmed screen.
@@ -155,6 +159,22 @@ pub struct AlertView {
     pub alpha: f64,
 }
 
+/// A count on screen: the edge glow and the number with its word.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountShow {
+    pub number: u8,
+    /// Above the number, upper case.
+    pub label: &'static str,
+    /// 0 to 1 through the current second (the pulse).
+    pub phase: f64,
+    /// The edge glow (every count).
+    pub edge: bool,
+    /// The number on the middle panel, else on the respawn alert's strip.
+    pub panel: bool,
+    /// The screen dimmed under the pause screen's rows (the resume count).
+    pub dim: bool,
+}
+
 /// Everything in-run for one frame.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunUi {
@@ -163,6 +183,7 @@ pub struct RunUi {
     pub hud: Option<Hud>,
     pub card: Option<Card>,
     pub alert: Option<AlertView>,
+    pub count: Option<CountShow>,
 }
 
 /// Shared pause: play resumes when every player has resumed.
@@ -183,12 +204,10 @@ pub enum UpgradeWait {
     PartnerChoosing,
     /// This player is choosing; the partner is done.
     PartnerReady,
-    /// As `PartnerChoosing`, past `upgrade_wait_seconds`: Esc stops waiting.
-    PartnerChoosingLong,
     /// Nothing to choose (or down): held on the pause screen meanwhile.
     HeldPaused,
-    /// As `HeldPaused`, past `upgrade_wait_seconds`: Esc stops waiting.
-    HeldPausedLong,
+    /// This player has Ataraxia: held on the pause screen for the partner.
+    AtaraxiaHeld,
     /// This player paused while the partner opened the upgrade screen.
     ResumeToChoose,
 }
@@ -199,12 +218,14 @@ pub enum UpgradeWait {
 pub struct SessionFacts {
     pub pause: Option<SharedPause>,
     pub upgrade: Option<UpgradeWait>,
+    /// A count showing (the resume's, or the respawn alert's last seconds).
+    pub count: Option<CountView>,
     /// This player's ship is down: whole seconds until it respawns (game time).
     pub me_down: Option<u64>,
-    /// ... alone (no partner here): it respawns where it went down.
-    pub me_down_alone: bool,
     /// The partner's ship is down: whole seconds until it respawns.
     pub partner_down: Option<u64>,
+    /// The upgrade round's end will count (the host's state).
+    pub upgrade_counts: bool,
 }
 
 /// A one-off session event (alert or note).
@@ -220,6 +241,71 @@ pub enum SessionEvent {
     PartnerBack,
     /// Every ship is down: the run is over.
     AllDown,
+    /// The partner became ready while this player holds the round: cue only.
+    PartnerReady,
+    /// A count's number `n` starts: its tick sounds.
+    CountTick(CountKind, u8),
+    /// A count is over: play goes on.
+    CountGo(CountKind),
+    /// An upgrade round ended without a count: play goes on, no sound.
+    ResumedNoCount,
+}
+
+/// Which count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountKind {
+    /// Before play resumes after a shared hold (both games).
+    Resume,
+    /// The last seconds before this player's ship returns (its game only).
+    Respawn,
+    /// Before a run starts (both games; the flow's "both ready").
+    Start,
+}
+
+impl CountKind {
+    /// The word above the number.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resume => "RESUMING",
+            Self::Respawn => "BACK IN",
+            Self::Start => "STARTING",
+        }
+    }
+
+    /// The count's name in log lines.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::Respawn => "respawn",
+            Self::Start => "start",
+        }
+    }
+}
+
+/// The count this frame, as the rules see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountView {
+    pub kind: CountKind,
+    pub number: u8,
+    /// Thousandths into the current second.
+    pub phase_pm: u16,
+}
+
+impl CountView {
+    /// As shown.
+    #[must_use]
+    pub fn show(self) -> CountShow {
+        CountShow {
+            number: self.number,
+            label: self.kind.label(),
+            phase: f64::from(self.phase_pm) / 1000.0,
+            edge: true,
+            panel: self.kind != CountKind::Respawn,
+            dim: self.kind == CountKind::Resume,
+        }
+    }
 }
 
 /// The session as the run UI needs it.
@@ -237,7 +323,7 @@ pub struct RunFacts<'a> {
     pub upgrade: Option<UpgradeWait>,
     /// While linked: how long nothing has arrived from the partner.
     pub silent_for: Option<Duration>,
-    /// Host: the partner left this run; it plays on alone until the run ends.
+    /// The partner is gone for this run, even with the link back.
     pub separate: bool,
     /// The wait for a lost link ([`crate::wait`]).
     pub wait: WaitView,
@@ -245,15 +331,13 @@ pub struct RunFacts<'a> {
     pub paused: bool,
     /// This game hosts (or hosted when last linked).
     pub host: bool,
-    /// Joining game: its run is over (the host is gone for good).
+    /// The run is over (the partner left it by choice), either role.
     pub over: bool,
 }
 
 /// Something happened to the partner's part in this run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkEvent {
-    /// Host: the partner is gone for good.
-    Left { name: String },
     /// The link is back after a wait; `long`: it became the shared pause.
     Back { long: bool },
 }
@@ -263,11 +347,16 @@ pub enum LinkEvent {
 pub struct Switches {
     /// The HUD line (P3; `overlay`).
     pub hud: bool,
+    /// The traffic line above it (`show_traffic`).
+    pub traffic: bool,
 }
 
 impl Default for Switches {
     fn default() -> Self {
-        Self { hud: true }
+        Self {
+            hud: true,
+            traffic: false,
+        }
     }
 }
 
@@ -278,6 +367,7 @@ pub fn start_gate(partner: &str) -> (PauseText, Bar) {
         PauseText {
             row0: Some(format!("Waiting for {partner}...")),
             row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
         Bar::new(format!(
@@ -294,6 +384,7 @@ pub fn modes_differ() -> (PauseText, Bar) {
         PauseText {
             row0: Some("Modes differ".into()),
             row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
         Bar::new("Both players must pick the same game mode. Quit and pick it again together."),
@@ -307,6 +398,7 @@ pub fn pause_waiting(partner: &str) -> (PauseText, Bar) {
         PauseText {
             row0: Some(format!("Waiting for {partner}...")),
             row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
         Bar::new(format!("{partner} is still paused.")),
@@ -327,52 +419,74 @@ pub fn pause_partner_ready(partner: &str) -> Bar {
     Bar::new(format!("{partner} is ready and waiting for you."))
 }
 
-/// Upgrade screen: this player is done, the partner is still choosing.
+/// Upgrade screen: this player is done, the partner is choosing.
 #[must_use]
-pub fn upgrade_waiting(partner: &str) -> Card {
+pub fn upgrade_waiting(partner: &str, counts: bool) -> Card {
     Card {
         title: "WAITING".into(),
         subtitle: format!("Waiting for {partner}..."),
-        note: Some(format!("{partner} is choosing an upgrade.")),
+        note: Some(format!(
+            "{partner} is choosing an upgrade. {}",
+            super::text::resume_note(counts)
+        )),
     }
 }
 
 /// Upgrade screen: this player is choosing, the partner is done.
 #[must_use]
-pub fn upgrade_partner_ready(partner: &str) -> Bar {
-    Bar::new(format!("{partner} is ready and waiting for you."))
-}
-
-/// Upgrade screen: this player is done, the partner has been choosing long.
-#[must_use]
-pub fn upgrade_waiting_long(partner: &str) -> Card {
-    Card {
-        title: "WAITING".into(),
-        subtitle: format!("Waiting for {partner}..."),
-        note: Some(format!("Press Esc to play on. {partner} can still choose.")),
-    }
+pub fn upgrade_partner_ready(partner: &str, counts: bool) -> Bar {
+    Bar::new(format!(
+        "{partner} is ready and waiting for you. {}",
+        super::text::resume_note(counts)
+    ))
 }
 
 /// Upgrade screen open for the partner; this game waits on the pause screen.
 #[must_use]
-pub fn upgrade_held_paused(partner: &str, long: bool) -> (PauseText, Bar) {
+pub fn upgrade_held_paused(partner: &str, counts: bool) -> (PauseText, Bar) {
     (
         PauseText {
-            row0: Some(if long {
-                "Play On".to_owned()
-            } else {
-                format!("Waiting for {partner}...")
-            }),
-            row0_blocked: !long,
+            row0: Some(format!("Waiting for {partner}...")),
+            row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
-        Bar::new(if long {
-            format!("{partner} is choosing an upgrade. Press Esc to play on.")
-        } else {
-            format!("{partner} is choosing an upgrade.")
-        })
-        .pulsing(),
+        held_bar(partner, counts),
     )
+}
+
+/// The held pause screen's bar, with or without Ataraxia.
+fn held_bar(partner: &str, counts: bool) -> Bar {
+    Bar::new(format!(
+        "{partner} is choosing an upgrade. {}",
+        super::text::resume_note(counts)
+    ))
+    .pulsing()
+}
+
+/// This player has Ataraxia: Space (row 0) opens this player's own screen.
+#[must_use]
+pub fn upgrade_ataraxia_held(partner: &str, counts: bool) -> (PauseText, Bar) {
+    (
+        PauseText {
+            row0: Some("Choose Upgrade".to_owned()),
+            row0_blocked: false,
+            row0_choose: true,
+            quit: None,
+        },
+        held_bar(partner, counts),
+    )
+}
+
+/// The pause screen while the resume count runs: its Resume is refused.
+#[must_use]
+pub fn resume_counting(n: u8) -> PauseText {
+    PauseText {
+        row0: Some(format!("Resuming in {n}...")),
+        row0_blocked: true,
+        row0_choose: false,
+        quit: None,
+    }
 }
 
 /// This player paused while the partner opened the upgrade screen.
@@ -383,14 +497,10 @@ pub fn resume_to_choose(partner: &str) -> Bar {
     ))
 }
 
-/// This player's ship is down (`None`: alone, it comes back where it went down).
+/// This player's ship is down.
 #[must_use]
-pub fn you_are_down(partner: Option<&str>, secs: u64) -> Bar {
-    Bar::new(match partner {
-        Some(p) => format!("Your ship is down. Back next to {p} in {secs} s."),
-        None => format!("Your ship is down. Back in {secs} s."),
-    })
-    .pulsing()
+pub fn you_are_down(secs: u64) -> Bar {
+    Bar::new(format!("Your ship is down. Back in {secs} s.")).pulsing()
 }
 
 /// The partner's ship is down.
@@ -459,10 +569,12 @@ pub fn link_wait(partner: &str) -> (PauseText, Bar) {
         PauseText {
             row0: Some(format!("Waiting for {partner}...")),
             row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
         Bar::new(format!(
-            "Lost the link to {partner}. Leave Co-op Run returns to the menu."
+            "{} Leave Co-op Run returns to the menu.",
+            super::text::lost_link(partner, "")
         ))
         .pulsing(),
     )
@@ -478,23 +590,18 @@ pub fn link_wait_unpaused(partner: &str) -> Bar {
     .pulsing()
 }
 
-/// Joining game: the host is gone for good and this run is over.
+/// The partner left the run by choice and this run is over, either role.
 #[must_use]
 pub fn run_over(partner: &str) -> (PauseText, Bar) {
     (
         PauseText {
             row0: Some("The run is over".into()),
             row0_blocked: true,
+            row0_choose: false,
             quit: None,
         },
         Bar::new(format!("{partner} left. The run is over.")),
     )
-}
-
-/// The partner is gone for this run (left for good, or left for the menu).
-#[must_use]
-pub fn partner_left() -> Bar {
-    Bar::new("Playing on alone. Saves stay off for this run.")
 }
 
 /// The link is back. `long`: the wait became the shared pause.
@@ -514,6 +621,7 @@ pub fn hud_no_signal(partner: &str) -> Hud {
         name: partner.to_owned(),
         detail: Some("no signal".into()),
         bad: true,
+        traffic: None,
     }
 }
 
@@ -524,6 +632,7 @@ pub fn hud_next_run(partner: &str) -> Hud {
         name: partner.to_owned(),
         detail: Some("co-op from the next run".into()),
         bad: false,
+        traffic: None,
     }
 }
 
@@ -534,6 +643,7 @@ pub fn hud_reconnecting(partner: &str) -> Hud {
         name: partner.to_owned(),
         detail: Some("reconnecting...".into()),
         bad: true,
+        traffic: None,
     }
 }
 
@@ -550,10 +660,31 @@ pub fn hud(partner: &str, rtt_ms: Option<f64>, loss_pct: Option<f64>) -> Hud {
         name: partner.to_owned(),
         detail: rtt_ms.map(|r| format!("{r:.0} ms")),
         bad: rtt_ms.is_some_and(|r| bad_link(r, loss_pct.unwrap_or(0.0))),
+        traffic: None,
     }
 }
 
-/// The link line on the loadout screen, in the run's words.
+/// The traffic line's text: KB/s of the mod's datagrams each way.
+#[must_use]
+pub fn traffic_text(up_kbs: f64, down_kbs: f64) -> String {
+    let kb = |x: f64| {
+        if x < 10.0 {
+            format!("{x:.1}")
+        } else {
+            format!("{x:.0}")
+        }
+    };
+    format!("{} KB/s up  {} KB/s down", kb(up_kbs), kb(down_kbs))
+}
+
+/// Puts the traffic line above a shown HUD line. `traffic`: `None` unlinked.
+pub fn add_traffic(ui: &mut RunUi, sw: Switches, traffic: Option<(f64, f64)>) {
+    if let (true, Some(h), Some((up, down))) = (sw.traffic, ui.hud.as_mut(), traffic) {
+        h.traffic = Some(traffic_text(up, down));
+    }
+}
+
+/// The link line on the new game screen, in the run's words.
 #[must_use]
 pub fn loadout_hud(
     partner: &str,
@@ -607,6 +738,200 @@ impl Alert {
     }
 }
 
+/// The partner's Ready alert wherever this player is. Never takes input.
+#[derive(Debug, Clone, Default)]
+pub struct ReadyNotice {
+    alert: Option<Alert>,
+    /// The cue is due ([`Self::take_cue`]).
+    cue: bool,
+    /// The places it was drawn on since it began ([`Self::first_on`]).
+    places: u8,
+}
+
+/// Where the partner's Ready is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyPlace {
+    NewGameScreen,
+    Menu,
+    CoopPage,
+    Run,
+    EndScreen,
+    /// The high-score name entry after the end screen (`oHighscoreEntry`).
+    NameEntry,
+    /// The high-score table after it (`oHighscoresDynamic`).
+    ScoreTable,
+}
+
+impl ReadyPlace {
+    /// In a log line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NewGameScreen => "the new game screen",
+            Self::Menu => "the main menu",
+            Self::CoopPage => "the Co-op page",
+            Self::Run => "a run",
+            Self::EndScreen => "the end screen",
+            Self::NameEntry => "the high-score name entry",
+            Self::ScoreTable => "the high-score table",
+        }
+    }
+}
+
+impl ReadyNotice {
+    /// The partner has just become ready: the alert and the cue.
+    pub fn start(&mut self, text: String) {
+        self.alert = Some(Alert::new(text));
+        self.cue = true;
+        self.places = 0;
+    }
+
+    /// The partner is not ready any more (or the link went): no alert, no cue.
+    pub fn clear(&mut self) {
+        self.alert = None;
+        self.cue = false;
+        self.places = 0;
+    }
+
+    /// It is drawn on `place` now: `true` the first time since it began.
+    pub fn first_on(&mut self, place: ReadyPlace) -> bool {
+        let bit = 1 << (place as u8);
+        let first = self.places & bit == 0;
+        self.places |= bit;
+        first
+    }
+
+    /// The cue to play now, once.
+    pub fn take_cue(&mut self) -> bool {
+        std::mem::take(&mut self.cue)
+    }
+
+    /// One drawn frame: the alert, while it is up.
+    pub fn step(&mut self) -> Option<AlertView> {
+        let v = self.alert.as_mut()?.advance();
+        if v.is_none() {
+            self.alert = None;
+        }
+        v
+    }
+}
+
+/// The bar while the partner stays ready: pulsing, as "in progress".
+#[must_use]
+pub fn ready_bar(text: impl Into<String>) -> Bar {
+    Bar::new(text).pulsing()
+}
+
+/// How long a lost link's notice stays in the menus at most.
+pub const LINK_NOTICE_FOR: Duration = Duration::from_secs(60);
+
+/// The screens a lost link's notice belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeRoom {
+    Menus,
+    NewGameScreen,
+    EndScreens,
+    Run,
+}
+
+impl ReadyPlace {
+    /// Its screen for a lost link's notice.
+    #[must_use]
+    pub fn room(self) -> NoticeRoom {
+        match self {
+            Self::Menu | Self::CoopPage => NoticeRoom::Menus,
+            Self::NewGameScreen => NoticeRoom::NewGameScreen,
+            Self::EndScreen | Self::NameEntry | Self::ScoreTable => NoticeRoom::EndScreens,
+            Self::Run => NoticeRoom::Run,
+        }
+    }
+}
+
+/// What a link that was up and went says, by how it went. `None`: this player
+/// dropped it, or it was never a link.
+#[must_use]
+pub fn lost_link_line(
+    reason: ndml_net::endpoint::DisconnectReason,
+    partner: &str,
+) -> Option<String> {
+    use ndml_net::endpoint::DisconnectReason as R;
+    match reason {
+        R::Remote => Some(super::text::partner_left(partner)),
+        R::Timeout | R::Replaced => Some(super::text::lost_link(partner, "")),
+        R::Local | R::HandshakeTimeout | R::Refused(_) => None,
+    }
+}
+
+/// A lost link in the menus: a bar and an alert. It stays on its first screen
+/// until the player leaves it, links again or [`LINK_NOTICE_FOR`] passes.
+#[derive(Debug, Clone)]
+pub struct LinkNotice {
+    line: String,
+    since: Instant,
+    room: Option<NoticeRoom>,
+    /// Made for that screen: until drawn there, another screen does not end it.
+    bound: Option<NoticeRoom>,
+    alert: Option<Alert>,
+    places: u8,
+}
+
+impl LinkNotice {
+    #[must_use]
+    pub fn new(line: String, now: Instant) -> Self {
+        let alert = Some(Alert::new(super::text::upper(line.trim_end_matches('.'))));
+        Self {
+            line,
+            since: now,
+            room: None,
+            bound: None,
+            alert,
+            places: 0,
+        }
+    }
+
+    /// A notice for `room` only: drawn there first.
+    #[must_use]
+    pub fn for_room(line: String, now: Instant, room: NoticeRoom) -> Self {
+        Self {
+            bound: Some(room),
+            ..Self::new(line, now)
+        }
+    }
+
+    /// Made for another screen, not drawn there: none on `place`, not over.
+    #[must_use]
+    pub fn waits_for_other(&self, place: ReadyPlace) -> bool {
+        self.room.is_none() && self.bound.is_some_and(|b| b != place.room())
+    }
+
+    /// One drawn frame on `place`: its bar and this frame's alert. `None` once
+    /// it is over: the caller drops it.
+    pub fn frame(&mut self, place: ReadyPlace, now: Instant) -> Option<(Bar, Option<AlertView>)> {
+        let room = place.room();
+        if room == NoticeRoom::Run || now.saturating_duration_since(self.since) > LINK_NOTICE_FOR {
+            return None;
+        }
+        match self.room {
+            Some(r) if r != room => return None,
+            None => self.room = Some(room),
+            Some(_) => {}
+        }
+        let alert = self.alert.as_mut().and_then(Alert::advance);
+        if alert.is_none() {
+            self.alert = None;
+        }
+        Some((Bar::new(self.line.clone()), alert))
+    }
+
+    /// It is drawn on `place` now: `true` the first time.
+    pub fn first_on(&mut self, place: ReadyPlace) -> bool {
+        let bit = 1 << (place as u8);
+        let first = self.places & bit == 0;
+        self.places |= bit;
+        first
+    }
+}
+
 /// The run messages' timers and state.
 #[derive(Debug, Clone, Default)]
 pub struct RunMessages {
@@ -615,8 +940,6 @@ pub struct RunMessages {
     lost: Option<(String, Instant)>,
     /// The next return is a long one (the shared pause).
     back_long: bool,
-    /// The partner left this run for good (since when).
-    left: Option<(String, Instant)>,
     /// "Sam is back" (text, since when).
     back: Option<(Bar, Instant)>,
     alert: Option<Alert>,
@@ -657,11 +980,14 @@ impl RunMessages {
                     self.session_note = Some((back_in_the_fight(Some(name)), now));
                 }
                 SessionEvent::AllDown => self.session_note = Some((all_down(), now)),
+                SessionEvent::PartnerReady
+                | SessionEvent::CountTick(..)
+                | SessionEvent::CountGo(_)
+                | SessionEvent::ResumedNoCount => {}
             }
         }
         if let Some(s) = self.session.me_down {
-            let next_to = (!self.session.me_down_alone).then_some(name);
-            ui.bars.push(you_are_down(next_to, s));
+            ui.bars.push(you_are_down(s));
         }
         if let Some(s) = self.session.partner_down {
             ui.bars.push(partner_is_down(name, s));
@@ -675,19 +1001,19 @@ impl RunMessages {
         }
     }
 
-    /// Something happened to the partner's part in this run.
-    pub fn event(&mut self, ev: LinkEvent, now: Instant) {
-        if !matches!(ev, LinkEvent::Back { .. }) {
-            // Gone for this run: no "is back" note beside it.
-            self.back = None;
-            self.back_long = false;
-        }
-        match ev {
-            LinkEvent::Left { name } => {
-                self.alert = Some(Alert::new(super::text::upper(&format!("{name} left"))));
-                self.lost = None;
-                self.left = Some((name, now));
+    /// A count showing (and "Resuming in 3..." on the pause screen).
+    fn count_view(&self, f: &RunFacts<'_>, ui: &mut RunUi) {
+        if let Some(c) = self.session.count {
+            if c.kind == CountKind::Resume && f.paused && ui.pause.is_none() {
+                ui.pause = Some(resume_counting(c.number));
             }
+            ui.count = Some(c.show());
+        }
+    }
+
+    /// Something happened to the partner's part in this run.
+    pub fn event(&mut self, ev: LinkEvent) {
+        match ev {
             LinkEvent::Back { long } => self.back_long = long,
         }
     }
@@ -701,7 +1027,7 @@ impl RunMessages {
         }
         let name = f.partner;
         if f.over && f.coop_run {
-            // The joining player's run is over: only that, until the menu.
+            // The run is over (the partner left): only that, until the menu.
             let (p, b) = run_over(name);
             ui.pause = Some(p);
             ui.bars.push(b);
@@ -749,19 +1075,10 @@ impl RunMessages {
                 None => {}
             }
         }
-        match f.upgrade.or(self.session.upgrade) {
-            Some(UpgradeWait::PartnerChoosing) => ui.card = Some(upgrade_waiting(name)),
-            Some(UpgradeWait::PartnerChoosingLong) => ui.card = Some(upgrade_waiting_long(name)),
-            Some(UpgradeWait::PartnerReady) => ui.bars.push(upgrade_partner_ready(name)),
-            Some(w @ (UpgradeWait::HeldPaused | UpgradeWait::HeldPausedLong)) => {
-                let (p, b) = upgrade_held_paused(name, w == UpgradeWait::HeldPausedLong);
-                // The held pause screen says why, over a partner's pause text.
-                ui.pause = Some(p);
-                ui.bars.push(b);
-            }
-            Some(UpgradeWait::ResumeToChoose) => ui.bars.push(resume_to_choose(name)),
-            None => {}
+        if let Some(w) = f.upgrade.or(self.session.upgrade) {
+            upgrade_view(name, w, self.session.upgrade_counts, &mut ui);
         }
+        self.count_view(f, &mut ui);
         self.session_bars(name, &mut ui, now);
         wait_bars(f, &mut ui);
         if f.coop_run {
@@ -781,6 +1098,7 @@ impl RunMessages {
                     name: name.to_owned(),
                     detail: Some("co-op from the next run".into()),
                     bad: false,
+                    traffic: None,
                 }
             });
         } else if sw.hud && f.coop_run && waiting {
@@ -810,6 +1128,26 @@ impl RunMessages {
     }
 }
 
+/// The upgrade round's card, bar or held pause screen.
+fn upgrade_view(name: &str, w: UpgradeWait, counts: bool, ui: &mut RunUi) {
+    match w {
+        UpgradeWait::PartnerChoosing => ui.card = Some(upgrade_waiting(name, counts)),
+        UpgradeWait::PartnerReady => ui.bars.push(upgrade_partner_ready(name, counts)),
+        UpgradeWait::HeldPaused => {
+            let (p, b) = upgrade_held_paused(name, counts);
+            // The held pause screen says why, over a partner's pause text.
+            ui.pause = Some(p);
+            ui.bars.push(b);
+        }
+        UpgradeWait::AtaraxiaHeld => {
+            let (p, b) = upgrade_ataraxia_held(name, counts);
+            ui.pause = Some(p);
+            ui.bars.push(b);
+        }
+        UpgradeWait::ResumeToChoose => ui.bars.push(resume_to_choose(name)),
+    }
+}
+
 /// A co-op run's pause menu: the last row ("Leave Co-op Run" or "Quit Run").
 fn pause_rows_text(f: &RunFacts<'_>, waiting: bool, ui: &mut RunUi) {
     // Held at the start gate (not a wait): the partner has not arrived.
@@ -823,6 +1161,7 @@ fn pause_rows_text(f: &RunFacts<'_>, waiting: bool, ui: &mut RunUi) {
     let p = ui.pause.get_or_insert(PauseText {
         row0: None,
         row0_blocked: false,
+        row0_choose: false,
         quit: None,
     });
     p.quit = quit;
@@ -848,13 +1187,8 @@ fn wait_bars(f: &RunFacts<'_>, ui: &mut RunUi) {
 }
 
 impl RunMessages {
-    /// The notes after a change: the partner left, back.
+    /// The notes after a change: the partner back.
     fn link_bars(&mut self, f: &RunFacts<'_>, ui: &mut RunUi, now: Instant) {
-        if let Some((_, at)) = &self.left
-            && now.saturating_duration_since(*at) < NOTE_FOR
-        {
-            ui.bars.push(partner_left());
-        }
         if let Some((bar, at)) = &self.back {
             if now.saturating_duration_since(*at) < NOTE_FOR && f.linked {
                 if bar.text.ends_with("both resumed.") {
@@ -885,7 +1219,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_loadout_link_line_uses_the_runs_words() {
+    fn a_lost_link_says_how_it_went_and_stays_on_its_screen() {
+        use ndml_net::endpoint::DisconnectReason as R;
+        assert_eq!(
+            lost_link_line(R::Remote, "Sam").as_deref(),
+            Some("Sam left.")
+        );
+        assert_eq!(
+            lost_link_line(R::Timeout, "Sam").as_deref(),
+            Some("Lost the link to Sam.")
+        );
+        assert_eq!(
+            lost_link_line(R::Replaced, "Sam").as_deref(),
+            Some("Lost the link to Sam.")
+        );
+        assert_eq!(
+            lost_link_line(R::Local, "Sam"),
+            None,
+            "this player dropped it"
+        );
+        assert_eq!(lost_link_line(R::HandshakeTimeout, "Sam"), None);
+        let t = Instant::now();
+        let mut n = LinkNotice::new("Lost the link to Sam.".into(), t);
+        let (bar, alert) = n.frame(ReadyPlace::CoopPage, t).expect("shown");
+        assert_eq!(bar.text, "Lost the link to Sam.");
+        assert!(!bar.pulse, "a fact, not a wait");
+        assert_eq!(alert.expect("its alert").text, "LOST THE LINK TO SAM");
+        assert!(n.first_on(ReadyPlace::CoopPage) && !n.first_on(ReadyPlace::CoopPage));
+        // The main menu is the same screen as its Co-op page.
+        assert!(
+            n.frame(ReadyPlace::Menu, t + Duration::from_secs(1))
+                .is_some()
+        );
+        // The alert fades, the bar stays.
+        let mut last = None;
+        for i in 0..400 {
+            last = n.frame(ReadyPlace::Menu, t + Duration::from_millis(1000 + i * 16));
+        }
+        let (bar, alert) = last.expect("still up");
+        assert!(alert.is_none() && bar.text.starts_with("Lost"));
+        assert!(n.clone().frame(ReadyPlace::NewGameScreen, t).is_none());
+        assert!(n.clone().frame(ReadyPlace::Run, t).is_none());
+        assert!(
+            n.frame(
+                ReadyPlace::Menu,
+                t + LINK_NOTICE_FOR + Duration::from_secs(1)
+            )
+            .is_none()
+        );
+        // The end screens are one screen.
+        let mut e = LinkNotice::new("Sam left.".into(), t);
+        assert!(e.frame(ReadyPlace::EndScreen, t).is_some());
+        assert!(e.frame(ReadyPlace::ScoreTable, t).is_some());
+        // Made for the menus: it waits for them, then stays there.
+        let mut g = LinkNotice::for_room("Kept.".into(), t, NoticeRoom::Menus);
+        assert!(g.waits_for_other(ReadyPlace::NewGameScreen));
+        assert!(!g.waits_for_other(ReadyPlace::Menu));
+        assert!(g.frame(ReadyPlace::Menu, t).is_some());
+        assert!(
+            !g.waits_for_other(ReadyPlace::NewGameScreen),
+            "drawn: as any"
+        );
+        assert!(g.frame(ReadyPlace::CoopPage, t).is_some());
+        assert!(g.frame(ReadyPlace::NewGameScreen, t).is_none());
+    }
+
+    /// The alert grows, holds and fades as the wave alert does. Its cue is due
+    /// once, and it goes at a clear.
+    #[test]
+    fn the_ready_notice_alerts_once_and_fades() {
+        let mut n = ReadyNotice::default();
+        assert!(n.step().is_none() && !n.take_cue());
+        n.start("SAM IS READY".into());
+        assert!(n.take_cue() && !n.take_cue(), "the cue once");
+        let first = n.step().expect("up");
+        assert_eq!(first.text, "SAM IS READY");
+        let mut last = first;
+        let mut steps = 1;
+        while let Some(v) = n.step() {
+            last = v;
+            steps += 1;
+        }
+        assert!(
+            last.scale > 0.99 && steps > ALERT_HOLD_STEPS,
+            "grown, held, faded"
+        );
+        assert!(n.step().is_none(), "gone after its fade");
+        n.start("SAM IS READY".into());
+        n.clear();
+        assert!(n.step().is_none() && !n.take_cue(), "cleared");
+        assert!(ready_bar("x").pulse);
+    }
+
+    #[test]
+    fn the_new_game_screen_link_line_uses_the_runs_words() {
         let s = |x: f64| Some(Duration::from_secs_f64(x));
         assert_eq!(
             loadout_hud("Sam", true, false, Some(42.0), Some(0.0), s(0.1)),
@@ -1181,14 +1608,14 @@ mod tests {
         let back = facts(GatePhase::Running);
         let mut m = RunMessages::default();
         m.frame(&waiting, sw, t0);
-        m.event(LinkEvent::Back { long: false }, t0);
+        m.event(LinkEvent::Back { long: false });
         let ui = m.frame(&back, sw, t0 + Duration::from_secs(1));
         assert!(texts(&ui).contains(&"Sam is back."), "{:?}", ui.bars);
         let ui = m.frame(&back, sw, t0 + NOTE_FOR + Duration::from_secs(2));
         assert!(!texts(&ui).contains(&"Sam is back."), "the note fades");
         let mut m = RunMessages::default();
         m.frame(&waiting, sw, t0);
-        m.event(LinkEvent::Back { long: true }, t0);
+        m.event(LinkEvent::Back { long: true });
         let ui = m.frame(&back, sw, t0 + Duration::from_secs(1));
         assert!(
             texts(&ui).contains(&"Sam is back. Play resumes when you have both resumed."),
@@ -1208,10 +1635,8 @@ mod tests {
         assert!(!t.contains(&both_paused("Sam").text.as_str()), "{t:?}");
     }
 
-    /// The partner left just after the return: no "Sam is back." beside it;
-    /// the host's last row reads Quit Run from then on.
     #[test]
-    fn leaving_just_after_the_return_drops_the_back_note() {
+    fn leaving_just_after_the_return_shows_only_the_run_over() {
         let t0 = Instant::now();
         let sw = Switches::default();
         let mut m = RunMessages::default();
@@ -1221,26 +1646,28 @@ mod tests {
             ..facts(GatePhase::Running)
         };
         m.frame(&frozen, sw, t0);
-        m.event(LinkEvent::Back { long: true }, t0);
+        m.event(LinkEvent::Back { long: true });
         let back = RunFacts {
             paused: true,
             ..facts(GatePhase::Running)
         };
         let ui = m.frame(&back, sw, t0);
         assert!(texts(&ui).iter().any(|t| t.starts_with("Sam is back.")));
-        m.event(LinkEvent::Left { name: "Sam".into() }, t0);
-        let gone = RunFacts {
-            separate: true,
-            ..back
-        };
-        let ui = m.frame(&gone, sw, t0);
-        let t = texts(&ui);
-        assert!(t.iter().all(|t| !t.contains("is back")), "{t:?}");
-        assert!(
-            t.iter().any(|t| t.starts_with("Playing on alone.")),
-            "{t:?}"
-        );
-        assert_eq!(ui.pause.unwrap().quit.unwrap().0, "Quit Run");
+        for host in [true, false] {
+            let gone = RunFacts {
+                separate: true,
+                over: true,
+                host,
+                ..back
+            };
+            let ui = m.frame(&gone, sw, t0);
+            assert_eq!(
+                texts(&ui),
+                vec!["Sam left. The run is over."],
+                "host {host}"
+            );
+            assert_eq!(ui.pause.unwrap().row0.as_deref(), Some("The run is over"));
+        }
     }
 
     #[test]
@@ -1311,14 +1738,16 @@ mod tests {
     }
 
     #[test]
-    fn partner_left_alert_grows_holds_and_fades() {
+    fn the_connection_lost_alert_grows_holds_and_fades() {
         let mut m = RunMessages::default();
         let t0 = Instant::now();
-        m.event(LinkEvent::Left { name: "Sam".into() }, t0);
         let mut f = facts(GatePhase::Running);
         f.linked = false;
+        f.wait = WaitView::PlayingOn {
+            left: Duration::from_secs(12),
+        };
         let first = m.frame(&f, Switches::default(), t0).alert.unwrap();
-        assert_eq!(first.text, "SAM LEFT");
+        assert_eq!(first.text, "CONNECTION LOST");
         assert!(first.scale < 0.2 && (first.alpha - 1.0).abs() < 1e-9);
         let mut last = first;
         let mut frames = 1;
@@ -1348,14 +1777,14 @@ mod tests {
             pause_partner_ready("Sam").text,
             "Sam is ready and waiting for you."
         );
-        let c = upgrade_waiting("Sam");
+        let c = upgrade_waiting("Sam", false);
         assert_eq!(
             (c.title.as_str(), c.subtitle.as_str()),
             ("WAITING", "Waiting for Sam...")
         );
         assert_eq!(
-            upgrade_partner_ready("Sam").text,
-            "Sam is ready and waiting for you."
+            upgrade_partner_ready("Sam", false).text,
+            "Sam is ready and waiting for you. (no countdown)"
         );
         assert_eq!(
             leave_run("Sam", true, false, false).1,
@@ -1408,19 +1837,14 @@ mod tests {
         let ui = m.frame(&f, sw, t0);
         assert!(!ui.pause.unwrap().row0_blocked);
         assert!(ui.bars[0].text.contains("paused too"));
-        // Waiting on the upgrade screen: the card; after the wait, Esc.
         m.set_session(SessionFacts {
             upgrade: Some(UpgradeWait::PartnerChoosing),
             ..SessionFacts::default()
         });
-        assert_eq!(m.frame(&f, sw, t0).card, Some(upgrade_waiting("Sam")));
-        m.set_session(SessionFacts {
-            upgrade: Some(UpgradeWait::PartnerChoosingLong),
-            ..SessionFacts::default()
-        });
-        let card = m.frame(&f, sw, t0).card.unwrap();
-        assert!(card.note.unwrap().starts_with("Press Esc to play on."));
-        // Nothing to choose: the pause screen says why; Esc after the wait.
+        assert_eq!(
+            m.frame(&f, sw, t0).card,
+            Some(upgrade_waiting("Sam", false))
+        );
         m.set_session(SessionFacts {
             upgrade: Some(UpgradeWait::HeldPaused),
             ..SessionFacts::default()
@@ -1429,14 +1853,9 @@ mod tests {
         let p = ui.pause.unwrap();
         assert_eq!(p.row0.as_deref(), Some("Waiting for Sam..."));
         assert!(p.row0_blocked);
-        assert!(ui.bars[0].text == "Sam is choosing an upgrade." && ui.bars[0].pulse);
-        m.set_session(SessionFacts {
-            upgrade: Some(UpgradeWait::HeldPausedLong),
-            ..SessionFacts::default()
-        });
-        let p = m.frame(&f, sw, t0).pause.unwrap();
-        assert_eq!(p.row0.as_deref(), Some("Play On"));
-        assert!(!p.row0_blocked);
+        assert!(
+            ui.bars[0].text == "Sam is choosing an upgrade. (no countdown)" && ui.bars[0].pulse
+        );
         m.set_session(SessionFacts {
             upgrade: Some(UpgradeWait::ResumeToChoose),
             ..SessionFacts::default()
@@ -1451,11 +1870,120 @@ mod tests {
             upgrade: Some(UpgradeWait::PartnerReady),
             ..SessionFacts::default()
         });
-        assert_eq!(m.frame(&f, sw, t0).bars, vec![upgrade_partner_ready("Sam")]);
+        assert_eq!(
+            m.frame(&f, sw, t0).bars,
+            vec![upgrade_partner_ready("Sam", false)]
+        );
         // What the caller passes wins over the session.
         let mut g = facts(GatePhase::Running);
         g.upgrade = Some(UpgradeWait::PartnerChoosing);
         assert!(m.frame(&g, sw, t0).card.is_some());
+    }
+
+    #[test]
+    fn counts_and_the_ataraxia_hold_as_shown() {
+        let mut f = facts(GatePhase::Running);
+        let sw = Switches::default();
+        let (mut m, t0) = past_start_note(&f);
+        f.paused = true;
+        m.set_session(SessionFacts {
+            count: Some(CountView {
+                kind: CountKind::Resume,
+                number: 2,
+                phase_pm: 250,
+            }),
+            ..SessionFacts::default()
+        });
+        let ui = m.frame(&f, sw, t0);
+        let p = ui.pause.unwrap();
+        assert_eq!(p.row0.as_deref(), Some("Resuming in 2..."));
+        assert!(p.row0_blocked && !p.row0_choose);
+        let c = ui.count.unwrap();
+        assert!(c.edge && c.number == 2 && c.label == "RESUMING");
+        assert!((c.phase - 0.25).abs() < 1e-9);
+        f.paused = false;
+        m.set_session(SessionFacts {
+            count: Some(CountView {
+                kind: CountKind::Respawn,
+                number: 3,
+                phase_pm: 0,
+            }),
+            ..SessionFacts::default()
+        });
+        let ui = m.frame(&f, sw, t0);
+        assert_eq!(ui.pause.and_then(|p| p.row0), None, "no pause text");
+        let c = ui.count.unwrap();
+        assert!(c.edge && !c.panel && !c.dim && c.number == 3 && c.label == "BACK IN");
+        let start = CountView {
+            kind: CountKind::Start,
+            number: 1,
+            phase_pm: 0,
+        }
+        .show();
+        assert!(start.edge && start.panel && start.label == "STARTING");
+        f.paused = true;
+        // No Space prompt on the bar. Row 0 opens this player's screen.
+        m.set_session(SessionFacts {
+            upgrade: Some(UpgradeWait::AtaraxiaHeld),
+            ..SessionFacts::default()
+        });
+        let ui = m.frame(&f, sw, t0);
+        let p = ui.pause.unwrap();
+        assert_eq!(p.row0.as_deref(), Some("Choose Upgrade"));
+        assert!(p.row0_choose && !p.row0_blocked);
+        assert_eq!(
+            ui.bars[0].text,
+            "Sam is choosing an upgrade. (no countdown)"
+        );
+    }
+
+    #[test]
+    fn the_upgrade_waits_say_whether_the_end_counts() {
+        assert_eq!(super::super::text::resume_note(false), "(no countdown)");
+        assert_eq!(
+            super::super::text::resume_note(true),
+            "(countdown on resume)"
+        );
+        let f = facts(GatePhase::Running);
+        let sw = Switches::default();
+        let (mut m, t0) = past_start_note(&f);
+        let text = |m: &mut RunMessages, w, counts| {
+            m.set_session(SessionFacts {
+                upgrade: Some(w),
+                upgrade_counts: counts,
+                ..SessionFacts::default()
+            });
+            let ui = m.frame(&f, sw, t0);
+            ui.card
+                .and_then(|c| c.note)
+                .or_else(|| {
+                    ui.bars
+                        .iter()
+                        .find(|b| b.text.contains("countdown"))
+                        .map(|b| b.text.clone())
+                })
+                .unwrap_or_default()
+        };
+        for (w, line) in [
+            (UpgradeWait::PartnerChoosing, "Sam is choosing an upgrade."),
+            (
+                UpgradeWait::PartnerReady,
+                "Sam is ready and waiting for you.",
+            ),
+            (UpgradeWait::HeldPaused, "Sam is choosing an upgrade."),
+            (UpgradeWait::AtaraxiaHeld, "Sam is choosing an upgrade."),
+        ] {
+            assert_eq!(
+                text(&mut m, w, false),
+                format!("{line} (no countdown)"),
+                "{w:?}"
+            );
+            assert_eq!(
+                text(&mut m, w, true),
+                format!("{line} (countdown on resume)"),
+                "{w:?}"
+            );
+        }
     }
 
     #[test]
@@ -1470,22 +1998,9 @@ mod tests {
         });
         let ui = m.frame(&f, sw, t0);
         assert_eq!(ui.alert.unwrap().text, "SHIP DOWN");
-        assert_eq!(
-            ui.bars,
-            vec![you_are_down(Some("Sam"), 32)],
-            "the countdown names who you come back to"
-        );
-        assert!(ui.bars[0].text.contains("Back next to Sam in 32 s") && ui.bars[0].pulse);
-        // Alone, the ship comes back where it went down: nobody named.
-        let mut alone = past_start_note(&f).0;
-        alone.set_session(SessionFacts {
-            me_down: Some(32),
-            me_down_alone: true,
-            ..SessionFacts::default()
-        });
-        let ui = alone.frame(&f, sw, t0);
-        assert_eq!(ui.bars, vec![you_are_down(None, 32)]);
+        assert_eq!(ui.bars, vec![you_are_down(32)]);
         assert_eq!(ui.bars[0].text, "Your ship is down. Back in 32 s.");
+        assert!(ui.bars[0].pulse);
         let (mut m, t0) = past_start_note(&f);
         m.session_event(SessionEvent::PartnerDown);
         m.set_session(SessionFacts {

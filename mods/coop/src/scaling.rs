@@ -27,8 +27,9 @@
 //!   `enemy_health_mult` (a few later absolute writes undo it).
 //! * Damage: `enemyDamageScaling`'s result times `enemy_damage_mult`.
 //! * Whose values: the host's, sent in `SessionSettings` ([`session_mults`]).
-//! * Saves: `triggerSaveRun` and `deleteRunFiles` skipped for a run that
-//!   started linked (a latch that holds after a disconnect).
+//! * Saves: `triggerSaveRun` and `deleteRunFiles` skipped from a Start taken while linked
+//!   (`start_held`) through the whole co-op run it makes (`save_protect`, kept after a
+//!   disconnect), and while the host's run settings are held (`rules_held`).
 //! * Leaderboards: no upload while linked or in such a run ([`upload_blocked`]).
 
 #![forbid(unsafe_code)]
@@ -43,6 +44,9 @@ pub struct Flags {
     save_protect: AtomicBool,
     /// The host's run settings may be in the flags (`loadout`).
     rules_held: AtomicBool,
+    /// A Start taken while linked waits for its run's first frame
+    /// (`state::Core::start_held`).
+    start_held: AtomicBool,
     linked: AtomicBool,
     health_mult: AtomicU64,
     damage_mult: AtomicU64,
@@ -57,6 +61,7 @@ impl Flags {
             scaling: AtomicBool::new(false),
             save_protect: AtomicBool::new(false),
             rules_held: AtomicBool::new(false),
+            start_held: AtomicBool::new(false),
             linked: AtomicBool::new(false),
             health_mult: AtomicU64::new(health_mult.to_bits()),
             damage_mult: AtomicU64::new(damage_mult.to_bits()),
@@ -120,11 +125,18 @@ impl Flags {
         self.rules_held.store(held, Ordering::Relaxed);
     }
 
-    /// Whether the resume file's writes are skipped: in a co-op run, or while
-    /// the host's run settings may be in the flags.
+    /// Whether a Start taken while linked waits for its run.
+    pub fn set_start_held(&self, held: bool) {
+        self.start_held.store(held, Ordering::Relaxed);
+    }
+
+    /// Whether the resume file's writes are skipped: saves protected, a Start
+    /// taken while linked, or the host's run settings held.
     #[must_use]
     pub fn resume_writes_off(&self) -> bool {
-        self.save_protect() || self.rules_held.load(Ordering::Relaxed)
+        self.save_protect()
+            || self.start_held.load(Ordering::Relaxed)
+            || self.rules_held.load(Ordering::Relaxed)
     }
 }
 
@@ -149,28 +161,6 @@ pub fn session_mults(own: (f64, f64), host: Option<(f32, f32)>) -> (f64, f64) {
         }
     };
     (take(h, own.0), take(d, own.1))
-}
-
-/// A wait as `SessionSettings` carries it: seconds, 0 = none (forever, or
-/// never, as the setting reads it).
-#[must_use]
-pub fn wire_secs(d: Option<Duration>) -> f32 {
-    d.map_or(0.0, |d| d.as_secs_f32())
-}
-
-/// A wait from the host's `SessionSettings`, clamped as the file's own is
-/// (`lo`..3600 s; 0 = none). `None`: no valid seconds, keep the file's.
-#[must_use]
-pub fn host_wait(secs: f32, lo: f64) -> Option<Option<Duration>> {
-    let s = f64::from(secs);
-    if !s.is_finite() || s < 0.0 {
-        return None;
-    }
-    if s == 0.0 {
-        return Some(None);
-    }
-    let s = (s * 1e3).round() / 1e3;
-    Some(Some(Duration::from_secs_f64(s.clamp(lo, 3600.0))))
 }
 
 /// The respawn time from the host's `SessionSettings`, clamped to 5..600 s.
@@ -264,6 +254,12 @@ mod tests {
         assert!(!f.save_protect(), "the latch itself is unchanged");
         f.set_rules_held(false);
         assert!(!f.resume_writes_off());
+        // A Start taken while linked, before its run's first tick.
+        f.set_start_held(true);
+        assert!(f.resume_writes_off(), "a linked Start, before its run");
+        assert!(!f.save_protect());
+        f.set_start_held(false);
+        assert!(!f.resume_writes_off());
     }
 
     /// A joining game applies the host's multipliers once they arrived.
@@ -293,22 +289,6 @@ mod tests {
         f.set_mults(1.8, 1.25);
         assert_eq!(f.health_mult(), Some(1.8));
         assert_eq!(f.damage_mult(), Some(1.25));
-    }
-
-    /// The host's waits: 0 = none, clamped as the files', garbage ignored.
-    #[test]
-    fn the_hosts_waits_count() {
-        assert!(wire_secs(None).abs() < 1e-9);
-        assert!((wire_secs(Some(Duration::from_secs(20))) - 20.0).abs() < 1e-6);
-        assert_eq!(host_wait(0.0, 1.0), Some(None));
-        assert_eq!(host_wait(20.0, 1.0), Some(Some(Duration::from_secs(20))));
-        assert_eq!(host_wait(2.0, 10.0), Some(Some(Duration::from_secs(10))));
-        assert_eq!(host_wait(1e9, 1.0), Some(Some(Duration::from_secs(3600))));
-        assert_eq!(host_wait(f32::NAN, 1.0), None);
-        assert_eq!(host_wait(-1.0, 1.0), None);
-        // A round trip through the wire keeps the file's value.
-        let d = Some(Duration::from_millis(12_500));
-        assert_eq!(host_wait(wire_secs(d), 1.0), Some(d));
     }
 
     /// The host's respawn time: clamped as the file's, garbage ignored.

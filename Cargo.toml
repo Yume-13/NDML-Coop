@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "mods/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.100"
 publish = false
@@ -11,12 +11,13 @@ license = "MIT"
 repository = "https://github.com/Yume-13/NDML-Coop"
 
 [workspace.dependencies]
-ndml-sdk = { git = "https://github.com/Yume-13/NDML", tag = "v0.1.2" }
+ndml-sdk = { git = "https://github.com/Yume-13/NDML", tag = "v0.1.4" }
 ndml-net = { path = "crates/ndml-net" }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 toml = "1"
+cpu-time = "1.0.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -122,7 +122,9 @@ impl WorldHooks {
             .as_ref()
             .map_or_default(|o| o.local_roots.clone());
         let o = u32::from(obj);
-        let e = self.class_of(call, o, true) == Some(Class::Other)
+        let e = self
+            .class_of(call, o, true)
+            .is_some_and(Class::may_go_with_an_enemy)
             && !roots.iter().any(|&r| self.ancestor(call, o, Some(r)))
             && !self.player_family(call, o);
         self.lock().deps.eligible.insert(obj, e);
@@ -142,7 +144,7 @@ impl WorldHooks {
 
     /// Whether `obj` is a player family member by name
     /// ([`super::classify::is_player_family_name`]); `true` when unknown.
-    fn player_family(&self, call: &Call<'_>, obj: u32) -> bool {
+    pub(super) fn player_family(&self, call: &Call<'_>, obj: u32) -> bool {
         let Some(parent) = self.h.object_parent else {
             return true;
         };

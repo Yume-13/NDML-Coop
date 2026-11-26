@@ -72,8 +72,13 @@ fn status_of(dir: &Path) -> Status {
 /// `stalled` is an id whose game thread does not pump; `per_pump` caps sends
 /// per pump (0: none); `out_capacity` sizes later agents' queues (0: default);
 /// `drop_after_stall` drops the stalled side's backlog, as the co-op pump does.
+/// `queues` gives a sender Steam's own send queue ([`SendQueue`]). A send
+/// past its size is refused and counted in `refused`. `now_ms` is the time the
+/// rate counts in, set before a pump.
 #[derive(Default)]
 struct FakeSteam {
+    queues: HashMap<u64, SendQueue>,
+    now_ms: u64,
     bridges: HashMap<u64, SteamBridge>,
     stalled: Option<u64>,
     was_stalled: Option<u64>,
@@ -88,6 +93,73 @@ struct FakeSteam {
     dup_pct: u64,
     refused: u64,
     rng: u64,
+}
+
+/// Steam's send queue for one sender: `cap` bytes at most, drained in order
+/// at `rate` bytes a second, nothing while `stalled` (a path that carries
+/// nothing for a while). `SendP2PPacket` returns false when too many bytes are
+/// queued. Steam states no size or rate.
+#[derive(Debug, Default)]
+struct SendQueue {
+    cap: usize,
+    rate: f64,
+    stalled: bool,
+    q: std::collections::VecDeque<(u64, Vec<u8>)>,
+    bytes: usize,
+    credit: f64,
+    last_ms: Option<u64>,
+    /// The most bytes it ever held.
+    peak: usize,
+}
+
+impl SendQueue {
+    fn new(cap_kb: usize, rate_kbps: f64) -> Self {
+        Self {
+            cap: cap_kb * 1024,
+            rate: rate_kbps * 1024.0,
+            ..Self::default()
+        }
+    }
+
+    /// Take a datagram, or refuse it (`false`) when it would not fit.
+    fn offer(&mut self, to: u64, data: Vec<u8>) -> bool {
+        if self.bytes + data.len() > self.cap {
+            return false;
+        }
+        self.bytes += data.len();
+        self.peak = self.peak.max(self.bytes);
+        self.q.push_back((to, data));
+        true
+    }
+
+    /// What has left by `now_ms`.
+    fn drain(&mut self, now_ms: u64) -> Vec<(u64, Vec<u8>)> {
+        let dt = self.last_ms.map_or(0, |t| now_ms.saturating_sub(t));
+        self.last_ms = Some(now_ms);
+        if self.stalled {
+            self.credit = 0.0;
+            return Vec::new();
+        }
+        #[allow(clippy::cast_precision_loss)] // milliseconds of a test
+        let add = self.rate * dt as f64 / 1000.0;
+        // No saving up past a frame's worth while idle.
+        self.credit = (self.credit + add).min(self.rate * 0.02 + 1500.0);
+        let mut out = Vec::new();
+        #[allow(clippy::cast_precision_loss)] // datagram sizes
+        while self
+            .q
+            .front()
+            .is_some_and(|(_, d)| d.len() as f64 <= self.credit)
+        {
+            let Some((to, d)) = self.q.pop_front() else {
+                break;
+            };
+            self.credit -= d.len() as f64;
+            self.bytes -= d.len();
+            out.push((to, d));
+        }
+        out
+    }
 }
 
 impl FakeSteam {
@@ -120,6 +192,14 @@ impl FakeSteam {
                 }
             }
         }
+        let now = self.now_ms;
+        for (&from, q) in &mut self.queues {
+            for (to, data) in q.drain(now) {
+                if let Some(b) = self.bridges.get(&to) {
+                    let _ = b.deliver(from, data);
+                }
+            }
+        }
         let mut moving = Vec::new();
         for (&from, b) in &self.bridges {
             if self.stalled == Some(from) {
@@ -139,6 +219,12 @@ impl FakeSteam {
             moving.reverse();
         }
         for (from, d) in moving {
+            if let Some(q) = self.queues.get_mut(&from) {
+                if !q.offer(d.peer, d.data) {
+                    self.refused += 1;
+                }
+                continue;
+            }
             if self.refuse_pct > 0 && self.roll() < self.refuse_pct {
                 self.refused += 1;
                 continue;
@@ -1009,4 +1095,409 @@ fn the_host_leaving_mid_join_ends_the_attempt_in_time() {
             .contains("Steam could not connect you")
     );
     assert!(!host.steam_active());
+}
+
+// ---- Steam's send queue under heavy traffic ----------------------------------
+
+/// One cell of the heavy-traffic grid: Steam's queue on both sides
+/// (`cap_kb`, `rate_kbps`), the traffic seed.
+#[derive(Debug, Clone, Copy)]
+struct Heavy {
+    cap_kb: usize,
+    rate_kbps: f64,
+    seed: u64,
+}
+
+impl Heavy {
+    /// How long a full queue takes to drain, ms.
+    fn depth_ms(&self) -> u64 {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // KB and ms
+        let d = (self.cap_kb as f64 / self.rate_kbps * 1000.0) as u64;
+        d
+    }
+}
+
+/// What one run measured (milliseconds unless said).
+#[derive(Debug, Default)]
+struct HeavyResult {
+    /// Disconnects either side saw.
+    gone: Vec<Event>,
+    /// Reliable messages in arrival order: host to joiner the critical
+    /// rounds and the bulk spawns, joiner to host its rounds.
+    rounds_to_join: Vec<u16>,
+    spawns_to_join: Vec<u16>,
+    rounds_to_host: Vec<u16>,
+    sent: (u16, u16, u16),
+    /// Worst delay of a critical round while the traffic was heavy (the
+    /// stall and the drain after it left out), each way.
+    worst_heavy: (u64, u64),
+    /// Worst delay of a round sent across the stall, each way.
+    worst_stall: (u64, u64),
+    /// Worst delay of a round once the heavy traffic was over and Steam's
+    /// queue had had time to empty, each way.
+    worst_after: (u64, u64),
+    /// First newly accepted packet after the stall ended, each way.
+    resume: (u64, u64),
+    /// Longest stretch without a newly accepted packet outside the stall
+    /// and its drain, each way.
+    longest_gap: (u64, u64),
+    /// The same once the heavy traffic was over and the queue had emptied.
+    gap_after: (u64, u64),
+    /// Steam refusals, the most bytes the host's queue held, the most
+    /// reliable messages unacked on either side, unacked at the end.
+    refused: u64,
+    peak_queue: usize,
+    max_unacked: usize,
+    end_unacked: (usize, usize),
+    bridge_drops: u64,
+    /// Bytes the host offered (its game's messages) and Steam carried.
+    offered_kb: f64,
+}
+
+/// The host's send rate at second `s` of the heavy stretch, KB/s: 30 s
+/// cycles of one 10 s window with a 1,160 KB second and nine of 429, then
+/// 20 s at 244 (a mean of about 330 KB/s).
+fn host_kbps(s: u64) -> f64 {
+    match s % 30 {
+        0 => 1160.0,
+        1..=9 => 429.0,
+        _ => 244.0,
+    }
+}
+
+/// The joining game's send rate, the same shape.
+fn join_kbps(s: u64) -> f64 {
+    match s % 30 {
+        0 => 122.0,
+        1..=9 => 70.0,
+        _ => 52.0,
+    }
+}
+
+const HEAVY_FROM: u64 = 5_000;
+const HEAVY_TO: u64 = 95_000;
+const STALL_FROM: u64 = 50_000;
+const STALL_TO: u64 = 56_000;
+const HEAVY_END: u64 = 125_000;
+
+/// Two linked games over the fake Steam with a send queue each way, for two
+/// minutes of simulated play: 90 s of heavy traffic, a 6 s total stall of both
+/// queues in the middle, then 30 s of light traffic. The network threads poll
+/// every 2 ms and the game threads pump every 16 ms. Each frame each game
+/// queues its unreliable bytes for the second's rate. The host also sends one
+/// reliable spawn a frame, and both send a reliable critical message
+/// (`UpgradeOpen`) every 250 ms.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // one scenario, read in one piece
+fn heavy_run(h: Heavy) -> HeavyResult {
+    let net = LoopbackNet::new();
+    let mut steam = FakeSteam::default();
+    let name = format!("heavy-{}-{}-{}", h.cap_kb, h.rate_kbps, h.seed);
+    let (mut host, mut join, dh, dc) = linked(&name, &mut steam, &net);
+    steam.per_pump = 64;
+    steam.now_ms = 300;
+    for id in [ALICE, BOB] {
+        let mut q = SendQueue::new(h.cap_kb, h.rate_kbps);
+        q.last_ms = Some(300);
+        steam.queues.insert(id, q);
+    }
+    let enemies: Vec<crate::msg::EnemyState> = (0..400)
+        .map(|i| crate::msg::EnemyState {
+            net_id: i,
+            x: f32::from(i),
+            y: 1.0,
+            angle: 0.0,
+            hull_frac: 1.0,
+            target: None,
+            seg: 0,
+        })
+        .collect();
+    let mut rng = h.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut jitter = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        // 0.6 .. 1.4
+        #[allow(clippy::cast_precision_loss)] // a test's draw
+        let f = 0.6 + (rng % 800) as f64 / 1000.0;
+        f
+    };
+    let mut r = HeavyResult::default();
+    let (mut owe_h, mut owe_j) = (0.0_f64, 0.0_f64);
+    let (mut part_h, mut part_j) = (0usize, 0usize);
+    let (mut round_h, mut round_j, mut spawn) = (0u16, 0u16, 0u16);
+    let mut sent_h: Vec<u64> = Vec::new();
+    let mut sent_j: Vec<u64> = Vec::new();
+    // The receivers' newly accepted packet counts, and when they last grew.
+    let (mut seen_j, mut seen_h) = ((0u64, 300u64), (0u64, 300u64));
+    let drain_ms = h.depth_ms();
+    let settled = HEAVY_TO + drain_ms + 2_000;
+    let calm = |t: u64| t < STALL_FROM || t >= STALL_TO + drain_ms + 2_000;
+    let gap = |seen: &mut (u64, u64), n: u64, t: u64, worst: &mut u64, after: &mut u64| {
+        if n != seen.0 {
+            let g = t - seen.1;
+            if calm(seen.1) && calm(t) && seen.1 >= HEAVY_FROM {
+                *worst = (*worst).max(g);
+            }
+            if seen.1 >= settled {
+                *after = (*after).max(g);
+            }
+            *seen = (n, t);
+        }
+    };
+    let mut t = 300;
+    while t < HEAVY_END {
+        let frame = (t - 300).is_multiple_of(16);
+        if frame {
+            let s = t / 1000;
+            let heavy = (HEAVY_FROM..HEAVY_TO).contains(&t);
+            let (kh, kj) = if heavy {
+                (
+                    host_kbps(s - HEAVY_FROM / 1000),
+                    join_kbps(s - HEAVY_FROM / 1000),
+                )
+            } else {
+                (20.0, 10.0)
+            };
+            owe_h += kh * 1024.0 * 0.016 * jitter();
+            owe_j += kj * 1024.0 * 0.016 * jitter();
+            let wire = crate::time::to_wire_ms(ms(t));
+            let parts = crate::msg::EnemySnapshotFine::split(wire, &enemies);
+            for (a, to, owe, part) in [
+                (&mut host, PeerId(1), &mut owe_h, &mut part_h),
+                (&mut join, PeerId::HOST, &mut owe_j, &mut part_j),
+            ] {
+                while *owe > 0.0 {
+                    let m =
+                        crate::msg::Message::EnemySnapshotFine(parts[*part % parts.len()].clone());
+                    *part += 1;
+                    #[allow(clippy::cast_precision_loss)] // bytes
+                    {
+                        *owe -= m.encode().map_or(1000, |b| b.len()) as f64;
+                    }
+                    let _ = a.endpoint_mut().unwrap().send(to, &m);
+                }
+            }
+            if heavy {
+                #[allow(clippy::cast_possible_truncation)] // a test's offered bytes
+                {
+                    r.offered_kb += kh * 0.016;
+                }
+            }
+            // The last second sends no reliable message, so the end can
+            // check that nothing is left unacked.
+            let quiet = t >= HEAVY_END - 1_000;
+            if !quiet {
+                host.endpoint_mut()
+                    .unwrap()
+                    .send(
+                        PeerId(1),
+                        &crate::msg::Message::EnemySpawn(crate::msg::EnemySpawn {
+                            net_id: spawn,
+                            object: 7,
+                            x: 1.0,
+                            y: 2.0,
+                            angle: 0.0,
+                            hull: 10.0,
+                            hull_max: 10.0,
+                            flags: 0,
+                        }),
+                    )
+                    .expect("the spawn is taken");
+                spawn = spawn.wrapping_add(1);
+            }
+            if !quiet && (t - 300).is_multiple_of(256) {
+                host.endpoint_mut()
+                    .unwrap()
+                    .send(
+                        PeerId(1),
+                        &crate::msg::Message::UpgradeOpen { round: round_h },
+                    )
+                    .expect("the round is taken");
+                join.endpoint_mut()
+                    .unwrap()
+                    .send(
+                        PeerId::HOST,
+                        &crate::msg::Message::UpgradeOpen { round: round_j },
+                    )
+                    .expect("the round is taken");
+                sent_h.push(t);
+                sent_j.push(t);
+                round_h += 1;
+                round_j += 1;
+            }
+        }
+        let stalled = (STALL_FROM..STALL_TO).contains(&t);
+        for q in steam.queues.values_mut() {
+            q.stalled = stalled;
+        }
+        host.poll(ms(t));
+        join.poll(ms(t));
+        if frame {
+            steam.now_ms = t;
+            steam.pump();
+            steam.pump();
+        }
+        let delay = |sent: &[u64], round: u16| t - sent[usize::from(round)];
+        for e in events(&mut join) {
+            match e {
+                Event::Message {
+                    msg: crate::msg::Message::UpgradeOpen { round },
+                    ..
+                } => {
+                    r.rounds_to_join.push(round);
+                    let (sent_at, d) = (sent_h[usize::from(round)], delay(&sent_h, round));
+                    let worst = if sent_at >= settled {
+                        &mut r.worst_after.0
+                    } else if calm(sent_at) && calm(t) {
+                        &mut r.worst_heavy.0
+                    } else {
+                        &mut r.worst_stall.0
+                    };
+                    *worst = (*worst).max(d);
+                }
+                Event::Message {
+                    msg: crate::msg::Message::EnemySpawn(s),
+                    ..
+                } => r.spawns_to_join.push(s.net_id),
+                e @ Event::Disconnected { .. } => r.gone.push(e),
+                _ => {}
+            }
+        }
+        for e in events(&mut host) {
+            match e {
+                Event::Message {
+                    msg: crate::msg::Message::UpgradeOpen { round },
+                    ..
+                } => {
+                    r.rounds_to_host.push(round);
+                    let (sent_at, d) = (sent_j[usize::from(round)], delay(&sent_j, round));
+                    let worst = if sent_at >= settled {
+                        &mut r.worst_after.1
+                    } else if calm(sent_at) && calm(t) {
+                        &mut r.worst_heavy.1
+                    } else {
+                        &mut r.worst_stall.1
+                    };
+                    *worst = (*worst).max(d);
+                }
+                e @ Event::Disconnected { .. } => r.gone.push(e),
+                _ => {}
+            }
+        }
+        let hs = host.endpoint().unwrap().stats(PeerId(1));
+        let js = join.endpoint().unwrap().stats(PeerId::HOST);
+        if let (Some(hs), Some(js)) = (hs, js) {
+            r.max_unacked = r.max_unacked.max(hs.unacked).max(js.unacked);
+            let before = (seen_j.0, seen_h.0);
+            gap(
+                &mut seen_j,
+                js.packets_recv,
+                t,
+                &mut r.longest_gap.0,
+                &mut r.gap_after.0,
+            );
+            gap(
+                &mut seen_h,
+                hs.packets_recv,
+                t,
+                &mut r.longest_gap.1,
+                &mut r.gap_after.1,
+            );
+            if t >= STALL_TO {
+                if r.resume.0 == 0 && seen_j.0 != before.0 {
+                    r.resume.0 = t - STALL_TO;
+                }
+                if r.resume.1 == 0 && seen_h.0 != before.1 {
+                    r.resume.1 = t - STALL_TO;
+                }
+            }
+        }
+        t += 2;
+    }
+    r.sent = (round_h, spawn, round_j);
+    r.refused = steam.refused;
+    r.peak_queue = steam.queues.values().map(|q| q.peak).max().unwrap_or(0);
+    r.end_unacked = (
+        host.endpoint()
+            .unwrap()
+            .stats(PeerId(1))
+            .map_or(0, |s| s.unacked),
+        join.endpoint()
+            .unwrap()
+            .stats(PeerId::HOST)
+            .map_or(0, |s| s.unacked),
+    );
+    r.bridge_drops = steam
+        .bridges
+        .values()
+        .map(|b| b.stats().dropped_out + b.stats().dropped_in)
+        .sum();
+    assert_eq!(status_of(&dh).state, LobbyState::Connected);
+    assert_eq!(status_of(&dc).state, LobbyState::Connected);
+    r
+}
+
+/// Under a full Steam send queue both ways, traffic above its rate and a 6 s
+/// total stall, the transport recovers by itself. Nobody times out, every
+/// reliable message arrives once and in order, and the critical lane is late by
+/// at most the queue's depth plus 3 s. Packets resume within a second of the
+/// stall's end, and nothing is left unacked once the traffic is light.
+#[test]
+fn a_full_steam_send_queue_recovers_by_itself() {
+    for (cap_kb, rate_kbps) in [(512, 128.0), (512, 256.0), (256, 128.0), (256, 256.0)] {
+        for seed in [1, 2] {
+            let h = Heavy {
+                cap_kb,
+                rate_kbps,
+                seed,
+            };
+            let depth = h.depth_ms();
+            let r = heavy_run(h);
+            let tag = format!(
+                "queue {cap_kb} KB at {rate_kbps} KB/s seed {seed}: refused {}, peak {} KB, \
+                 critical worst heavy {:?} ms, across the stall {:?}, after {:?}; resume {:?} ms; \
+                 longest gap {:?} ms, after {:?}; unacked max {}, at the end {:?}; bridge drops {}",
+                r.refused,
+                r.peak_queue / 1024,
+                r.worst_heavy,
+                r.worst_stall,
+                r.worst_after,
+                r.resume,
+                r.longest_gap,
+                r.gap_after,
+                r.max_unacked,
+                r.end_unacked,
+                r.bridge_drops
+            );
+            eprintln!("{tag}");
+            assert!(r.gone.is_empty(), "{tag}; gone {:?}", r.gone);
+            let want = |n: u16| (0..n).collect::<Vec<u16>>();
+            assert_eq!(r.rounds_to_join, want(r.sent.0), "{tag}");
+            assert_eq!(r.spawns_to_join, want(r.sent.1), "{tag}");
+            assert_eq!(r.rounds_to_host, want(r.sent.2), "{tag}");
+            assert!(r.refused > 0, "the queue filled: {tag}");
+            // The critical lane waits for the queue ahead of it and a
+            // resend or two, never more.
+            assert!(
+                r.worst_heavy.0.max(r.worst_heavy.1) <= depth + 3_000,
+                "{tag}"
+            );
+            assert!(
+                r.worst_stall.0.max(r.worst_stall.1) <= (STALL_TO - STALL_FROM) + depth + 3_000,
+                "{tag}"
+            );
+            assert!(r.worst_after.0.max(r.worst_after.1) <= 500, "{tag}");
+            assert!(r.resume.0 <= 1_000 && r.resume.1 <= 1_000, "{tag}");
+            assert!(
+                r.longest_gap.0.max(r.longest_gap.1) < 3_000,
+                "no link wait outside the stall: {tag}"
+            );
+            assert!(r.gap_after.0.max(r.gap_after.1) <= 500, "{tag}");
+            assert_eq!(r.end_unacked, (0, 0), "{tag}");
+            assert!(
+                r.max_unacked < usize::from(crate::reliability::RELIABLE_WINDOW),
+                "{tag}"
+            );
+        }
+    }
 }

@@ -91,12 +91,17 @@ pub fn toml_str(s: &str) -> String {
 /// can't be read or is read-only is an error and nothing is written; with no
 /// file yet, the changes go into `shipped` (the mod's defaults).
 pub fn save(path: &Path, shipped: &str, changes: &[(&str, String)]) -> Result<(), String> {
-    let mut text = read_text(path)?.unwrap_or_else(|| shipped.to_owned());
+    // An error names the file from the game folder on, not in full.
+    let shown = crate::game::shown_path(path);
+    let named = |e: String| e.replace(&path.display().to_string(), &shown);
+    let mut text = read_text(path)
+        .map_err(named)?
+        .unwrap_or_else(|| shipped.to_owned());
     for (k, v) in changes {
         text = set_value(&text, k, v);
     }
-    refuse_read_only(path)?;
-    write_atomic(path, &text).map_err(|e| format!("unable to write {} ({e})", path.display()))
+    refuse_read_only(path).map_err(named)?;
+    write_atomic(path, &text).map_err(|e| format!("unable to write {shown} ({e})"))
 }
 
 #[cfg(test)]
@@ -157,6 +162,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let e = save(&path, crate::NDML_DEFAULT_CONFIG, &change).unwrap_err();
         assert!(e.contains("ndmod_coop.toml"), "{e}");
+        assert!(!e.contains("test-tmp"), "never the folders above: {e}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
         // A read that fails (a folder in the file's place): refused.

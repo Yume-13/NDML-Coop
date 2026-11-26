@@ -109,6 +109,94 @@ pub fn route(drawn: bool, raised: bool, pos: i64) -> Route {
     }
 }
 
+/// Game Start's row (the game's own on every frame, Co-op row or not).
+pub const START_ROW: i64 = 1;
+
+/// Game Start while linked: the game's saved-run question (`newGameCheck`) is
+/// answered YES before `confirmMenu` runs. The YES branch touches no file, and a
+/// co-op run never writes the solo resume file (`scaling::resume_writes_off`).
+/// `dialog`: a `newGameCheck` already up is left alone.
+#[must_use]
+pub fn answer_new_game_question(pos: i64, linked: bool, dialog: bool) -> bool {
+    linked && !dialog && pos == START_ROW
+}
+
+/// The two reads the answer stands on: `global.loaded_run_state` and the
+/// menu's `alarm[1]`. `Err`: what could not be read. The game then asks itself.
+pub fn answer_reads(saved_run: Option<f64>, alarm: Option<f64>) -> Result<(), &'static str> {
+    if saved_run.is_none() {
+        Err("global.loaded_run_state")
+    } else if alarm.is_none() {
+        Err("alarm_get")
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the answered Game Start was taken (`alarm[1]` set: its fade began).
+/// The new game screen's visit is then guarded. An unreadable `alarm[1]`
+/// counts as taken.
+#[must_use]
+pub fn answered_start_taken(alarm: Option<f64>) -> bool {
+    alarm.is_none_or(|a| a >= 0.0)
+}
+
+/// Once per link, both games go from the main menu to the new game screen by
+/// themselves. A link that comes up arms it. Pressing Game Start, reaching the
+/// new game screen while linked, or the link going disarms it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToNewGame {
+    armed: bool,
+    was_linked: bool,
+}
+
+/// What [`ToNewGame::due`] reads on a main-menu frame.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent facts of one frame
+pub struct NewGameFacts {
+    pub linked: bool,
+    /// The partner's `Hello` is in (the link's version checks are behind it).
+    pub greeted: bool,
+    /// This game hosts the link.
+    pub host: bool,
+    /// A joining game has the host's picks (or the host's settings rule is off
+    /// here). The start gate refuses a Start made before them.
+    pub picks_in: bool,
+    /// A text entry or a question (the page's, or `newGameCheck`) is open.
+    pub busy: bool,
+}
+
+impl ToNewGame {
+    /// Any menu or new-game-screen frame. A new link arms the move, no link
+    /// disarms it.
+    pub fn observe(&mut self, linked: bool) {
+        if linked && !self.was_linked {
+            self.armed = true;
+        }
+        if !linked {
+            self.armed = false;
+        }
+        self.was_linked = linked;
+    }
+
+    /// On the new game screen while linked, or the move made: spent for this link.
+    pub fn spent(&mut self) {
+        self.armed = false;
+    }
+
+    /// Whether this main-menu frame presses Game Start.
+    #[must_use]
+    pub fn due(&self, f: &NewGameFacts) -> bool {
+        self.armed && f.linked && f.greeted && (f.host || f.picks_in) && !f.busy
+    }
+
+    /// The move is to be made on this link.
+    #[must_use]
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+}
+
 /// `pos` on the same label when the Co-op row comes (`drawn`) or goes: the
 /// rows from Unlocks down move one place (Co-op itself goes to Unlocks).
 #[must_use]
@@ -130,10 +218,11 @@ pub struct Saved {
     pub max_pos: f64,
 }
 
-/// Selection limits for a page of `n` rows: `(minPos, maxPos)`.
+/// Selection limits for a page of `n` rows: `(minPos, maxPos)`. Row 11 is the
+/// mod's to draw, as on the plain menu.
 #[must_use]
 pub fn page_limits(n: usize) -> (f64, f64) {
-    let n = n.clamp(1, ROWS - 1);
+    let n = n.clamp(1, ROWS);
     #[allow(clippy::cast_precision_loss)]
     (1.0, n as f64)
 }
@@ -259,6 +348,106 @@ mod tests {
         assert_eq!(route(false, true, 4), Route::Original);
     }
 
+    #[test]
+    fn game_start_while_linked_skips_the_saved_run_question() {
+        assert!(answer_new_game_question(START_ROW, true, false));
+        assert!(
+            !answer_new_game_question(START_ROW, false, false),
+            "solo: the game's own question"
+        );
+        assert!(
+            !answer_new_game_question(START_ROW, true, true),
+            "a question already up is left alone"
+        );
+        for pos in [0, 2, 3, 11] {
+            assert!(!answer_new_game_question(pos, true, false), "row {pos}");
+        }
+    }
+
+    /// The mod answers only where both reads succeed. An unreadable `alarm[1]`
+    /// after the press keeps the new game screen's guard on.
+    #[test]
+    fn the_question_is_the_games_where_its_reads_fail() {
+        assert_eq!(answer_reads(Some(1.0), Some(-1.0)), Ok(()));
+        assert_eq!(answer_reads(Some(0.0), Some(-1.0)), Ok(()));
+        assert_eq!(
+            answer_reads(None, Some(-1.0)),
+            Err("global.loaded_run_state")
+        );
+        assert_eq!(answer_reads(Some(1.0), None), Err("alarm_get"));
+        assert!(answer_reads(None, None).is_err());
+        assert!(answered_start_taken(Some(10.0)));
+        assert!(!answered_start_taken(Some(-1.0)), "not taken: no guard");
+        assert!(answered_start_taken(None), "unreadable: guarded");
+    }
+
+    fn facts(host: bool) -> NewGameFacts {
+        NewGameFacts {
+            linked: true,
+            greeted: true,
+            host,
+            picks_in: false,
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn a_new_link_goes_to_the_new_game_screen_once() {
+        let mut t = ToNewGame::default();
+        t.observe(false);
+        assert!(!t.due(&facts(true)), "no link, no move");
+        t.observe(true);
+        assert!(t.due(&facts(true)), "the host goes at once");
+        assert!(
+            !t.due(&NewGameFacts {
+                greeted: false,
+                ..facts(true)
+            }),
+            "not before the partner's hello"
+        );
+        assert!(
+            !t.due(&NewGameFacts {
+                busy: true,
+                ..facts(true)
+            }),
+            "not over an open entry or question"
+        );
+        t.spent();
+        t.observe(true);
+        assert!(!t.due(&facts(true)), "once per link: not after a run");
+        // The link goes and a new one comes: once more.
+        t.observe(false);
+        t.observe(true);
+        assert!(t.due(&facts(true)));
+    }
+
+    #[test]
+    fn the_joining_game_waits_for_the_hosts_picks() {
+        let mut t = ToNewGame::default();
+        t.observe(true);
+        assert!(!t.due(&facts(false)));
+        assert!(t.due(&NewGameFacts {
+            picks_in: true,
+            ..facts(false)
+        }));
+    }
+
+    #[test]
+    fn a_player_already_on_the_new_game_screen_is_not_moved_later() {
+        let mut t = ToNewGame::default();
+        // The link came up on the new game screen: spent there.
+        t.observe(true);
+        t.spent();
+        // Back to the menu: not pulled back.
+        t.observe(true);
+        assert!(!t.armed() && !t.due(&facts(true)));
+        // A link that comes and goes unseen (another room) arms nothing.
+        let mut u = ToNewGame::default();
+        u.observe(false);
+        u.observe(false);
+        assert!(!u.armed());
+    }
+
     /// When the row comes or goes, the selection stays on its label: Exit
     /// is row 11 with the row and row 10 without it.
     #[test]
@@ -302,7 +491,8 @@ mod tests {
         assert_eq!(l[3], "Back");
         assert!(l[4..].iter().all(String::is_empty));
         assert_eq!(page_limits(3), (1.0, 3.0));
-        assert_eq!(page_limits(40), (1.0, 10.0));
+        assert_eq!(page_limits(11), (1.0, 11.0), "row 11 is the mod's");
+        assert_eq!(page_limits(40), (1.0, 11.0));
         assert!((clamp_pos(0.0, 3, 2.0) - 2.0).abs() < 1e-9, "row 0: back");
         assert!((clamp_pos(7.0, 3, 9.0) - 3.0).abs() < 1e-9);
         assert!((clamp_pos(2.0, 3, 1.0) - 2.0).abs() < 1e-9);

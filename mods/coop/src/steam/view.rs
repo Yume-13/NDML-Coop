@@ -84,7 +84,7 @@ pub enum Visibility {
     /// Friends join from their friends list ("Join Game"); invites work.
     #[default]
     Friends,
-    /// Only people you invite through the Steam overlay.
+    /// Only people invited through the Steam overlay.
     InviteOnly,
     /// A short room code; invites still work, the friends list hides it.
     RoomCode,

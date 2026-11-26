@@ -25,10 +25,11 @@
 //! in, [`Out`] messages, freeze decisions and draw items out.
 //!
 //! A run is the life of one `oController` (new instance or new
-//! `timeGameStart`). A run that starts linked is a **co-op run**, a latch
-//! that holds until it ends: save protection and the leaderboard block
-//! follow it. A lost link is waited for ([`crate::wait`]); when the host is
-//! gone for good the joining player's run is over ([`Core::run_over`]).
+//! `timeGameStart`). A run that starts linked, or whose Start was taken while
+//! linked ([`Core::start_taken`]), is a co-op run until it ends. Save
+//! protection and the leaderboard block follow it. A lost link is waited for
+//! ([`crate::wait`]). A partner gone for good ends the run in either role
+//! ([`Core::run_over`]). A resumed run is never a co-op run.
 
 #![forbid(unsafe_code)]
 
@@ -42,7 +43,7 @@ use ndml_net::lobby::refusal_message;
 use ndml_net::msg::{Message, PeerId, PlayerLook};
 use ndml_net::session::PeerSet;
 
-use crate::gate::{FreezeAction, Freezer, GatePhase, StartGate};
+use crate::gate::{FreezeAction, Freezer, GatePhase, StartAsk, StartGate};
 use crate::net::Out;
 use crate::overlay::{Line, RunView, run_lines};
 use crate::player::{
@@ -50,7 +51,7 @@ use crate::player::{
     pack_look_frame, pack_state,
 };
 use crate::render::{DrawItem, Gui, LookParams, PartnerFrame, View, plan_partner};
-use crate::wait::{LinkWait, PLAYS_ON_DEFAULT, WaitEvent, WaitInput, WaitView};
+use crate::wait::{HOST_PLAYS_ON, LinkWait, WaitEvent, WaitInput, WaitView};
 
 /// How long a one-off overlay message stays.
 pub const NOTICE_FOR: Duration = Duration::from_secs(6);
@@ -60,6 +61,8 @@ pub const NOTICE_FOR: Duration = Duration::from_secs(6);
 pub struct Partner {
     /// Name from its `Hello`.
     pub name: String,
+    /// Its `Hello` arrived on this link.
+    pub greeted: bool,
     /// Its ship.
     pub ship: RemoteShip,
 }
@@ -80,13 +83,14 @@ struct Run {
     left: Option<String>,
     /// The partner left for good (a goodbye, a refusal): no wait.
     gone: bool,
-    /// Joining game: the host is gone for good (it left for the menu or
-    /// closed its game); this run is over (since).
+    /// The partner left this run by choice, since then: it is over here too.
     over: Option<Instant>,
+    /// The game's own end screen is up: a partner leaving now ends nothing.
+    ended: bool,
 }
 
-/// How long the joining game shows why its run is over (paused) before it
-/// leaves for the menu as Leave Co-op Run does.
+/// How long a game whose co-op run is over (the partner left) shows why,
+/// paused, before it leaves for the menu as Leave Co-op Run does.
 pub const OVER_HOLD: Duration = Duration::from_secs(4);
 
 /// What the run tick read from `oController` and the globals.
@@ -113,6 +117,9 @@ pub struct RunFrame {
     pub woke: Option<Instant>,
     /// The upgrade screen is open here (the wait's pause comes when it closes).
     pub upgrade_screen: bool,
+    /// The session rules keep this game paused (`rules::Rules::holds_game`).
+    /// A lifting wait freeze leaves the pause to them.
+    pub rules_hold: bool,
 }
 
 /// The local ship's send state.
@@ -133,12 +140,15 @@ struct Local {
 
 /// See the module docs.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent session facts, one each
 pub struct Core {
     extrapolation: Duration,
     me: Option<PeerId>,
     partners: BTreeMap<PeerId, Partner>,
     gate: StartGate,
     freezer: Freezer,
+    /// An upgrade screen asked for before the gate's release ([`StartAsk`]).
+    start_ask: StartAsk,
     run: Option<Run>,
     view: Option<View>,
     local: Local,
@@ -148,14 +158,25 @@ pub struct Core {
     /// A run started without a partner: newcomers are turned away until it
     /// ends (no linking during a run, on either route).
     solo_refusing: bool,
+    /// The next run is a resumed one ([`Self::resumed_next`]).
+    resumed_next: bool,
+    /// Why no run can be a co-op run in this game ([`Self::coop_runs_off`]).
+    coop_off: Option<String>,
     /// When the last partner's link timed out (cleared when one links).
     lost_at: Option<Instant>,
+    /// A Start taken while linked, until its run's first frame.
+    start_linked: bool,
+    /// This game left a co-op run while the link was down: the partner is
+    /// sent `RunLeft` when it links again.
+    owe_run_left: bool,
     /// The co-op run's wait for a lost link.
     wait: LinkWait,
     /// Wait events for the glue (the rules, the UI).
     wait_events: Vec<WaitEvent>,
-    /// Host: how long it plays on alone after a loss.
-    plays_on: Duration,
+    /// When the freezer paused this game for the link wait.
+    wait_frozen: Option<Instant>,
+    /// The link wait had this game frozen when the link came back.
+    frozen_at_back: bool,
     /// The partner last linked (kept while it is away) and its name.
     last_partner: Option<(PeerId, String)>,
     /// Whether this game hosted when last linked.
@@ -163,7 +184,8 @@ pub struct Core {
 }
 
 /// A run that starts this soon after the partner's link timed out is a
-/// co-op run waiting for the partner (a long load can stall past the timeout).
+/// co-op run waiting for the partner. After a Start taken while linked, a
+/// timeout at any time since that Start counts too.
 pub const RUN_START_GRACE: Duration = Duration::from_secs(2);
 
 fn look_params(l: &PlayerLook) -> LookParams {
@@ -187,24 +209,25 @@ impl Core {
             partners: BTreeMap::new(),
             gate: StartGate::default(),
             freezer: Freezer::default(),
+            start_ask: StartAsk::default(),
             run: None,
             view: None,
             local: Local::default(),
             notices: VecDeque::new(),
             left_run: BTreeSet::new(),
             solo_refusing: false,
+            resumed_next: false,
+            coop_off: None,
             lost_at: None,
+            start_linked: false,
+            owe_run_left: false,
             wait: LinkWait::default(),
             wait_events: Vec::new(),
-            plays_on: PLAYS_ON_DEFAULT,
+            wait_frozen: None,
+            frozen_at_back: false,
             last_partner: None,
             last_host: false,
         }
-    }
-
-    /// Host: how long its game plays on alone after a loss.
-    pub fn set_plays_on(&mut self, d: Duration) {
-        self.plays_on = d;
     }
 
     /// This game hosts (or hosted when last linked: kept through a wait).
@@ -217,20 +240,27 @@ impl Core {
         }
     }
 
-    /// Joining game: since when its co-op run is over (the host gone).
+    /// When this game's co-op run ended (the partner left it by choice).
     #[must_use]
     pub fn run_over(&self) -> Option<Instant> {
         self.run.as_ref().and_then(|r| r.over)
     }
 
-    /// The host is gone for good: the joining player's run is over.
-    fn host_gone(&mut self, now: Instant) {
-        let Some(run) = self.run.as_mut().filter(|r| r.coop && r.over.is_none()) else {
+    /// The partner left this co-op run by choice: the run is over here too,
+    /// in either role. Nothing on this game's own end screen.
+    fn partner_gone(&mut self, now: Instant) {
+        let host = self.me().is_host();
+        let Some(run) = self
+            .run
+            .as_mut()
+            .filter(|r| r.coop && r.over.is_none() && !r.ended)
+        else {
             return;
         };
         run.over = Some(now);
         self.wait.reset();
-        self.note("the host left; this run is over".into(), now);
+        let who = if host { "the partner" } else { "the host" };
+        self.note(format!("{who} left; this run is over"), now);
     }
 
     /// What the wait shows now.
@@ -249,6 +279,20 @@ impl Core {
     #[must_use]
     pub fn wait_hold(&self) -> bool {
         self.wait.hold()
+    }
+
+    /// The link wait had this game frozen at its last return.
+    #[must_use]
+    pub fn frozen_at_back(&self) -> bool {
+        self.frozen_at_back
+    }
+
+    /// This game's run is over: a game over's end screen, or the partner gone.
+    #[must_use]
+    pub fn run_over_here(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|r| r.over.is_some() || r.ended)
     }
 
     /// The wait's events since the last call.
@@ -276,6 +320,12 @@ impl Core {
     #[must_use]
     pub fn linked(&self) -> bool {
         !self.partners.is_empty()
+    }
+
+    /// A partner is connected and its `Hello` is in.
+    #[must_use]
+    pub fn greeted(&self) -> bool {
+        self.partners.values().any(|p| p.greeted)
     }
 
     /// Own peer id: a client's if a host is linked, else the host's.
@@ -336,6 +386,20 @@ impl Core {
         self.gate.phase()
     }
 
+    /// The game called `gotoUpgrade` ([`StartAsk::note`]). `true` if kept for
+    /// the gate's release.
+    pub fn note_start_ask(&mut self) -> bool {
+        let released = self.gate.phase() == GatePhase::Running;
+        self.start_ask.note(self.linked(), released)
+    }
+
+    /// Whether to ask for that screen again this frame ([`StartAsk::due`]).
+    pub fn start_ask_due(&mut self, paused: bool, screen_open: bool) -> bool {
+        let ready = self.gate.phase() == GatePhase::Running && !paused;
+        let wanted = self.coop_run() && !screen_open;
+        self.start_ask.due(ready, wanted)
+    }
+
     fn note(&mut self, text: String, now: Instant) {
         log::info!("co-op: {text}");
         self.notice(text, now);
@@ -376,6 +440,7 @@ impl Core {
                     peer,
                     Partner {
                         name: "partner".into(),
+                        greeted: false,
                         ship: RemoteShip::new(self.extrapolation),
                     },
                 );
@@ -391,6 +456,15 @@ impl Core {
                 if !peer.is_host() {
                     self.me = Some(PeerId::HOST);
                     outs.push(Out::Send(peer, Message::Welcome { peer, peers: 2 }));
+                }
+                if std::mem::take(&mut self.owe_run_left) {
+                    log::info!("co-op: telling {peer} we left the run during the lost link");
+                    outs.push(Out::Send(peer, Message::RunLeft { peer: self.me() }));
+                } else if self.run.is_none() {
+                    // A partner in a run with this game takes it as a leave.
+                    // `RunLeft` counts only past the partner's gate.
+                    log::info!("co-op: telling {peer} this game is in no run");
+                    outs.push(Out::Send(peer, Message::RunLeft { peer: self.me() }));
                 }
                 self.gate.set_peers(self.peers());
                 // The host back in the shared run: readiness again.
@@ -439,9 +513,9 @@ impl Core {
             // Waited for (`wait`): the gate keeps holding.
             return Vec::new();
         }
-        if peer.is_host() {
-            // Gone for good: the joining player's run is over.
-            self.host_gone(now);
+        if peer.is_host() || self.gate.phase() == GatePhase::Running {
+            // Gone for good (a goodbye, a restart, a refusal): the run is over.
+            self.partner_gone(now);
         }
         if let Some(run) = self.run.as_mut().filter(|r| r.coop) {
             run.gone = true;
@@ -455,6 +529,7 @@ impl Core {
             Message::Hello(h) => {
                 if let Some(p) = self.partners.get_mut(&from) {
                     p.name = clean_name(&h.name).unwrap_or_else(|| "partner".into());
+                    p.greeted = true;
                     // No name in the log.
                     log::info!(
                         "co-op: {from} said hello (build {}, mod version {})",
@@ -530,17 +605,67 @@ impl Core {
                     &format!("{from} left the run for the menu"),
                     now,
                 );
-                if from.is_host() {
-                    self.host_gone(now);
-                }
+                self.partner_gone(now);
             }
             _ => {} // not the session's
         }
         Vec::new()
     }
 
+    /// `resumeRun` ran: the next run is resumed and solo. A partner linked at
+    /// its first frame is turned away, and the run saves as the game does.
+    pub fn resumed_next(&mut self) {
+        self.resumed_next = true;
+    }
+
+    /// The game took a new run's Start (its fade began). Taken while linked, it
+    /// makes a co-op run whatever the link does next. The resume file stays off
+    /// until the run's first frame ([`Self::start_held`]).
+    pub fn start_taken(&mut self) {
+        self.start_linked |= self.linked();
+    }
+
+    /// A Start taken while linked waits for its run's first frame.
+    #[must_use]
+    pub fn start_held(&self) -> bool {
+        self.start_linked
+    }
+
+    /// The co-op rules cannot be kept in this game (`why`, from
+    /// `loadout::run_safety`). Every run is solo, a partner linked at its start
+    /// turned away. The menus link as usual.
+    pub fn coop_runs_off(&mut self, why: String) {
+        self.coop_off = Some(why);
+    }
+
+    /// A run started linked can be a co-op run here (no [`Self::coop_runs_off`]).
+    /// Only then does `ui::menu` answer the saved-run question for a linked player.
+    #[must_use]
+    pub fn coop_runs_on(&self) -> bool {
+        self.coop_off.is_none()
+    }
+
+    /// Every linked partner turned away with "in a run", out of this run.
+    fn turn_partners_away(&mut self, now: Instant) -> Vec<Out> {
+        let why = ndml_net::endpoint::RefuseReason::RunInProgress;
+        let peers: Vec<PeerId> = self.partners.keys().copied().collect();
+        let mut outs = Vec::new();
+        for p in peers {
+            self.left_run.insert(p);
+            self.note(
+                format!("{p} turned away: this game resumed a solo run"),
+                now,
+            );
+            outs.push(Out::Refuse(p, why));
+        }
+        outs
+    }
+
     /// A menu frame: any run is over.
     pub fn menu_frame(&mut self) -> Vec<Out> {
+        // A `resumeRun` or Start whose run never came (a game error): forgotten.
+        self.resumed_next = false;
+        self.start_linked = false;
         if self.run.is_some() {
             self.leave_run()
         } else {
@@ -551,6 +676,8 @@ impl Core {
     fn leave_run(&mut self) -> Vec<Out> {
         let was_coop = self.run.take().is_some_and(|r| r.coop);
         self.freezer.reset();
+        self.start_ask.reset();
+        self.wait_frozen = None;
         self.local.last_look = None;
         self.left_run.clear();
         let mut outs = self.gate.leave_run();
@@ -558,8 +685,12 @@ impl Core {
             outs.push(Out::Refusing(None));
         }
         if was_coop && self.linked() {
-            // The partner plays on alone (or is told at its gate).
+            // The partner's run ends with this one (or it is told at its gate).
             outs.push(Out::Broadcast(Message::RunLeft { peer: self.me() }));
+        }
+        if was_coop && (!self.linked() || self.wait.waiting()) {
+            // The link is down or silent: told again at the next link.
+            self.owe_run_left = true;
         }
         if was_coop {
             outs.push(Out::HoldLink(false));
@@ -569,6 +700,7 @@ impl Core {
     }
 
     /// A run-tick frame. Returns what to send and what to do to the game.
+    #[allow(clippy::too_many_lines)] // the run start's steps in order
     pub fn run_frame(
         &mut self,
         f: &RunFrame,
@@ -583,22 +715,46 @@ impl Core {
             if self.run.is_some() {
                 outs.extend(self.leave_run());
             }
-            let awaiting = !self.linked()
-                && self
-                    .lost_at
-                    .is_some_and(|t| now.saturating_duration_since(t) <= RUN_START_GRACE);
+            // A resumed run is solo: a partner linked now is turned away.
+            let resumed = std::mem::take(&mut self.resumed_next);
+            let started_linked = std::mem::take(&mut self.start_linked);
+            let solo = resumed || self.coop_off.is_some();
+            if solo {
+                outs.extend(self.turn_partners_away(now));
+            }
+            let unlinked = !solo && !self.linked();
+            // The link timed out just before, or since a Start taken while
+            // linked: a lost link, waited for.
+            let awaiting = unlinked
+                && self.lost_at.is_some_and(|t| {
+                    started_linked || now.saturating_duration_since(t) <= RUN_START_GRACE
+                });
+            // A linked Start whose partner is gone for good since: over at once.
+            let gone = unlinked && started_linked && !awaiting;
+            let coop = !solo && (self.linked() || awaiting || gone);
             self.run = Some(Run {
                 key: f.key,
                 stamp: f.stamp,
-                coop: self.linked() || awaiting,
+                coop,
                 awaiting_partner: awaiting,
+                gone,
                 ..Run::default()
             });
-            if self.linked() || awaiting {
+            if coop {
                 // The link is held for the whole co-op run.
                 outs.push(Out::HoldLink(true));
             }
             if self.linked() {
+                // Linked at a new run's start: an owed `RunLeft` is void.
+                self.owe_run_left = false;
+            }
+            if resumed {
+                log::info!(
+                    "co-op: a resumed run starts: a solo run (a resumed run is never a co-op run; it saves as the game does)"
+                );
+            } else if let Some(why) = &self.coop_off {
+                log::info!("co-op: a run starts solo: co-op runs are off in this game ({why})");
+            } else if self.linked() {
                 log::info!(
                     "co-op: a co-op run starts (saves and leaderboard uploads off until it ends)"
                 );
@@ -606,7 +762,13 @@ impl Core {
                 log::info!(
                     "co-op: a co-op run starts with the partner's link just lost; it waits for the partner at the start gate when they are back (saves and leaderboard uploads off until it ends)"
                 );
-            } else if !self.solo_refusing {
+            } else if gone {
+                log::info!(
+                    "co-op: a co-op run starts with the partner gone since its Start (saves and leaderboard uploads off until it ends)"
+                );
+                self.partner_gone(now);
+            }
+            if !coop && !self.solo_refusing {
                 // A solo run: nobody links into it.
                 self.solo_refusing = true;
                 outs.push(Out::Refusing(Some(
@@ -623,6 +785,7 @@ impl Core {
             return (outs, FreezeAction::None);
         };
         run.frame += 1;
+        run.ended |= f.game_over;
         let frame = run.frame;
         let waiting = run.awaiting_partner && !linked;
         if !run.arrived && !waiting && !f.paused && !f.game_over && (f.gameplay || run.ship_seen) {
@@ -650,30 +813,76 @@ impl Core {
             linked,
             silent_for: f.silent_for,
             is_host: if linked { me.is_host() } else { self.last_host },
-            plays_on: self.plays_on,
+            plays_on: HOST_PLAYS_ON,
             woke: f.woke,
             now,
         });
-        if let Some(mut ev) = ev {
-            log::info!("co-op: link wait {ev:?}");
-            if ev == (WaitEvent::Back { long: true }) {
-                if !gate_hold && self.freezer.adopt() {
-                    // The freeze stays as a player's pause: the shared pause.
-                    log::info!("co-op: frozen 10 s or more; the wait becomes the shared pause");
-                } else {
-                    // Not paused by the wait (on the upgrade screen, or held
-                    // by the start gate): an ordinary return.
-                    log::info!("co-op: not frozen by the wait here; an ordinary return");
-                    ev = WaitEvent::Back { long: false };
+        if let Some(ev) = ev {
+            self.wait_event(ev, gate_hold);
+        }
+        // A run that is over stands paused until it leaves, after the upgrade
+        // screen. The game's own end screen is never frozen.
+        let over = self.run.as_ref().is_some_and(|r| r.over.is_some());
+        let ended = self.run.as_ref().is_some_and(|r| r.ended);
+        let hold = gate_hold || ((over || self.wait.hold()) && !f.upgrade_screen && !ended);
+        if !hold && f.paused && f.rules_hold && self.freezer.made_pause() {
+            // The freeze lifts into a pause the rules hold: no unpause.
+            self.freezer.adopt();
+            if let Some(t) = self.wait_frozen.take() {
+                log::info!(
+                    "co-op: the link wait's freeze lifts after {:.2} s into the session's pause or round",
+                    now.saturating_duration_since(t).as_secs_f64()
+                );
+            }
+        }
+        let action = self.freezer.decide(hold, f.paused, frame);
+        self.note_freeze(action, gate_hold, now);
+        (outs, action)
+    }
+
+    /// One wait event. A long freeze stays as the shared pause. A return to a
+    /// game the wait did not freeze holds nothing.
+    fn wait_event(&mut self, mut ev: WaitEvent, gate_hold: bool) {
+        log::info!("co-op: link wait {ev:?}");
+        if matches!(ev, WaitEvent::Back { .. }) {
+            self.frozen_at_back = self.wait_frozen.is_some() || self.freezer.made_pause();
+        }
+        if ev == (WaitEvent::Back { long: true }) {
+            if !gate_hold && self.freezer.adopt() {
+                self.wait_frozen = None;
+                // The freeze stays as a player's pause: the shared pause.
+                log::info!("co-op: frozen 10 s or more; the wait becomes the shared pause");
+            } else {
+                // Not paused by the wait (upgrade screen, start gate): a plain return.
+                log::info!("co-op: not frozen by the wait here; an ordinary return");
+                ev = WaitEvent::Back { long: false };
+            }
+        } else if matches!(ev, WaitEvent::Back { .. }) && !self.freezer.made_pause() {
+            // Not frozen by the wait: nothing to hold.
+            self.wait.lift_now();
+        }
+        self.wait_events.push(ev);
+    }
+
+    /// Logs the link wait's freeze and how long it lasted.
+    fn note_freeze(&mut self, action: FreezeAction, gate_hold: bool, now: Instant) {
+        match action {
+            FreezeAction::Pause if !gate_hold && self.wait.hold() => {
+                if self.wait_frozen.is_none() {
+                    log::info!("co-op: the link wait freezes this game");
+                }
+                self.wait_frozen.get_or_insert(now);
+            }
+            FreezeAction::Unpause => {
+                if let Some(t) = self.wait_frozen.take() {
+                    log::info!(
+                        "co-op: the link wait's freeze lifts after {:.2} s",
+                        now.saturating_duration_since(t).as_secs_f64()
+                    );
                 }
             }
-            self.wait_events.push(ev);
+            _ => {}
         }
-        // A joining game whose run is over stands paused until it leaves.
-        let over = self.run.as_ref().is_some_and(|r| r.over.is_some());
-        let hold = gate_hold || ((over || self.wait.hold()) && !f.upgrade_screen);
-        let action = self.freezer.decide(hold, f.paused, frame);
-        (outs, action)
     }
 
     /// The local ship is down (or not): sent in `PlayerState.downed`.
@@ -771,11 +980,11 @@ impl Core {
             let Some(latest) = p.ship.latest().copied() else {
                 continue;
             };
-            if latest.downed {
-                // Down (the session rules): no ship, label or marker.
+            let t = render(peer).unwrap_or_else(|| ndml_net::time::from_wire_ms(latest.time_ms));
+            if p.ship.downed_at(t) {
+                // Down at the render time: no ship, label or marker.
                 continue;
             }
-            let t = render(peer).unwrap_or_else(|| ndml_net::time::from_wire_ms(latest.time_ms));
             let Some(pose) = p.ship.pose(t, now) else {
                 continue;
             };
@@ -905,6 +1114,7 @@ mod tests {
             silent_for: Some(Duration::ZERO),
             woke: None,
             upgrade_screen: false,
+            rules_hold: false,
         }
     }
 
@@ -1018,6 +1228,110 @@ mod tests {
         );
     }
 
+    /// Co-op runs off in this game: a partner linked at the run's start is
+    /// turned away with "in a run", and nothing is held or sent.
+    #[test]
+    fn without_the_saved_runs_hooks_every_run_is_solo() {
+        let t = Instant::now();
+        let why = ndml_net::endpoint::RefuseReason::RunInProgress;
+        let mut c = Core::new(Duration::from_millis(250));
+        c.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        c.handle(msg(CLIENT, hello("Sam", "pe-1-2")), t, 0);
+        assert!(c.linked());
+        c.coop_runs_off("no resumeRun or confirmLoadout hook".into());
+        let (outs, _) = c.run_frame(&frame(5, false, true), t, 0);
+        assert_eq!(
+            outs,
+            vec![Out::Refuse(CLIENT, why), Out::Refusing(Some(why))],
+            "turned away, newcomers too; no hold, no RunStart"
+        );
+        assert!(!c.coop_run() && c.in_run() && !c.run_linked());
+        assert_eq!(
+            c.switches(),
+            (false, false),
+            "no scaling, saves as the game does"
+        );
+    }
+
+    /// A resumed run is solo: a link that completed during its start is
+    /// turned away with "in a run", and the next run starts afresh.
+    #[test]
+    fn a_resumed_run_is_never_a_coop_run() {
+        let t = Instant::now();
+        let why = ndml_net::endpoint::RefuseReason::RunInProgress;
+        for partner in [CLIENT, HOST] {
+            let mut c = Core::new(Duration::from_millis(250));
+            c.handle(
+                Event::Connected {
+                    peer: partner,
+                    addr: addr(),
+                },
+                t,
+                0,
+            );
+            c.handle(msg(partner, hello("Sam", "pe-1-2")), t, 0);
+            if partner.is_host() {
+                c.handle(
+                    msg(
+                        HOST,
+                        Message::Welcome {
+                            peer: CLIENT,
+                            peers: 2,
+                        },
+                    ),
+                    t,
+                    0,
+                );
+            }
+            assert!(c.linked());
+            c.resumed_next();
+            let (outs, act) = c.run_frame(&frame(5, false, true), t, 0);
+            assert_eq!(
+                outs,
+                vec![Out::Refuse(partner, why), Out::Refusing(Some(why))],
+                "{partner:?}: turned away, newcomers too; no hold, no RunStart"
+            );
+            assert_eq!(act, FreezeAction::None);
+            assert!(!c.coop_run() && c.in_run());
+            assert!(!c.run_linked(), "the partner is out of this run at once");
+            assert_eq!(c.switches(), (false, false), "no scaling, saves on");
+            let (outs, _) = c.run_frame(&frame(5, false, true), t, 10);
+            assert!(outs.is_empty(), "{outs:?}");
+            assert!(c.local_ship(&ship(), 60.0, 20, t).is_empty());
+            // The run ends: newcomers admitted, the next linked run is co-op.
+            assert_eq!(c.menu_frame(), vec![Out::Refusing(None)]);
+            let (outs, _) = c.run_frame(&frame(6, false, true), t, 30);
+            assert!(outs.contains(&Out::HoldLink(true)), "{outs:?}");
+            assert!(c.coop_run());
+        }
+        // Unlinked: a plain solo run. A stale mark is dropped at the menu.
+        let mut c = Core::new(Duration::from_millis(250));
+        c.resumed_next();
+        let (outs, _) = c.run_frame(&frame(1, false, true), t, 0);
+        assert_eq!(outs, vec![Out::Refusing(Some(why))]);
+        assert!(!c.coop_run());
+        let mut c = Core::new(Duration::from_millis(250));
+        c.resumed_next();
+        let _ = c.menu_frame();
+        c.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        let (outs, _) = c.run_frame(&frame(2, false, true), t, 0);
+        assert!(outs.contains(&Out::HoldLink(true)) && c.coop_run());
+    }
+
     /// Hosting began after the solo run started: the core turns the newcomer away.
     #[test]
     fn a_newcomer_during_a_solo_run_is_turned_away() {
@@ -1049,9 +1363,13 @@ mod tests {
             0,
         );
         assert!(c.linked());
+        // In no run: it says so.
         assert!(matches!(
             outs.as_slice(),
-            [Out::Send(CLIENT, Message::Welcome { .. })]
+            [
+                Out::Send(CLIENT, Message::Welcome { .. }),
+                Out::Send(CLIENT, Message::RunLeft { peer: HOST })
+            ]
         ));
     }
 
@@ -1069,18 +1387,23 @@ mod tests {
         );
         assert_eq!(
             outs,
-            vec![Out::Send(
-                CLIENT,
-                Message::Welcome {
-                    peer: CLIENT,
-                    peers: 2
-                }
-            )]
+            vec![
+                Out::Send(
+                    CLIENT,
+                    Message::Welcome {
+                        peer: CLIENT,
+                        peers: 2
+                    }
+                ),
+                Out::Send(CLIENT, Message::RunLeft { peer: HOST })
+            ]
         );
+        assert!(c.linked() && !c.greeted(), "linked, its hello not in yet");
         c.handle(msg(CLIENT, hello("Wing", "pe-1-2")), t, 0);
+        assert!(c.greeted());
         assert_eq!(c.partners()[&CLIENT].name, "Wing");
         assert!(c.is_host());
-        // Menu → loadout → first controller frame (paused intro), then gameplay.
+        // Menu → new game screen → first controller frame (paused intro), then gameplay.
         let (outs, act) = c.run_frame(&frame(7, true, false), t, 0);
         assert_eq!(outs, vec![Out::HoldLink(true)], "the link held for the run");
         assert_eq!(act, FreezeAction::None);
@@ -1136,7 +1459,8 @@ mod tests {
     fn client_flow_and_partner_leaving_mid_run() {
         let t = Instant::now();
         let mut c = Core::new(Duration::from_millis(250));
-        assert!(
+        // In no run: it says so, and the host, in no run either, ignores it.
+        assert_eq!(
             c.handle(
                 Event::Connected {
                     peer: HOST,
@@ -1144,8 +1468,8 @@ mod tests {
                 },
                 t,
                 0
-            )
-            .is_empty()
+            ),
+            vec![Out::Send(HOST, Message::RunLeft { peer: PeerId(1) })]
         );
         c.handle(
             msg(
@@ -1279,6 +1603,140 @@ mod tests {
         assert!(outs.iter().any(|o| matches!(o, Out::Refusing(Some(_)))));
     }
 
+    /// On the new game screen, linked to `partner` (no run yet).
+    fn on_new_game_screen(partner: PeerId, t: Instant) -> Core {
+        let mut c = Core::new(Duration::from_millis(250));
+        c.handle(
+            Event::Connected {
+                peer: partner,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        if partner.is_host() {
+            c.handle(
+                msg(
+                    HOST,
+                    Message::Welcome {
+                        peer: CLIENT,
+                        peers: 2,
+                    },
+                ),
+                t,
+                0,
+            );
+        }
+        c
+    }
+
+    /// A linked Start makes a co-op run in either role, the resume file off
+    /// until its first frame. A partner gone for good ends it at once, a lost
+    /// link is waited for, and an earlier run's `RunLeft` is ignored.
+    #[test]
+    fn a_start_taken_linked_is_a_coop_run_whatever_the_link_does_before_its_first_frame() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        for partner in [HOST, CLIENT] {
+            for (way, first, over) in [
+                ("goodbye", 300, true),
+                ("restart", 300, true),
+                ("timeout in the grace", 500, false),
+                ("timeout outside the grace", 5_000, false),
+                ("RunLeft", 300, false),
+                ("crash", 300, false),
+            ] {
+                let way = format!("{partner} {way}");
+                let mut c = on_new_game_screen(partner, t);
+                c.start_taken();
+                assert!(c.start_held(), "{way}: off from the Start");
+                let gone = |reason| Event::Disconnected {
+                    peer: partner,
+                    reason,
+                };
+                if way.ends_with("goodbye") {
+                    c.handle(gone(DisconnectReason::Remote), ms(100), 0);
+                } else if way.ends_with("restart") {
+                    c.handle(gone(DisconnectReason::Replaced), ms(100), 0);
+                } else if way.contains("timeout") {
+                    c.handle(gone(DisconnectReason::Timeout), ms(100), 0);
+                } else if way.ends_with("RunLeft") {
+                    c.handle(msg(partner, Message::RunLeft { peer: partner }), ms(100), 0);
+                }
+                assert!(c.start_held(), "{way}: still off before the run");
+                let t1 = ms(first);
+                let (outs, act) = c.run_frame(&frame(3, false, true), t1, 0);
+                assert!(c.coop_run(), "{way}");
+                assert!(
+                    c.switches().1,
+                    "{way}: the run's latch from its first frame"
+                );
+                assert!(!c.start_held(), "{way}: taken over");
+                assert!(outs.contains(&Out::HoldLink(true)), "{way}");
+                assert!(
+                    !outs.iter().any(|o| matches!(o, Out::Refusing(Some(_)))),
+                    "{way}: not a solo run: {outs:?}"
+                );
+                assert_eq!(c.run_over(), over.then_some(t1), "{way}");
+                if over {
+                    assert_eq!(act, FreezeAction::Pause, "{way}: it stands, then the menu");
+                }
+                if way.ends_with("crash") {
+                    timeout(&mut c, partner, ms(10_300));
+                }
+                let _ = at(&mut c, t, 20.0, false, 0.0);
+                if over {
+                    assert!(!c.waiting(), "{way}: not waited for");
+                } else if c.linked() {
+                    assert!(c.run_over().is_none(), "{way}: the run goes on");
+                } else {
+                    assert!(c.waiting(), "{way}: a lost link is waited for");
+                    assert!(c.run_over().is_none(), "{way}");
+                }
+                assert!(c.switches().1, "{way}: saves off to its end");
+                let outs = c.menu_frame();
+                assert!(outs.contains(&Out::HoldLink(false)), "{way}");
+                assert!(!c.switches().1, "{way}: the menu ends it");
+            }
+        }
+    }
+
+    /// Only a linked Start sets the latch. A latch whose run never came is
+    /// dropped at the menu.
+    #[test]
+    fn an_unlinked_start_is_solo_and_the_menu_drops_a_start_latch() {
+        let t = Instant::now();
+        let mut c = Core::new(Duration::from_millis(250));
+        c.start_taken();
+        assert!(!c.start_held());
+        let (outs, _) = c.run_frame(&frame(3, false, true), t, 0);
+        assert!(!c.coop_run());
+        assert!(outs.iter().any(|o| matches!(o, Out::Refusing(Some(_)))));
+        let mut c = on_new_game_screen(CLIENT, t);
+        c.start_taken();
+        c.handle(
+            Event::Disconnected {
+                peer: CLIENT,
+                reason: DisconnectReason::Remote,
+            },
+            t,
+            0,
+        );
+        let _ = c.menu_frame();
+        assert!(!c.start_held());
+        let (_, _) = c.run_frame(&frame(3, false, true), t, 0);
+        assert!(!c.coop_run(), "a later unlinked Start is solo");
+    }
+
+    /// Where co-op runs are off, the game asks its saved-run question itself.
+    #[test]
+    fn coop_runs_off_leave_the_saved_run_question_to_the_game() {
+        let mut c = Core::new(Duration::from_millis(250));
+        assert!(c.coop_runs_on());
+        c.coop_runs_off("a hook".into());
+        assert!(!c.coop_runs_on());
+    }
+
     /// A cut at the start gate holds both; the repeated `RunStart` lets both go.
     #[test]
     fn a_cut_at_the_start_gate_holds_both_until_the_link_is_back() {
@@ -1344,7 +1802,8 @@ mod tests {
         assert_ne!(host.gate_phase(), GatePhase::Holding);
     }
 
-    /// A partner who quits to the menu says `RunLeft`; its next run waits at
+    /// A partner who quits to the menu says `RunLeft`. The run is over here
+    /// too, with saves off while it stands. The partner's next run waits at
     /// its gate until this one is over.
     #[test]
     fn a_partner_who_leaves_the_run_is_out_of_it_and_waits_for_the_next() {
@@ -1373,6 +1832,7 @@ mod tests {
         let out = c.handle(msg(CLIENT, Message::RunLeft { peer: CLIENT }), t, 20);
         assert!(out.is_empty());
         assert!(c.left_run(CLIENT) && c.linked() && !c.run_linked());
+        assert!(c.run_over().is_some(), "the run is over here too");
         assert_eq!(
             c.switches(),
             (false, true),
@@ -1444,6 +1904,53 @@ mod tests {
         f.stamp = Some(2000.0);
         c.run_frame(&f, t, 0);
         assert_eq!(c.gate_phase(), GatePhase::Idle, "restart: back to the gate");
+    }
+
+    /// Draft's opening screen kept at the gate is asked once at its own run's
+    /// release. A run left at the gate leaves nothing for the next run.
+    #[test]
+    fn an_ask_kept_at_the_gate_is_its_own_runs_and_cleared_at_the_menu() {
+        let t = Instant::now();
+        let mut c = Core::new(Duration::from_millis(250));
+        c.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        c.handle(
+            msg(
+                HOST,
+                Message::Welcome {
+                    peer: PeerId(1),
+                    peers: 2,
+                },
+            ),
+            t,
+            0,
+        );
+        // Run 1's Create keeps it, and the run is left at the gate.
+        assert!(c.note_start_ask());
+        c.run_frame(&frame(3, false, true), t, 0);
+        c.menu_frame();
+        // Run 2, with no ask of its own: nothing at its release.
+        c.run_frame(&frame(4, false, true), t, 0);
+        c.handle(msg(HOST, Message::Go { start_ms: 5 }), t, 0);
+        assert_eq!(c.gate_phase(), GatePhase::Running);
+        assert!(!c.start_ask_due(false, false));
+        assert!(!c.note_start_ask(), "a call in play is not kept");
+        // Run 3's Create keeps it again: once, at its release.
+        c.menu_frame();
+        assert!(c.note_start_ask());
+        c.run_frame(&frame(5, false, true), t, 0);
+        assert!(!c.start_ask_due(false, false), "held at the gate");
+        c.handle(msg(HOST, Message::Go { start_ms: 6 }), t, 0);
+        assert_eq!(c.gate_phase(), GatePhase::Running);
+        assert!(!c.start_ask_due(true, false), "paused: not yet");
+        assert!(c.start_ask_due(false, false));
+        assert!(!c.start_ask_due(false, false));
     }
 
     #[test]
@@ -1702,6 +2209,61 @@ mod tests {
         assert!(!c.waiting());
     }
 
+    /// After a 3.4 s silence the freeze holds 2 s. A game the wait did not
+    /// freeze is not held after the return.
+    #[test]
+    fn a_short_freeze_is_held_two_seconds_and_only_if_it_was_shown() {
+        let t = Instant::now();
+        let mut c = running(HOST, t);
+        let (_, act) = at(&mut c, t, 13.0, false, 3.0);
+        assert_eq!(act, FreezeAction::Pause);
+        let (_, act) = at(&mut c, t, 13.4, true, 0.0);
+        assert_eq!(act, FreezeAction::None, "held");
+        assert_eq!(
+            c.take_wait_events(),
+            vec![WaitEvent::Lost, WaitEvent::Back { long: false }]
+        );
+        let (_, act) = at(&mut c, t, 14.9, true, 0.0);
+        assert_eq!(act, FreezeAction::None, "held");
+        assert!(c.wait_hold());
+        let (_, act) = at(&mut c, t, 15.0, true, 0.0);
+        assert_eq!(act, FreezeAction::Unpause, "2 s after the freeze began");
+        // Paused by the player when the wait began: not the wait's hold.
+        let mut c = running(HOST, t);
+        at(&mut c, t, 13.0, true, 3.0);
+        at(&mut c, t, 13.4, true, 0.0);
+        assert!(!c.wait_hold(), "nothing of the wait's to hold");
+    }
+
+    /// A 2 s hold that lifts while the rules hold the game leaves them the pause.
+    #[test]
+    fn the_hold_lifts_into_the_rules_pause_without_an_unpause() {
+        let t = Instant::now();
+        let mut c = running(HOST, t);
+        let (_, act) = at(&mut c, t, 13.0, false, 3.0);
+        assert_eq!(act, FreezeAction::Pause);
+        at(&mut c, t, 13.4, true, 0.0);
+        let mut f = frame(3, true, true);
+        f.silent_for = Some(Duration::ZERO);
+        f.rules_hold = true;
+        let (_, act) = c.run_frame(&f, t + Duration::from_secs(15), 0);
+        assert_eq!(act, FreezeAction::None, "left paused for the rules");
+        assert!(!c.wait_hold());
+        f.rules_hold = false;
+        let (_, act) = c.run_frame(&f, t + Duration::from_secs(16), 0);
+        assert_eq!(
+            act,
+            FreezeAction::None,
+            "never the freezer's to unpause now"
+        );
+        // Without a rules hold the lift unpauses.
+        let mut c = running(HOST, t);
+        at(&mut c, t, 13.0, false, 3.0);
+        at(&mut c, t, 13.4, true, 0.0);
+        let (_, act) = at(&mut c, t, 15.0, true, 0.0);
+        assert_eq!(act, FreezeAction::Unpause);
+    }
+
     #[test]
     fn the_host_plays_on_fifteen_seconds_then_waits_and_a_long_freeze_is_a_pause() {
         let t = Instant::now();
@@ -1748,20 +2310,26 @@ mod tests {
         assert_eq!(act, FreezeAction::None, "never unpaused by the wait");
     }
 
-    /// The host gone for good, each way: the joining player's run is over.
+    /// The partner gone for good, each way and in either role: the run is over
+    /// and stands paused. The next run is co-op again where the link stays.
     #[test]
-    fn the_host_gone_for_good_ends_the_joining_players_run() {
+    fn a_partner_gone_for_good_ends_the_run_in_either_role() {
         let t = Instant::now();
-        let goodbye = Event::Disconnected {
-            peer: HOST,
-            reason: DisconnectReason::Remote,
-        };
-        for (way, stays) in [("RunLeft", true), ("goodbye", false)] {
-            let mut c = running(HOST, t);
+        for (partner, way, stays) in [
+            (HOST, "RunLeft", true),
+            (HOST, "goodbye", false),
+            (CLIENT, "RunLeft", true),
+            (CLIENT, "goodbye", false),
+        ] {
+            let mut c = running(partner, t);
             let ev = match way {
-                "RunLeft" => msg(HOST, Message::RunLeft { peer: HOST }),
-                _ => goodbye.clone(),
+                "RunLeft" => msg(partner, Message::RunLeft { peer: partner }),
+                _ => Event::Disconnected {
+                    peer: partner,
+                    reason: DisconnectReason::Remote,
+                },
             };
+            let way = format!("{partner} {way}");
             let t1 = t + Duration::from_secs(5);
             assert!(c.handle(ev, t1, 0).is_empty(), "{way}");
             assert_eq!(c.run_over(), Some(t1), "{way}");
@@ -1781,12 +2349,301 @@ mod tests {
             assert_eq!(outs.contains(&Out::HoldLink(true)), stays, "{way}");
             assert_eq!(c.run_over(), None, "{way}");
         }
-        // The host's own partner leaving changes nothing of this: it plays on.
+        // Not a run end: the partner leaving from this game's end screen.
         let mut h = running(CLIENT, t);
+        let mut f = frame(3, false, true);
+        f.game_over = true;
+        h.run_frame(&f, t, 0);
         h.handle(msg(CLIENT, Message::RunLeft { peer: CLIENT }), t, 0);
-        assert_eq!(h.run_over(), None);
-        let (_, act) = at(&mut h, t, 1.0, false, 0.0);
+        assert_eq!(h.run_over(), None, "the end screen stays as it is");
+        let (_, act) = h.run_frame(&f, t + Duration::from_secs(1), 0);
         assert_eq!(act, FreezeAction::None);
+    }
+
+    /// A leave while the link is down is told to the partner at the next link.
+    #[test]
+    fn leaving_during_a_lost_link_is_told_at_the_next_link() {
+        let t = Instant::now();
+        let mut c = running(CLIENT, t);
+        timeout(&mut c, CLIENT, t);
+        let outs = c.menu_frame();
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Out::Broadcast(Message::RunLeft { .. }))),
+            "nobody to tell now: {outs:?}"
+        );
+        let outs = c.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        assert!(
+            outs.contains(&Out::Send(CLIENT, Message::RunLeft { peer: HOST })),
+            "{outs:?}"
+        );
+        // The debt is paid once. In no run, each new link says so once.
+        assert!(!c.owe_run_left);
+        c.handle(
+            Event::Disconnected {
+                peer: CLIENT,
+                reason: DisconnectReason::Timeout,
+            },
+            t,
+            0,
+        );
+        let outs = c.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        assert_eq!(
+            outs.iter()
+                .filter(|o| matches!(o, Out::Send(_, Message::RunLeft { .. })))
+                .count(),
+            1
+        );
+        // The partner waiting in that run takes it: run over.
+        let mut w = running(HOST, t);
+        timeout(&mut w, HOST, t);
+        w.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        w.handle(msg(HOST, Message::RunLeft { peer: HOST }), t, 0);
+        assert!(w.run_over().is_some());
+    }
+
+    /// A leave in a silent wait sends `RunLeft` at once and at the next link (a
+    /// link timeout drops what was unsent). A new co-op run together drops it.
+    #[test]
+    fn leaving_in_a_silent_wait_is_told_now_and_at_the_next_link() {
+        let t = Instant::now();
+        let mut c = running(CLIENT, t);
+        at(&mut c, t, 13.0, false, 3.0);
+        assert!(c.waiting() && c.linked());
+        let outs = c.menu_frame();
+        assert!(outs.contains(&Out::Broadcast(Message::RunLeft { peer: HOST })));
+        timeout(&mut c, CLIENT, t);
+        let connect = Event::Connected {
+            peer: CLIENT,
+            addr: addr(),
+        };
+        let outs = c.handle(connect.clone(), t, 0);
+        assert!(outs.contains(&Out::Send(CLIENT, Message::RunLeft { peer: HOST })));
+        // Told by the return itself, and a new run together since: no debt.
+        let mut c = running(CLIENT, t);
+        at(&mut c, t, 13.0, false, 3.0);
+        c.menu_frame();
+        c.run_frame(&frame(4, false, true), t + Duration::from_secs(20), 0);
+        timeout(&mut c, CLIENT, t);
+        let outs = c.handle(connect, t, 0);
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Out::Send(_, Message::RunLeft { .. }))),
+            "{outs:?}"
+        );
+    }
+
+    /// A game that links again from its menus says it is in no run (`RunLeft`).
+    /// The partner in the run takes it as a leave: its run is over.
+    #[test]
+    fn a_game_back_from_its_menus_ends_the_run_it_left() {
+        let t = Instant::now();
+        // The host restarted while the joining player was frozen in the run.
+        let mut j = running(HOST, t);
+        at(&mut j, t, 13.0, false, 3.0);
+        assert!(j.wait_hold(), "frozen in the wait");
+        timeout(&mut j, HOST, t + Duration::from_secs(20));
+        let mut restarted = Core::new(Duration::from_millis(250));
+        let said = restarted.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        assert!(said.contains(&Out::Send(CLIENT, Message::RunLeft { peer: HOST })));
+        let t1 = t + Duration::from_secs(40);
+        j.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t1,
+            0,
+        );
+        j.handle(msg(HOST, hello("Sam", "pe-1-2")), t1, 0);
+        j.handle(msg(HOST, Message::RunLeft { peer: HOST }), t1, 0);
+        assert_eq!(j.run_over(), Some(t1), "the joining player's run is over");
+        assert!(j.left_run(HOST));
+        assert_eq!(
+            j.run.as_ref().and_then(|r| r.left.clone()).as_deref(),
+            Some("Sam left the run"),
+            "as at a leave"
+        );
+        assert!(
+            j.notices
+                .iter()
+                .any(|(n, _)| n == "Sam left the run for the menu")
+        );
+        // The joining game restarted while the host was in the run.
+        let mut h = running(CLIENT, t);
+        at(&mut h, t, 13.0, false, 3.0);
+        timeout(&mut h, CLIENT, t + Duration::from_secs(20));
+        let mut restarted = Core::new(Duration::from_millis(250));
+        let said = restarted.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        assert_eq!(
+            said,
+            vec![Out::Send(HOST, Message::RunLeft { peer: PeerId(1) })]
+        );
+        h.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t1,
+            0,
+        );
+        h.handle(msg(CLIENT, hello("Sam", "pe-1-2")), t1, 0);
+        h.handle(msg(CLIENT, Message::RunLeft { peer: PeerId(1) }), t1, 0);
+        assert_eq!(h.run_over(), Some(t1), "the host's run is over");
+        assert!(h.left_run(CLIENT));
+        let (_, act) = at(&mut h, t, 40.1, true, 0.0);
+        assert_eq!(act, FreezeAction::None, "it stands until it leaves");
+        assert!(!h.waiting(), "no wait: the run is over");
+    }
+
+    /// A first link with both games in the menus: each says it is in no run,
+    /// and neither ends a run or shows a notice.
+    #[test]
+    fn a_first_link_in_the_menus_ends_nothing() {
+        let t = Instant::now();
+        let mut h = Core::new(Duration::from_millis(250));
+        let mut j = Core::new(Duration::from_millis(250));
+        let from_h = h.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        let from_j = j.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t,
+            0,
+        );
+        assert!(from_h.contains(&Out::Send(CLIENT, Message::RunLeft { peer: HOST })));
+        assert!(from_j.contains(&Out::Send(HOST, Message::RunLeft { peer: PeerId(1) })));
+        j.handle(msg(HOST, Message::RunLeft { peer: HOST }), t, 0);
+        h.handle(msg(CLIENT, Message::RunLeft { peer: PeerId(1) }), t, 0);
+        for c in [&h, &j] {
+            assert!(c.linked());
+            assert!(!c.left_run(HOST) && !c.left_run(CLIENT));
+            assert_eq!(c.run_over(), None);
+            assert!(
+                !c.notices.iter().any(|(n, _)| n.contains("left the run")),
+                "{:?}",
+                c.notices
+            );
+        }
+        let (outs, _) = h.run_frame(&frame(3, false, true), t, 0);
+        assert!(h.coop_run() && outs.contains(&Out::HoldLink(true)));
+    }
+
+    /// A return inside the run (the endpoint timed out and linked again)
+    /// sends no `RunLeft`, and a long freeze is the shared pause.
+    #[test]
+    fn a_return_inside_the_run_sends_no_run_left() {
+        let t = Instant::now();
+        let mut h = running(CLIENT, t);
+        let mut j = running(HOST, t);
+        at(&mut h, t, 13.0, false, 3.0);
+        at(&mut j, t, 13.0, false, 3.0);
+        timeout(&mut h, CLIENT, t + Duration::from_secs(20));
+        timeout(&mut j, HOST, t + Duration::from_secs(20));
+        let t1 = t + Duration::from_secs(40);
+        let outs_h = h.handle(
+            Event::Connected {
+                peer: CLIENT,
+                addr: addr(),
+            },
+            t1,
+            0,
+        );
+        let outs_j = j.handle(
+            Event::Connected {
+                peer: HOST,
+                addr: addr(),
+            },
+            t1,
+            0,
+        );
+        for outs in [&outs_h, &outs_j] {
+            assert!(
+                !outs
+                    .iter()
+                    .any(|o| matches!(o, Out::Send(_, Message::RunLeft { .. }))),
+                "{outs:?}"
+            );
+        }
+        let (_, act) = at(&mut j, t, 40.1, true, 0.0);
+        assert_eq!(
+            act,
+            FreezeAction::None,
+            "the freeze stays: the shared pause"
+        );
+        assert_eq!(
+            j.take_wait_events(),
+            vec![WaitEvent::Lost, WaitEvent::Back { long: true }]
+        );
+        assert_eq!(j.run_over(), None);
+        assert_eq!(h.run_over(), None);
+    }
+
+    /// The host's game ends (everyone down) in its 15 s of playing on: its
+    /// end screen is not frozen when they run out.
+    #[test]
+    fn the_wait_never_freezes_this_games_end_screen() {
+        let t = Instant::now();
+        let mut c = running(CLIENT, t);
+        at(&mut c, t, 13.0, false, 3.0);
+        assert!(c.waiting());
+        let mut f = frame(3, false, true);
+        f.game_over = true;
+        for s in [16.0, 30.0, 40.0] {
+            f.silent_for = Some(Duration::from_secs_f64(s - 10.0));
+            let (_, act) = c.run_frame(&f, t + Duration::from_secs_f64(s), 0);
+            assert_eq!(act, FreezeAction::None, "at {s} s");
+        }
+        // Without the end screen the same wait freezes the host.
+        let mut c = running(CLIENT, t);
+        at(&mut c, t, 13.0, false, 3.0);
+        let (_, act) = at(&mut c, t, 30.0, false, 20.0);
+        assert_eq!(act, FreezeAction::Pause);
     }
 
     #[test]
@@ -1810,8 +2667,8 @@ mod tests {
         c.handle(msg(CLIENT, Message::RunLeft { peer: CLIENT }), t, 0);
         timeout(&mut c, CLIENT, t);
         let (_, act) = at(&mut c, t, 30.0, false, 0.0);
-        assert_eq!(act, FreezeAction::None);
-        assert!(!c.waiting());
+        assert_eq!(act, FreezeAction::Pause);
+        assert!(!c.waiting() && c.run_over().is_some());
     }
 
     /// On the upgrade screen the wait pauses only as the screen closes.

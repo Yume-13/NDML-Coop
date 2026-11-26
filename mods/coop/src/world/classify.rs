@@ -21,36 +21,14 @@
 // SOFTWARE.
 
 //! Which game objects the shared world deals with: names, classes and value
-//! parsing (the glue resolves names and ancestry). [`PARTS`] and [`LOCAL`]
-//! name the `oSolid` children that are their maker's parts or each game's
-//! own missiles.
+//! parsing (the glue resolves names and ancestry). A client makes every
+//! enemy-family object the host replicates the same way: `instance_create`
+//! alone, then the host's whole state (`gen_glue.rs`).
 
 #![forbid(unsafe_code)]
 
 use ndml_sdk::Value;
 use ndml_sdk::abi::OBJECT_REF_TAG;
-
-/// Parts made by their leader at any time, not only while it is built
-/// (`oEnemySegment` children count too).
-pub const PARTS: &[&str] = &[
-    "oSnapperJawLeft",
-    "oSnapperJawRight",
-    "oSnapperTentacle",
-    "oSnapperTentacleBase",
-    "oEnemyHardShield",
-];
-
-/// Enemy missiles: like shots, each game makes its own from its copy of the
-/// shooter.
-pub const LOCAL: &[&str] = &[
-    "oConstructorMissile",
-    "oDreadnoughtMissile",
-    "oDwellerChitinMissile",
-    "oInterceptorMissile",
-    "oJuggMissile",
-    "oJuggMissileHoming",
-    "oWarbringerMissile",
-];
 
 /// Parents the glue resolves by name.
 pub mod parent {
@@ -64,9 +42,19 @@ pub mod parent {
     pub const SEGMENT: &str = "oEnemySegment";
     /// Asteroids, mines, missiles.
     pub const TARGET: &str = "oTarget";
+    /// Enemies that emerge from the background (`oHiveEmerge`,
+    /// `oEclipseEmerging`): not an `oSolid` (no collision, no hit). Each
+    /// grows out of the background in its own Step, then makes the solid
+    /// enemy in its place and ends itself ([`super::Class::Enemy`]'s
+    /// `emerging`).
+    pub const EMERGING: &str = "oEnemyEmerging";
     /// Enemy shots, blasts and beams.
     pub const ENEMY_SHOTS: [&str; 3] = ["oEnemyProjectile", "oEnemyBlast", "oEnemyBeam"];
-    /// Beam charge-ups (`oEffect` children), shared and counted as beams.
+    /// Beam charge-ups (`oEffect` children, and their children), shared and
+    /// counted as beams. They go by this list, not by the wind-up rule
+    /// (`world::windup`): the host owns each one whoever makes it. Nothing
+    /// in the game marks them but their names (`chargeUpObject` holds them
+    /// and other wind-ups alike).
     pub const ENEMY_CHARGES: [&str; 6] = [
         "oEnemyBeamCharge",
         "oEnemyBeamChargeBlue",
@@ -75,8 +63,15 @@ pub mod parent {
         "oEnemyBeamChargePulse",
         "oEnemyBeamChargeScaled",
     ];
+    /// Effects (the one [`LOCAL_ROOTS`] root a wind-up may be under, and
+    /// the pooled ones under it that are never one: `world::windup`).
+    pub const EFFECT: &str = "oEffect";
+    pub const EFFECT_POOLED: &str = "oEffectPooled";
     /// Enemy areas (an `oEnemyBeam` child).
     pub const ENEMY_AREA: &str = "oEnemyAoE";
+    /// The spawn machinery ([`super::Class::Spawner`]): `oEnemySpawner` and
+    /// every other child.
+    pub const SPAWNER: &str = "oSpawner";
     /// What stays each game's own by ancestry: never a dependency.
     pub const LOCAL_ROOTS: [&str; 13] = [
         "oEffect",
@@ -106,7 +101,8 @@ pub fn is_player_family_name(chain: &[&str]) -> bool {
 /// What an object is, from its ancestry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// An `oSolid` child (enemy, part, asteroid, mine).
+    /// An `oSolid` child (enemy, part, asteroid, mine), or an enemy that
+    /// emerges from the background (`emerging`).
     Enemy {
         /// An `oEnemyStandard` child.
         standard: bool,
@@ -114,12 +110,12 @@ pub enum Class {
         segment: bool,
         /// An `oTarget` child.
         target: bool,
-        /// Part of whoever creates it, whenever it is made: a segment, or in
-        /// [`PARTS`]. Never replicated; a puppet builds its own.
-        part: bool,
-        /// An attack each game makes for itself ([`LOCAL`]): never replicated;
-        /// a puppet's own is let through and left to the game.
-        local: bool,
+        /// A [`parent::EMERGING`] child: replicated like an enemy but not an
+        /// `oSolid`, so nothing hits, targets or counts it on either game,
+        /// and its Step has no enemy tick of its own: the world ticks it after
+        /// its Step ([`Self::ticked_after_its_step`]). Its end is the host's
+        /// (`world::emerge`).
+        emerging: bool,
     },
     /// An `oCollectable` child.
     Collectable,
@@ -127,6 +123,14 @@ pub enum Class {
     EnemyShot,
     /// A spawn telegraph (`oSpawnWarning`, or `oEnemyPortal` when `portal`).
     Marker { portal: bool },
+    /// The host's spawn machinery (an `oSpawner` child: `oEnemySpawner`,
+    /// made by `spawnEnemies` for the wave director, a black hole or an
+    /// enemy that summons: a Host, Gyrogun, Bolt Thrower, Warden, Saucer).
+    /// Never a dependency, a follower, a world spawn or a part on a joining
+    /// game: all a spawner does reaches it another way (its telegraph as a
+    /// `SpawnMarker`, the enemy its `Alarm_1` makes as that enemy's own
+    /// spawn).
+    Spawner,
     /// Anything else (shots, effects, controllers, the avatar).
     Other,
 }
@@ -138,23 +142,61 @@ impl Class {
         matches!(self, Self::Enemy { .. } | Self::Collectable)
     }
 
-    /// An `oSolid` child.
+    /// An `oSolid` child, or an enemy that emerges from the background.
     #[must_use]
     pub fn is_enemy(self) -> bool {
         matches!(self, Self::Enemy { .. })
     }
 
-    /// Part of its creator (see [`Class::Enemy`]).
+    /// An enemy whose Step has no enemy tick of its own: the world ticks it
+    /// after its Step, every frame, on both games (the emerging ones).
     #[must_use]
-    pub fn is_part(self) -> bool {
-        matches!(self, Self::Enemy { part: true, .. })
+    pub fn ticked_after_its_step(self) -> bool {
+        matches!(self, Self::Enemy { emerging: true, .. })
     }
 
-    /// An attack each game makes for itself (see [`Class::Enemy`]).
+    /// The class of an object from its ancestry: an `oSolid` child, else an
+    /// [`parent::EMERGING`] child, is an enemy; `None` for the rest (the glue
+    /// tells those apart). `standard`, `segment` and `target` are the
+    /// `oSolid` child's own ancestry.
     #[must_use]
-    pub fn is_local(self) -> bool {
-        matches!(self, Self::Enemy { local: true, .. })
+    pub fn enemy_by_ancestry(solid: bool, emerging: bool, of: EnemyAncestry) -> Option<Self> {
+        if solid {
+            Some(Self::Enemy {
+                standard: of.standard,
+                segment: of.segment,
+                target: of.target,
+                emerging: false,
+            })
+        } else if emerging {
+            Some(Self::Enemy {
+                standard: false,
+                segment: false,
+                target: false,
+                emerging: true,
+            })
+        } else {
+            None
+        }
     }
+
+    /// May an instance of this class be a dependency, a follower a leader's
+    /// code made, or a part of a replicated enemy: only [`Self::Other`]
+    /// (the rest is replicated in its own right, a telegraph, or the
+    /// host's spawn machinery, [`Self::Spawner`]).
+    #[must_use]
+    pub fn may_go_with_an_enemy(self) -> bool {
+        self == Self::Other
+    }
+}
+
+/// An `oSolid` child's further ancestry ([`Class::enemy_by_ancestry`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one per ancestor asked
+pub struct EnemyAncestry {
+    pub standard: bool,
+    pub segment: bool,
+    pub target: bool,
 }
 
 /// The object index in a value the game gives for an object: an object ref
@@ -208,18 +250,59 @@ mod tests {
         standard: true,
         segment: false,
         target: false,
-        part: false,
-        local: false,
+        emerging: false,
     };
 
     #[test]
     fn classes() {
-        for n in PARTS.iter().chain(LOCAL) {
-            assert!(n.starts_with('o'), "{n}");
-        }
         assert!(Class::Collectable.replicated() && !Class::Collectable.is_enemy());
         assert!(ENEMY.replicated() && ENEMY.is_enemy());
         assert!(!Class::Other.replicated());
+    }
+
+    /// The emerging family (an `oEnemyEmerging` child, no `oSolid`) is a
+    /// replicated enemy: the joining game never makes one itself, never
+    /// takes one for a dependency, follower or part, and ticks it after its
+    /// Step (no enemy tick of its own); an `oSolid` child is ticked by its
+    /// own.
+    #[test]
+    fn the_emerging_family_is_a_replicated_enemy_ticked_after_its_step() {
+        let of = EnemyAncestry {
+            standard: true,
+            ..EnemyAncestry::default()
+        };
+        let emerging = Class::enemy_by_ancestry(false, true, of).unwrap();
+        assert!(emerging.replicated() && emerging.is_enemy());
+        assert!(emerging.ticked_after_its_step());
+        assert!(!emerging.may_go_with_an_enemy());
+        assert_eq!(
+            emerging,
+            Class::Enemy {
+                standard: false,
+                segment: false,
+                target: false,
+                emerging: true,
+            }
+        );
+        let solid = Class::enemy_by_ancestry(true, false, of).unwrap();
+        assert_eq!(solid, ENEMY);
+        assert!(!solid.ticked_after_its_step());
+        // An `oSolid` child is the `oSolid` kind whatever else it is.
+        assert_eq!(Class::enemy_by_ancestry(true, true, of), Some(ENEMY));
+        assert_eq!(Class::enemy_by_ancestry(false, false, of), None);
+        assert_eq!(parent::EMERGING, "oEnemyEmerging");
+    }
+
+    /// The spawn machinery is the host's alone: not replicated, never with
+    /// an enemy (dependency, follower, part); an effect may be.
+    #[test]
+    fn a_spawner_goes_with_nothing() {
+        assert!(!Class::Spawner.replicated() && !Class::Spawner.is_enemy());
+        assert!(!Class::Spawner.may_go_with_an_enemy());
+        assert!(Class::Other.may_go_with_an_enemy());
+        assert!(!ENEMY.may_go_with_an_enemy());
+        assert!(!Class::Marker { portal: false }.may_go_with_an_enemy());
+        assert_eq!(parent::SPAWNER, "oSpawner");
     }
 
     #[test]

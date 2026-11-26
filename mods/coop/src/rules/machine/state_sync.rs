@@ -63,6 +63,7 @@ pub(super) fn counted(msg: &Message) -> bool {
             | Message::Unpause { .. }
             | Message::UpgradeOpen { .. }
             | Message::UpgradeDone { .. }
+            | Message::UpgradeChoosing { .. }
             | Message::Downed { .. }
             | Message::Respawned { .. }
             | Message::GameOver
@@ -314,6 +315,9 @@ impl Rules {
                 s.done = self.peers.minus(self.upgrade.waiting_on()).bits();
             }
             s.released = self.upgrade.last_released().unwrap_or(0);
+            if self.last_release_counted {
+                s.flags |= RulesState::COUNTED;
+            }
             let gt = self.game_time;
             s.downs = self
                 .respawn
@@ -481,9 +485,11 @@ impl Rules {
             if self.proposed.is_some_and(|p| p <= s.released) {
                 self.proposed = None;
             }
+            // The host's word on whether its release counts down.
+            self.release_counts = Some(s.flags & RulesState::COUNTED != 0);
             let ev = self.upgrade.adopt_released(s.released);
             self.on_upgrade(ev);
-            self.wait_since = None;
+            self.release_counts = None;
         }
         if self.open_due(s) {
             log::info!("co-op rules: round {} open from the host's state", s.round);
@@ -495,7 +501,7 @@ impl Rules {
                 "co-op rules: {p} chose in round {}, from the host's state",
                 s.round
             );
-            let ev = self.upgrade.done(p, s.round);
+            let ev = self.take_done(p, s.round);
             self.on_upgrade(ev);
         }
         let mine = PeerSet::from_bits(s.holders).contains(self.me);
@@ -609,7 +615,7 @@ impl Rules {
                 "co-op rules: {c} chose in round {}, from their state",
                 s.chosen
             );
-            self.on_upgrade_done(c, s.chosen);
+            self.on_upgrade_done(c, c, s.chosen, false);
         }
         if self.client_up_due(c, s) && self.respawn.respawned(c) {
             log::info!("co-op rules: {c}'s ship is up, from their state");

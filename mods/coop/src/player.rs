@@ -242,6 +242,8 @@ pub struct RemoteShip {
     last_render: Option<Duration>,
     /// The newest states.
     recent: std::collections::VecDeque<Recent>,
+    /// The time of the first state up after a down ([`Self::downed_at`]).
+    up_since: Option<Duration>,
 }
 
 /// A state as [`RemoteShip`] keeps it for the motion checks.
@@ -264,6 +266,7 @@ impl RemoteShip {
             last: None,
             look: None,
             last_rx: None,
+            up_since: None,
             last_pose_at: None,
             last_render: None,
             recent: std::collections::VecDeque::with_capacity(RECENT),
@@ -288,6 +291,11 @@ impl RemoteShip {
             seg: ps.seg,
         });
         if kept {
+            if ps.downed {
+                self.up_since = None;
+            } else if self.last.is_some_and(|l| l.downed) {
+                self.up_since = Some(state.time);
+            }
             self.last = Some(*ps);
             self.last_rx = Some(now);
             if self.recent.len() == RECENT {
@@ -448,6 +456,13 @@ impl RemoteShip {
     #[must_use]
     pub fn latest(&self) -> Option<&PlayerState> {
         self.last.as_ref()
+    }
+
+    /// Down at partner time `render` (the time its pose is drawn at): the
+    /// newest state says so, or the ship's first state up is newer than `render`.
+    #[must_use]
+    pub fn downed_at(&self, render: Duration) -> bool {
+        self.last.is_some_and(|l| l.downed) || self.up_since.is_some_and(|t| render < t)
     }
 
     /// Heard from within [`STALE_AFTER`].
@@ -639,6 +654,34 @@ mod tests {
             downed: false,
             seg: 0,
         }
+    }
+
+    /// A new down hides the ship at once.
+    #[test]
+    fn a_ship_coming_back_shows_from_its_own_time_on() {
+        let t0 = Instant::now();
+        let ms = |m: u64| Duration::from_millis(m);
+        let mut r = RemoteShip::new(ms(250));
+        let down = |m: u32| PlayerState {
+            downed: true,
+            ..state(m, 900.0, 0.0)
+        };
+        r.push(&down(0), t0);
+        r.push(&down(17), t0);
+        assert!(r.downed_at(ms(10)));
+        // Back at the fly-in's start (a new segment), 34 ms.
+        r.push(
+            &PlayerState {
+                seg: 1,
+                ..state(34, -50.0, 1100.0)
+            },
+            t0,
+        );
+        assert!(r.downed_at(ms(20)), "drawn before its return: still down");
+        assert!(!r.downed_at(ms(34)));
+        assert!(!r.downed_at(ms(40)));
+        r.push(&down(51), t0);
+        assert!(r.downed_at(ms(40)), "a new down hides it at once");
     }
 
     #[test]

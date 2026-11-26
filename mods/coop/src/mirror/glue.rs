@@ -320,6 +320,15 @@ impl MirrorHooks {
         }
     }
 
+    /// The slow-frames line (`crate::slow_log`): this player's own
+    /// player-side instances the mirror keys (shots, drones, constructs) and
+    /// the partner's it draws here. One lock, no walk.
+    #[must_use]
+    pub fn slow_counts(&self) -> (usize, usize) {
+        let st = self.lock();
+        (st.sender.len(), st.receiver.len())
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         crate::game::lock_or_report(&self.st, "mirror")
     }

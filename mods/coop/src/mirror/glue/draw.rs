@@ -286,6 +286,13 @@ pub(super) struct ViewerDraw {
     pub(super) proxy_of: HashMap<u64, (u16, u16)>,
     /// Values not yet due: key -> owner time -> pieces ([`Self::advance`]).
     incoming: HashMap<u16, BTreeMap<u32, Tick>>,
+    /// The viewer's running render time ([`Self::advance`]): the shown
+    /// time's steps from one drawn frame to the next, each counted up to
+    /// [`RUN_STEP_MS`]. Then the last shown time it stepped from, and per key
+    /// the running time its newest values came at.
+    run_ms: u32,
+    last_shown: Option<u32>,
+    came_at: HashMap<u16, u32>,
     /// Ticks applied, dropped incomplete, keys started over, dropped late.
     pub(super) ticks: [u64; 4],
     /// Per key: the owner time of the newest tick applied.
@@ -328,8 +335,12 @@ pub(super) const FOREIGN_READS: &[(&str, &[(&str, &str)])] = &[
 
 /// Ticks kept per key while waiting for their time (about 2 s of sends).
 const TICKS_KEPT: usize = 64;
-/// A key with nothing drawn this long after its newest values is forgotten.
+/// A key with nothing drawn this long after its newest values is forgotten
+/// (running render time: a hold does not count).
 const INCOMING_STALE_MS: u32 = 3000;
+/// The most render time one drawn frame adds to the running time: more is a
+/// hold or a stall the viewer did not run through.
+const RUN_STEP_MS: u32 = 250;
 
 impl ViewerDraw {
     pub(super) fn clear(&mut self) {
@@ -384,6 +395,7 @@ impl ViewerDraw {
     ) {
         for (after, k) in keys {
             let (key, i, n) = (k.key, usize::from(k.piece), usize::from(k.pieces));
+            self.came_at.insert(key, self.run_ms);
             let ticks = self.incoming.entry(key).or_default();
             let tick = ticks.entry(time_ms).or_insert_with(|| Tick {
                 pieces: vec![None; n.max(1)],
@@ -425,14 +437,23 @@ impl ViewerDraw {
 
     /// Bring drawn keys' values to their poses' times; forget stale keys.
     pub(super) fn advance(&mut self, shown: impl IntoIterator<Item = (u16, u32)>, t: u32) {
+        let step = self
+            .last_shown
+            .map_or(0, |l| t.saturating_sub(l).min(RUN_STEP_MS));
+        self.run_ms = self.run_ms.saturating_add(step);
+        self.last_shown = Some(t);
         for (key, at) in shown {
             self.advance_key(key, at);
         }
-        self.incoming.retain(|_, ticks| {
-            ticks
-                .last_key_value()
-                .is_some_and(|(newest, _)| newest.saturating_add(INCOMING_STALE_MS) >= t)
+        let now = self.run_ms;
+        let came_at = &self.came_at;
+        self.incoming.retain(|key, _| {
+            came_at
+                .get(key)
+                .is_some_and(|c| c.saturating_add(INCOMING_STALE_MS) >= now)
         });
+        let incoming = &self.incoming;
+        self.came_at.retain(|key, _| incoming.contains_key(key));
     }
 
     /// Apply `key`'s values of owner time `time`. After a missed send the
@@ -494,6 +515,7 @@ impl ViewerDraw {
 
     pub(super) fn forget(&mut self, key: u16) {
         self.incoming.remove(&key);
+        self.came_at.remove(&key);
         self.vals.remove(&key);
         self.dirty.remove(&key);
         self.applied.remove(&key);
@@ -516,31 +538,220 @@ pub(super) struct Observed {
     pub(super) code_of: Mutex<HashMap<u32, u32>>,
 }
 
-/// Draw code whose reads depend on state a young instance lacks (a trail's point arrays, an
-/// elite Carrier fighter's `nearby` and `col`): every trial keeps these variables when the model
-/// has them. An entry also covers the object's children.
+/// The instance's own variables each code object's Draw reads on any path
+/// (its `Draw_0`, the scripts it calls three deep, the ancestor's Draw an
+/// `event_inherited` runs): every trial of that code keeps those, besides
+/// what it finds. A trial sees only the path its instance takes. An entry
+/// also covers the object's children without a Draw of their own.
 pub(super) const PATH_READS: &[(&str, &[&str])] = &[
+    ("oBoltThrowerSlice", &["blend"]),
+    ("oBurstGrowDamaging", &["blend"]),
+    ("oBurstGrowDynamic", &["blend"]),
+    ("oBurstGrowPos", &["blend"]),
+    ("oBurstQuick", &["blend"]),
+    ("oBurstQuickNoDamage", &["blend"]),
+    ("oBurstRetaliate", &["blendAdd"]),
+    ("oChain", &["blend"]),
+    ("oCharge", &["blend"]),
+    ("oConstructAlly", &["col", "nearby"]),
+    ("oConstructSwarm", &["col", "nearby", "rarity"]),
+    ("oConstructTurret", &["col", "nearby"]),
+    ("oEnemyAoEReflectedObjectClone", &["object_index_original"]),
+    (
+        "oEnemyBlastReflectedObjectClone",
+        &["object_index_original"],
+    ),
+    (
+        "oEnemyProjectileReflectedObjectClone",
+        &["object_index_original"],
+    ),
+    ("oFlash", &["colorWhite"]),
+    ("oFollowingGraphic", &["blend"]),
+    ("oFollowingGraphicPulsating", &["blend"]),
+    ("oFollowingGraphicPulsing", &["blend"]),
+    (
+        "oPlayerTrails",
+        &[
+            "DrawTriangleNode",
+            "NodeCount",
+            "TrailD",
+            "TrailLength",
+            "TrailT",
+            "TrailTime",
+            "TrailX",
+            "TrailY",
+            "trailAlpha0",
+            "trailAlpha1",
+            "trailColor0",
+            "trailColor1",
+            "trailSprite",
+            "trailWidth0",
+            "trailWidth1",
+        ],
+    ),
+    ("oPlayerVisibility", &["blend"]),
+    (
+        "oRailTrail",
+        &[
+            "DrawTriangleNode",
+            "NodeCount",
+            "TrailD",
+            "TrailLength",
+            "TrailT",
+            "TrailTime",
+            "TrailX",
+            "TrailY",
+            "trailAlpha0",
+            "trailAlpha1",
+            "trailColor0",
+            "trailColor1",
+            "trailSprite",
+            "trailWidth0",
+            "trailWidth1",
+        ],
+    ),
+    (
+        "oRailgun",
+        &[
+            "DrawTriangleNode",
+            "NodeCount",
+            "TrailD",
+            "TrailLength",
+            "TrailT",
+            "TrailTime",
+            "TrailX",
+            "TrailY",
+        ],
+    ),
+    (
+        "oRainbowEffect",
+        &[
+            "col",
+            "flashAlpha",
+            "flashAlpha2",
+            "flashAlpha3",
+            "flashScale",
+            "flashScale2",
+            "flashScale3",
+            "flashScale4",
+            "graphic",
+        ],
+    ),
+    ("oSanctuaryIndicator", &["shieldSize"]),
+    (
+        "oSwordObject",
+        &[
+            "ColAdd",
+            "ColMake",
+            "ColMult",
+            "ColSplit",
+            "attackDone",
+            "charging",
+            "controllerFinishIdle",
+            "controllerStartIdle",
+            "debugColor",
+            "debugPos",
+            "firing",
+            "getController",
+            "goalX",
+            "goalY",
+            "hasSwapped",
+            "leftSide",
+            "mgmtSwordIndex",
+            "powered",
+            "recovering",
+            "relativeToObjective",
+            "startLeftSide",
+        ],
+    ),
+    ("oSwordSpark", &["blend"]),
     (
         "oTrail",
         &[
-            "trailWidth0",
-            "trailColor0",
-            "trailAlpha0",
-            "trailWidth1",
-            "trailColor1",
-            "trailAlpha1",
-            "trailSprite",
+            "DrawTriangleNode",
             "NodeCount",
+            "TrailD",
+            "TrailLength",
+            "TrailT",
+            "TrailTime",
             "TrailX",
             "TrailY",
-            "TrailT",
-            "TrailD",
-            "TrailTime",
-            "TrailLength",
-            "DrawTriangleNode",
+            "trailAlpha0",
+            "trailAlpha1",
+            "trailColor0",
+            "trailColor1",
+            "trailSprite",
+            "trailWidth0",
+            "trailWidth1",
         ],
     ),
-    ("oConstructSwarm", &["rarity", "nearby", "col"]),
+    (
+        "oTrailRay",
+        &[
+            "DrawTriangleNode",
+            "NodeCount",
+            "TrailD",
+            "TrailLength",
+            "TrailT",
+            "TrailTime",
+            "TrailX",
+            "TrailY",
+            "trailAlpha0",
+            "trailAlpha1",
+            "trailColor0",
+            "trailColor1",
+            "trailWidth0",
+            "trailWidth1",
+        ],
+    ),
+    (
+        "oUnlockable",
+        &[
+            "alpha",
+            "col",
+            "fade",
+            "flashAlpha",
+            "flashAlpha2",
+            "flashAlpha3",
+            "flashScale",
+            "flashScale2",
+            "flashScale3",
+            "flashScale4",
+            "graphic",
+            "graphicBack",
+            "hueCount",
+            "scale",
+            "textDesc",
+            "textPosX",
+            "textPosY",
+            "useFullDesc",
+        ],
+    ),
+    ("oVortex", &["blend"]),
+    ("oVortexCharge", &["blend"]),
+    ("oVortexTempest", &["blend"]),
+    (
+        "obj_Shockwave",
+        &[
+            "wave_additive",
+            "wave_alpha",
+            "wave_blend",
+            "wave_max_radius",
+            "wave_push",
+            "wave_radius",
+            "wave_segment",
+            "wave_speed",
+            "wave_surf",
+            "wave_surf_h",
+            "wave_surf_t",
+            "wave_surf_w",
+            "wave_update",
+            "wave_vb_inside",
+            "wave_vb_outside",
+            "wave_view",
+            "wave_width",
+        ],
+    ),
 ];
 
 /// `found` plus the [`PATH_READS`] the model has, in the model's order.
@@ -1496,10 +1707,56 @@ mod tests {
         v.advance([(7, 170)], 170);
         assert_eq!(v.vals[&7][1], None);
         assert!(!v.ready(7, 2));
-        // A key not drawn for a while is forgotten.
+        // A key not drawn for a while (running render time) is forgotten.
         v.on_message(vars(150, vec![piece(8, 0, 1, 0, arr(0))]));
-        v.advance([], 150 + INCOMING_STALE_MS + 1);
+        let mut t = 170;
+        while t <= 170 + INCOMING_STALE_MS + 100 {
+            t += 100;
+            v.advance([], t);
+        }
         assert!(!v.incoming.contains_key(&8));
+    }
+
+    /// A hold (a pause, an upgrade screen) longer than `INCOMING_STALE_MS`
+    /// with more than `TICKS_KEPT` of a key's values waiting does not cost
+    /// the key its values: the hold's time is not running render time.
+    #[test]
+    fn a_hold_does_not_cost_a_key_its_values() {
+        let tick = |time_ms, after, vals: Vec<(u8, StateValue)>| MirrorDraw::Edits {
+            peer: PeerId(1),
+            part: 0,
+            time_ms,
+            keys: vec![(after, KeyVars::whole(7, vals, Vec::new()))],
+        };
+        let n = |x: f64| StateValue::Real(x);
+        let mut v = ViewerDraw::default();
+        v.on_message(tick(100, 0, vec![(0, n(4.0)), (1, n(40.0)), (2, n(9.0))]));
+        v.advance([(7, 100)], 100);
+        // 70 more sends, every 16 ms, the pose drawn still that of 100 when
+        // the hold begins: the oldest over `TICKS_KEPT` go in order, the
+        // rest wait.
+        let pending = TICKS_KEPT as u32 + 6;
+        let mut time = 100;
+        for i in 0..pending {
+            time += 16;
+            v.on_message(tick(time, 16, vec![(1, n(41.0 + f64::from(i)))]));
+        }
+        assert_eq!(v.ticks, [7, 0, 0, 0], "the 6 over the cap applied in order");
+        // The hold: 5 s with no frame drawn; the first frame after it does
+        // not show the key yet (its new poses still on the way).
+        let after_hold = time + 5000;
+        v.advance([], after_hold);
+        // The key's first send after the hold names its last one before it.
+        v.on_message(tick(
+            after_hold + 50,
+            after_hold + 50 - time,
+            vec![(1, n(99.0))],
+        ));
+        v.advance([(7, after_hold + 50)], after_hold + 66);
+        assert_eq!(v.ticks[2], 0, "no key started over at the hold");
+        assert_eq!(v.ticks[0], 1 + u64::from(pending) + 1);
+        assert!(v.ready(7, 3));
+        assert_eq!(v.vals[&7][1], Some(n(99.0)));
     }
 
     #[test]
@@ -1546,6 +1803,7 @@ mod tests {
         let again = with_path_reads(got, &all, &path);
         assert_eq!(again.len(), 3);
         assert!(PATH_READS.iter().all(|(_, r)| !r.is_empty()));
+        assert!(PATH_READS.iter().any(|(c, _)| *c == "oTrail"));
     }
 
     #[test]

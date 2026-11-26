@@ -58,6 +58,7 @@ pub mod game;
 pub mod gate;
 pub mod guard;
 pub mod ids;
+pub mod link_log;
 pub mod loadout;
 mod loadout_glue;
 pub mod mirror;
@@ -70,6 +71,7 @@ pub mod rules;
 pub mod scaling;
 pub mod singularity;
 mod singularity_glue;
+pub mod slow_log;
 pub mod sound;
 pub mod state;
 pub mod steam;
@@ -124,10 +126,25 @@ pub(crate) struct Coop {
     pub(crate) silence: SilenceWatch,
     /// This frame's silence (from the run tick).
     pub(crate) silent_for: Option<Duration>,
+    /// The link line in the log and the traffic line's numbers.
+    pub(crate) link_log: link_log::LinkLog,
+    /// The slow-frames line in the log.
+    slow_log: slow_log::SlowLog,
+    /// The controller's last GUI draw (`run_draw`).
+    drawn_at: Option<Instant>,
     /// The joining game's over run already asked to leave for the menu.
     over_quit: bool,
     /// This frame's run UI (chosen in the Draw `before`).
     pub(crate) run_ui: RunUi,
+    /// The partner's Ready in this frame's run UI, drawn apart (`run_draw`).
+    pub(crate) run_ready: RunUi,
+    /// The post-run screen the partner's Ready is drawn on this frame. `None`
+    /// outside a run that is over.
+    pub(crate) end_place: Option<ui::run::ReadyPlace>,
+    /// A link that was up went while this player was outside a run's play.
+    pub(crate) link_notice: Option<ui::run::LinkNotice>,
+    /// A link wait ended: when, and this game's state then (`return_line`).
+    return_note: Option<(Instant, String)>,
     /// The run's end is on screen (why): nothing of co-op's drawn over it.
     pub(crate) end_shown: Option<&'static str>,
     /// Links that went away since the last run frame.
@@ -152,20 +169,37 @@ pub(crate) struct Coop {
     pub(crate) rules: rules::Rules,
     /// The host's enemy multipliers (`SessionSettings`), used while linked to it.
     host_mults: Option<(f32, f32)>,
-    /// The host's plays-on time and upgrade wait (`SessionSettings`), kept
-    /// until a menu frame without a link.
-    host_waits: Option<(Option<Duration>, Option<Duration>)>,
-    /// The host's respawn time, kept and forgotten as `host_waits` is.
+    /// The host's respawn time (`SessionSettings`), in force in the rules.
+    /// Forgotten at a menu frame without a link.
     host_respawn: Option<Duration>,
     /// The host's run settings on a joining game (`loadout.rs`).
     pub(crate) loadout: loadout::Joiner,
-    /// The loadout screen: the bar line, the link line, the Start row's "Ready".
+    /// The new game screen: the bar line, the link line, the Start row's "Ready".
     pub(crate) loadout_screen: loadout_glue::Screen,
     /// Host: its run settings as last sent.
     pub(crate) host_sent: loadout::HostSent,
+    /// This player's Ready as the partner last heard it. `None` while unlinked.
+    ready_sent: Option<bool>,
+    /// The partner's Ready notice, drawn wherever this player is.
+    pub(crate) ready_notice: ui::run::ReadyNotice,
 }
 
 impl Coop {
+    /// Each connected partner's measured round trip (the link's smoothed
+    /// RTT), for the honour rule's window (`damage::honour_window`).
+    fn partner_rtts(&self) -> Vec<(PeerId, Duration)> {
+        self.core
+            .partners()
+            .keys()
+            .filter_map(|&p| {
+                self.net
+                    .peer_info(p)
+                    .filter(|i| i.connected)
+                    .map(|i| (p, i.stats.rtt))
+            })
+            .collect()
+    }
+
     /// Drain network events into the session and send what it answers.
     fn pump(&mut self, now: Instant) {
         let now_ms = ndml_net::time::to_wire_ms(self.net.local_time(now));
@@ -206,7 +240,7 @@ impl Coop {
                 }
             };
             if let Event::Message { from, msg } = &ev
-                && self.on_session_message(*from, msg)
+                && self.on_session_message(*from, msg, now)
             {
                 continue;
             }
@@ -225,17 +259,14 @@ impl Coop {
                 self.host_gone();
             }
             if let Event::Disconnected { peer, reason } = &ev {
-                // A timeout is the wait's; anything else is gone for good.
+                // Told outside a run's play (before the core forgets it).
+                let name = self.core.partners().get(peer).map(|p| p.name.clone());
+                self.note_link_lost(*reason, name, now);
+                // Both players unready after a link change.
+                self.ready_gone();
+                // A timeout starts the wait. Any other reason ends the run.
                 let interrupted = world::Loss::of(*reason) == world::Loss::Interrupted;
                 self.rules.peer_left(*peer, interrupted, now);
-                if self.core.coop_run()
-                    && !interrupted
-                    && !peer.is_host()
-                    && let Some(p) = self.core.partners().get(peer)
-                {
-                    self.run_events
-                        .push(ui::glue::link_left(&p.name, &self.lang));
-                }
             }
             let joined = match &ev {
                 Event::Connected { peer, .. } => Some(*peer),
@@ -249,20 +280,96 @@ impl Coop {
             }
             // A newcomer the core turned away (a solo run) never joined.
             if let Some(peer) = joined.filter(|p| self.core.partners().contains_key(p)) {
+                // A new link starts unready on both sides; the partner
+                // assumes this one is not ready.
+                self.ready_gone();
+                self.ready_sent = Some(false);
+                self.link_notice = None;
                 self.rules.peer_joined(peer, now);
                 if self.core.is_host() {
                     self.send_session_settings(peer);
-                    // Its run settings go out at the next menu or loadout frame.
+                    // Its run settings go out at the next menu or new game
+                    // screen frame. A start the partner may have missed goes at once.
                     self.host_sent.reset();
+                    if let Some(m) = loadout_glue::start_again(self) {
+                        net::apply(&self.net, vec![net::Out::Send(peer, m)]);
+                    }
                 }
             }
         }
         let outs = self.rules.take_outs();
         net::apply(&self.net, outs);
+        self.send_start_count();
+        self.sync_ready();
         let linked: Vec<_> = self.core.partners().keys().copied().collect();
         let me = self.core.me();
         let outs = self.colors.outs(me, &linked);
         net::apply(&self.net, outs);
+    }
+
+    /// The link line's frame (`link_log`), in a co-op run only.
+    fn link_frame(
+        &mut self,
+        now: Instant,
+        stats: Option<&ndml_net::endpoint::Stats>,
+        steam: Option<link_log::SteamCounts>,
+        silent_for: Option<Duration>,
+    ) {
+        if !self.core.coop_run() {
+            self.link_log.reset();
+            return;
+        }
+        let f = link_log::LinkFrame {
+            now,
+            net: stats.map(link_log::NetCounts::from),
+            steam,
+            silent_for,
+            waiting: self.core.waiting(),
+        };
+        if let Some(line) = self.link_log.frame(&f) {
+            log::info!("{line}");
+        }
+    }
+
+    /// The slow-frames line's frame (`slow_log`): the line due, if any, and
+    /// this game's role in it.
+    fn slow_frame(
+        &mut self,
+        now: Instant,
+        running: bool,
+        stats: Option<&ndml_net::endpoint::Stats>,
+        steam: Option<link_log::SteamCounts>,
+        host_snaps: impl FnOnce() -> Option<(u64, u32)>,
+    ) -> Option<(slow_log::Due, &'static str)> {
+        let mod_time = self
+            .slow_log
+            .hooks_timed
+            .then(ndml_sdk::profile::take_sides);
+        let f = slow_log::SlowFrame {
+            now,
+            running,
+            mod_time,
+            drawn_at: self.drawn_at,
+        };
+        let totals = || slow_log::Totals {
+            cpu: cpu_times(),
+            net: stats.map(link_log::NetCounts::from),
+            steam,
+            host_snaps: host_snaps(),
+        };
+        let due = self.slow_log.frame(&f, totals);
+        let want = self.slow_log.timing();
+        if want != self.slow_log.hooks_timed {
+            ndml_sdk::profile::time_sides(want);
+            let _ = ndml_sdk::profile::take_sides();
+            self.slow_log.hooks_timed = want;
+        }
+        let role = match (self.core.coop_run(), self.core.is_host()) {
+            (false, _) => "solo",
+            (true, true) => "host",
+            (true, false) => "joining",
+        };
+        due.map(|d| (d, role))
     }
 
     /// A `RunLeft` from a partner still in this run.
@@ -283,11 +390,14 @@ impl Coop {
         for ev in self.core.take_wait_events() {
             match ev {
                 wait::WaitEvent::Lost => {
+                    log::info!("{}", self.link_log.lost(now));
                     if let Some(p) = peer {
                         self.rules.peer_left(p, true, now);
                     }
                 }
                 wait::WaitEvent::Back { long } => {
+                    log::info!("{}", self.link_log.back(now, long));
+                    self.return_note = Some((now, self.own_state_at_return()));
                     if let Some(p) = peer.filter(|p| self.core.partners().contains_key(p)) {
                         self.rules.peer_joined(p, now);
                     }
@@ -300,44 +410,75 @@ impl Coop {
         }
         let outs = self.rules.take_outs();
         net::apply(&self.net, outs);
+        self.return_line(now);
     }
 
-    /// The partner left this co-op run for the menu: the rules drop it, the
-    /// world hands over ([`world::Loss::Left`]) and the run UI says so.
+    /// This game's state when a link wait ends, for the return's line.
+    fn own_state_at_return(&self) -> String {
+        let at = if self.core.run_over_here() || self.rules.run_over() {
+            PartnerAtReturn::RunOver
+        } else if self.rules.is_down() {
+            PartnerAtReturn::Down
+        } else {
+            PartnerAtReturn::Up
+        };
+        own_state(self.core.is_host(), self.core.frozen_at_back(), at)
+    }
+
+    /// The return's state line, once, [`RETURN_LINE_AFTER`] after a link wait
+    /// ends: this game's state then and the partner's since. No names or ids.
+    fn return_line(&mut self, now: Instant) {
+        let Some((at, own)) = self.return_note.as_ref() else {
+            return;
+        };
+        if now.saturating_duration_since(*at) < RETURN_LINE_AFTER {
+            return;
+        }
+        let partner = match self.core.last_partner().map(|p| p.0) {
+            Some(p) if self.core.left_run(p) => PartnerAtReturn::LeftRun,
+            Some(p) if self.core.partners().contains_key(&p) => {
+                if self.rules.run_over() || self.core.run_over_here() {
+                    PartnerAtReturn::RunOver
+                } else if self.rules.peer_down(p) {
+                    PartnerAtReturn::Down
+                } else {
+                    PartnerAtReturn::Up
+                }
+            }
+            _ => PartnerAtReturn::Gone,
+        };
+        log::info!("{}", return_text(own, partner));
+        self.return_note = None;
+    }
+
+    /// The partner left this co-op run for the menu (its `RunLeft`): the run
+    /// is over here too. The rules drop the partner, and on the host the world
+    /// lets it go ([`world::Loss::Left`]).
     fn partner_left_run(&mut self, peer: PeerId, now: Instant) {
         if !self.core.left_run(peer) {
             return;
         }
         self.rules.peer_left(peer, false, now);
-        if peer.is_host() {
-            // The joining game: its run is over, the world is not handed over.
-            return;
-        }
-        self.world_loss = Some(world::Loss::Left);
-        if let Some(p) = self.core.partners().get(&peer) {
-            let name = ui::text::display_name(&p.name, &self.lang, ui::text::FALLBACK_PARTNER);
-            // No name in the log.
-            log::info!("co-op: {peer} left the run for the menu; playing on alone");
-            self.run_events.push(LinkEvent::Left { name });
+        if !peer.is_host() {
+            self.world_loss = Some(world::Loss::Left);
         }
     }
 
     /// Host: `SessionSettings` to a partner that just linked.
     fn send_session_settings(&self, peer: PeerId) {
         let (h, d) = (self.settings.health_mult, self.settings.damage_mult);
-        let plays_on = self.settings.host_plays_on;
-        let wait = self.settings.rules.upgrade_wait;
+        // `plays_on` is the fixed `wait::HOST_PLAYS_ON`.
+        let plays_on = wait::HOST_PLAYS_ON;
         let respawn = self.settings.rules.respawn;
         let msg = ndml_net::Message::SessionSettings {
             health_mult: h as f32,
             damage_mult: d as f32,
             plays_on_s: plays_on.as_secs_f32(),
-            upgrade_wait_s: scaling::wire_secs(wait),
             respawn_s: respawn.as_secs_f32(),
         };
         net::apply(&self.net, vec![net::Out::Send(peer, msg)]);
         log::info!(
-            "co-op: sent {peer} this host's enemy health x{h}, damage x{d}, plays on alone {plays_on:?} after a loss, upgrade wait {wait:?}, respawn {respawn:?}"
+            "co-op: sent {peer} this host's enemy health x{h}, damage x{d}, plays on alone {plays_on:?} after a loss, respawn {respawn:?}"
         );
     }
 
@@ -355,9 +496,106 @@ impl Coop {
         self.loadout_screen.note = None;
     }
 
+    /// A link that was up went while this player is outside a run's play: the
+    /// notice that says so. Nothing when this player dropped it.
+    fn note_link_lost(
+        &mut self,
+        reason: ndml_net::endpoint::DisconnectReason,
+        name: Option<String>,
+        now: Instant,
+    ) {
+        let Some(raw) = name else { return };
+        if self.core.coop_run() && self.end_shown.is_none() {
+            return;
+        }
+        let partner = ui::text::display_name(&raw, &self.lang, ui::text::FALLBACK_PARTNER);
+        if let Some(line) = ui::run::lost_link_line(reason, &partner) {
+            log::info!("co-op: the link went outside a run's play ({reason}): the player is told");
+            self.link_notice = Some(ui::run::LinkNotice::new(line, now));
+        }
+    }
+
+    /// The link changed: neither player is ready, no notice.
+    fn ready_gone(&mut self) {
+        self.loadout.link_changed();
+        self.ready_notice.clear();
+        self.ready_sent = None;
+    }
+
+    /// This player's Ready out to the partner whenever it changed, on the
+    /// reliable channel.
+    fn sync_ready(&mut self) {
+        if !self.core.linked() {
+            self.ready_sent = None;
+            return;
+        }
+        let ready = self.loadout.ready();
+        // A partner that has heard nothing in this link takes "not ready".
+        let heard = *self.ready_sent.get_or_insert(false);
+        if heard == ready {
+            return;
+        }
+        self.ready_sent = Some(ready);
+        log::info!(
+            "co-op: told the partner this player is {}",
+            if ready { "ready" } else { "not ready" }
+        );
+        net::apply(
+            &self.net,
+            vec![net::Out::Broadcast(ndml_net::Message::Ready { ready })],
+        );
+    }
+
+    /// The start count's messages (`loadout::StartCount`) in order, on the
+    /// reliable channel.
+    pub(crate) fn send_start_count(&mut self) {
+        let outs = self.loadout.take_start_outs();
+        if outs.is_empty() || !self.core.linked() {
+            return;
+        }
+        let outs = outs
+            .into_iter()
+            .map(|(round, step)| net::Out::Broadcast(ndml_net::Message::StartCount { round, step }))
+            .collect();
+        net::apply(&self.net, outs);
+    }
+
+    /// The partner's `Ready`: its state, and on a new Ready the notice and
+    /// its cue.
+    fn on_partner_ready(&mut self, ready: bool) {
+        let was = self.loadout.partner_ready();
+        let news = self.loadout.partner(ready);
+        if was != self.loadout.partner_ready() {
+            log::info!(
+                "co-op: the partner is {}",
+                if ready {
+                    "ready on the new game screen"
+                } else {
+                    "not ready any more"
+                }
+            );
+        }
+        if news {
+            let name = loadout_glue::partner_shown(self);
+            self.ready_notice.start(loadout::partner_ready_alert(&name));
+        } else if !ready {
+            self.ready_notice.clear();
+        }
+    }
+
     /// A session message this layer takes itself (`SessionSettings`,
-    /// `RunRules`).
-    fn on_session_message(&mut self, from: PeerId, msg: &ndml_net::Message) -> bool {
+    /// `RunRules`, `Ready`, `StartCount`).
+    fn on_session_message(&mut self, from: PeerId, msg: &ndml_net::Message, now: Instant) -> bool {
+        if let ndml_net::Message::Ready { ready } = *msg {
+            self.on_partner_ready(ready);
+            return true;
+        }
+        if let ndml_net::Message::StartCount { round, step } = *msg {
+            let host = self.core.is_host();
+            self.loadout
+                .start_msg(host, from.is_host(), round, step, now);
+            return true;
+        }
         if let ndml_net::Message::RunRules {
             start,
             mods,
@@ -374,14 +612,13 @@ impl Coop {
             health_mult,
             damage_mult,
             plays_on_s,
-            upgrade_wait_s,
             respawn_s,
         } = *msg
         else {
             return false;
         };
         self.on_session_settings(from, (health_mult, damage_mult));
-        self.on_session_waits(from, plays_on_s, upgrade_wait_s);
+        self.on_session_plays_on(from, plays_on_s);
         self.on_session_respawn(from, respawn_s);
         true
     }
@@ -417,32 +654,21 @@ impl Coop {
         }
     }
 
-    /// A joining game: the host's plays-on time (for the log) and upgrade
-    /// wait (replaces its file's).
-    fn on_session_waits(&mut self, from: PeerId, plays_on_s: f32, upgrade_wait_s: f32) {
+    /// A joining game: the host's plays-on time from its `SessionSettings`,
+    /// logged only.
+    fn on_session_plays_on(&self, from: PeerId, plays_on_s: f32) {
         if !from.is_host() || self.core.is_host() {
             return;
         }
-        let own_w = self.settings.rules.upgrade_wait;
         let p = (plays_on_s.is_finite() && plays_on_s >= 0.0)
             .then(|| Duration::from_secs_f32(plays_on_s.min(600.0)));
-        let w = scaling::host_wait(upgrade_wait_s, 10.0).unwrap_or(own_w);
-        self.host_waits = Some((p, w));
-        self.rules.set_upgrade_wait(w);
-        log::info!(
-            "co-op: the host plays on alone {p:?} after a loss; its upgrade wait {w:?} applies (this game's file: {own_w:?})"
-        );
+        log::info!("co-op: the host plays on alone {p:?} after a loss");
     }
 
-    /// At a menu frame without a link: the host's waits are forgotten.
+    /// At a menu frame without a link: the host's respawn time and multipliers are forgotten.
     fn forget_host_session(&mut self) {
         if self.core.linked() {
             return;
-        }
-        if self.host_waits.take().is_some() {
-            self.rules
-                .set_upgrade_wait(self.settings.rules.upgrade_wait);
-            log::info!("co-op: no host now; this game's own upgrade wait again");
         }
         if self.host_respawn.take().is_some() {
             self.rules.set_respawn(self.settings.rules.respawn);
@@ -487,6 +713,7 @@ impl Shared {
     fn update_flags(&self, c: &Coop) {
         let (scaling, protect) = c.core.switches();
         self.flags.set(scaling, protect);
+        self.flags.set_start_held(c.core.start_held());
         self.flags.set_linked(c.core.linked());
         let (health, damage) = c.mults();
         self.flags.set_mults(health, damage);
@@ -552,17 +779,14 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
     let shared = Arc::new(Shared {
         flags: Flags::new(settings.health_mult, settings.damage_mult),
         coop: Mutex::new(Coop {
-            core: {
-                let mut core = Core::new(config::EXTRAPOLATION);
-                core.set_plays_on(settings.host_plays_on);
-                core
-            },
+            core: Core::new(config::EXTRAPOLATION),
             page: {
                 let mut page = Page::new(
                     &settings.name,
                     world::color::page_choices(&cfg.color),
                     labels,
                 );
+                page.set_wild(settings.wild_mods);
                 page.lan.name_auto = settings.name_alt.is_some();
                 page
             },
@@ -576,8 +800,15 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
             run_msgs: RunMessages::default(),
             silence: SilenceWatch::default(),
             silent_for: None,
+            link_log: link_log::LinkLog::default(),
+            slow_log: slow_log::SlowLog::default(),
+            drawn_at: None,
             over_quit: false,
             run_ui: RunUi::default(),
+            run_ready: RunUi::default(),
+            end_place: None,
+            link_notice: None,
+            return_note: None,
             end_shown: None,
             run_events: Vec::new(),
             last_partner: String::new(),
@@ -590,11 +821,12 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
             world_loss: None,
             rules: rules::Rules::new(settings.rules.clone()),
             host_mults: None,
-            host_waits: None,
             host_respawn: None,
             loadout: loadout::Joiner::default(),
             loadout_screen: loadout_glue::Screen::default(),
             host_sent: loadout::HostSent::default(),
+            ready_sent: None,
+            ready_notice: ui::run::ReadyNotice::default(),
             settings,
             net,
         }),
@@ -621,14 +853,6 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
             .dmg
             .set_player_side(damage::glue::PlayerSide(Box::new(move |call, inst| {
                 m.is_player_side(call, inst)
-            })));
-        // A weak link: the world owns the damage hooks.
-        let w = Arc::downgrade(&shared.world);
-        shared
-            .world
-            .dmg
-            .set_kill_credit(damage::glue::KillCredit(Box::new(move |key| {
-                w.upgrade().and_then(|w| w.kill_credit(key))
             })));
         let m = Arc::clone(&shared.mirror);
         shared
@@ -697,6 +921,8 @@ fn register(ctx: &ModContext, shared: &Arc<Shared>) {
     hook_or_warn(
         world::names::CONTROLLER_END_STEP,
         ctx.hook_before(world::names::CONTROLLER_END_STEP, move |call| {
+            // What a downed ship made in this frame's Steps, before the draw.
+            c.rules.downed.settle(call);
             if let Some(moved) = c.world.ending_end_step(call) {
                 c.mirror.move_shifted(call, moved);
             }
@@ -729,7 +955,8 @@ fn register(ctx: &ModContext, shared: &Arc<Shared>) {
         hook_or_warn(
             name,
             ctx.hook_before(name, move |call| {
-                // A co-op run, or the host's run settings held.
+                // A co-op run, a Start taken while linked (to its run's first
+                // tick), or the host's run settings held.
                 if c.flags.resume_writes_off() {
                     call.skip_original();
                     info_once(
@@ -746,17 +973,20 @@ fn register(ctx: &ModContext, shared: &Arc<Shared>) {
         names::ENEMY_INIT,
         ctx.hook_after(names::ENEMY_INIT, move |call| enemy_init(call, &c)),
     );
+    register_damage_scaling(ctx, shared);
+}
+
+/// `enemyDamageScaling`: the session's damage multiplier on its result.
+fn register_damage_scaling(ctx: &ModContext, shared: &Arc<Shared>) {
     let c = Arc::clone(shared);
     hook_or_warn(
         names::ENEMY_DAMAGE_SCALING,
         ctx.hook_after(names::ENEMY_DAMAGE_SCALING, move |call| {
-            let Some(mult) = c.flags.damage_mult() else {
-                return;
-            };
             let Some(dmg) = call.result().and_then(|v| v.as_f64()) else {
                 return;
             };
-            if let Some(out) = scaled(dmg, mult) {
+            let out = c.flags.damage_mult().and_then(|mult| {
+                let out = scaled(dmg, mult)?;
                 match call.set_return(out) {
                     Ok(()) => info_once(
                         "damage-scaled",
@@ -764,7 +994,9 @@ fn register(ctx: &ModContext, shared: &Arc<Shared>) {
                     ),
                     Err(e) => warn_once("damage-scaling", &format!("co-op: damage scaling: {e}")),
                 }
-            }
+                Some(out)
+            });
+            let _ = out;
         }),
     );
 }
@@ -838,6 +1070,13 @@ fn register_menu(ctx: &ModContext, shared: &Arc<Shared>) {
 /// The menu tick. It never skips `oMenu_Step_0` (it runs `steam_update()`).
 fn menu_step(call: &mut Call<'_>, s: &Shared) {
     let now = Instant::now();
+    // The partner's new Ready, or a cue's next notes (`ui::cues`).
+    let cue = s.lock().ready_notice.take_cue();
+    if cue {
+        ui::glue::play_cue(call, s, ui::cues::Cue::PartnerReady, now);
+    } else {
+        ui::glue::cue_tick(call, s, now);
+    }
     {
         let mut c = s.lock();
         c.pump(now);
@@ -884,12 +1123,23 @@ fn read_view(call: &Call<'_>, h: &Handles) -> Option<View> {
     (view.w > 1.0 && view.h > 1.0).then_some(view)
 }
 
+/// The process's CPU time and this thread's, for the slow-frames line.
+/// `None` where the system refuses.
+fn cpu_times() -> Option<(Duration, Duration)> {
+    let p = cpu_time::ProcessTime::try_now().ok()?;
+    let t = cpu_time::ThreadTime::try_now().ok()?;
+    Some((p.as_duration(), t.as_duration()))
+}
+
+#[allow(clippy::too_many_lines)] // the run step's parts in their order
 fn run_step(call: &mut Call<'_>, s: &Shared) {
     // A Wild Metamorphosis value put aside (`wild`), before anything reads it.
     wild_glue::restore_pending(call, s);
     let now = Instant::now();
     let Some(me) = call.instance() else { return };
     let paused = num(&me, s.h.pause).is_some_and(|p| p != 0.0);
+    // Before the session's lock (the world's is never taken inside it).
+    let frozen = s.world.was_frozen();
     let frame = RunFrame {
         key: me.key(),
         stamp: num(&me, s.h.time_game_start),
@@ -901,30 +1151,46 @@ fn run_step(call: &mut Call<'_>, s: &Shared) {
         silent_for: None,
         woke: None,
         upgrade_screen: false,
+        rules_hold: false,
     };
     let run = (frame.key, frame.stamp);
-    let (action, input) = {
+    // The Steam connector's counts, before this lock (the connector has its own).
+    let steam_counts = s.steam.as_ref().and_then(|st| st.link_counts());
+    let (action, input, slow) = {
         let mut c = s.lock();
         c.pump(now);
         let now_ms = ndml_net::time::to_wire_ms(c.net.local_time(now));
         // The partner's silence, every frame (paused too: keepalives flow).
         let linked = c.core.linked();
-        let received = c
+        let stats = c
             .core
             .partners()
             .keys()
             .next()
             .and_then(|&p| c.net.peer_info(p))
             .filter(|i| linked && i.connected)
-            .map(|i| i.stats.packets_recv);
-        let silent_for = c.silence.update(received, now);
+            .map(|i| i.stats);
+        let silent_for = c.silence.update(stats.map(|s| s.packets_recv), now);
         c.silent_for = silent_for;
         let mut frame = frame.clone();
         frame.silent_for = silent_for;
         frame.woke = c.silence.woke();
         frame.upgrade_screen = c.rules.upgrade_choosing();
+        frame.rules_hold = c.rules.holds_game();
         let (outs, action) = c.core.run_frame(&frame, now, now_ms);
         net::apply(&c.net, outs);
+        c.link_frame(now, stats.as_ref(), steam_counts, silent_for);
+        // Running play: a run on screen, not paused, not held or frozen.
+        let running = frame.gameplay
+            && !frame.paused
+            && !frame.game_over
+            && !frozen
+            && !frame.rules_hold
+            && !frame.upgrade_screen
+            && !c.core.waiting();
+        let slow = c.slow_frame(now, running, stats.as_ref(), steam_counts, || {
+            s.world.host_snapshots()
+        });
         c.wait_events(now);
         s.update_flags(&c);
         // The session rules must not take the gate's pauses for a player's.
@@ -933,8 +1199,24 @@ fn run_step(call: &mut Call<'_>, s: &Shared) {
             FreezeAction::Unpause => c.rules.note_own(false),
             FreezeAction::None => {}
         }
-        (action, world_input(&mut c, run, now, now_ms))
+        // The honour rule's window (its own lock, never taken with this one).
+        s.world.dmg.set_rtts(&c.partner_rtts());
+        (action, world_input(&mut c, run, now, now_ms), slow)
     };
+    if let Some((due, role)) = slow {
+        // Read now, outside the session's lock.
+        let (wave, enemies, enemy_shots) = s.world.slow_scene(call);
+        let (own, partner_mirrored) = s.mirror.slow_counts();
+        let scene = slow_log::Scene {
+            role,
+            wave,
+            enemies,
+            enemy_shots,
+            partner_mirrored,
+            own,
+        };
+        log::info!("{}", due.line(&scene));
+    }
     hold(call, s, action);
     over_step(call, s, paused, now);
     rules::glue::run_tick(
@@ -948,6 +1230,7 @@ fn run_step(call: &mut Call<'_>, s: &Shared) {
         },
         now,
     );
+    rules::glue::start_ask_step(call, s, paused);
     let msgs = s.world.run_step(call, input);
     if !msgs.is_empty() {
         let c = s.lock();
@@ -1077,8 +1360,9 @@ fn hold(call: &Call<'_>, s: &Shared, action: FreezeAction) {
     }
 }
 
-/// The joining game's co-op run is over: after [`state::OVER_HOLD`] paused,
-/// it leaves for the menu as Leave Co-op Run does (`pressQuit`).
+/// The co-op run is over (the partner left it, either role): after
+/// [`state::OVER_HOLD`] paused, the game leaves for the menu as Leave Co-op
+/// Run does (`pressQuit`).
 fn over_step(call: &Call<'_>, s: &Shared, paused: bool, now: Instant) {
     let go = {
         let mut c = s.lock();
@@ -1099,7 +1383,7 @@ fn over_step(call: &Call<'_>, s: &Shared, paused: bool, now: Instant) {
         warn_once("over-quit", "co-op: unable to find pressQuit");
         return;
     };
-    log::info!("co-op: host gone; run over");
+    log::info!("co-op: the partner left; the run is over, leaving for the menu");
     if let Err(e) = rules::glue::own_call(s, || call.call_script(script, &[])) {
         warn_once(
             "over-quit-call",
@@ -1113,7 +1397,8 @@ fn over_step(call: &Call<'_>, s: &Shared, paused: bool, now: Instant) {
 fn run_draw(call: &mut Call<'_>, s: &Shared, saved: ui::glue::Swapped) {
     let now = Instant::now();
     let active = {
-        let c = s.lock();
+        let mut c = s.lock();
+        c.drawn_at = Some(now);
         c.core.linked() || c.core.coop_run()
     };
     if !active {
@@ -1133,6 +1418,9 @@ fn run_draw(call: &mut Call<'_>, s: &Shared, saved: ui::glue::Swapped) {
         );
     }
     let end = run_end_shown(call, s);
+    // Which post-run screen the partner's Ready is drawn on, while it shows.
+    let end_place = (end == Some(END_GAME_OVER) && !s.lock().run_ready.bars.is_empty())
+        .then(|| ui::glue::end_place(call, s));
     let items = {
         let mut guard = s.lock();
         let c = &mut *guard;
@@ -1164,9 +1452,29 @@ fn run_draw(call: &mut Call<'_>, s: &Shared, saved: ui::glue::Swapped) {
             }
             c.end_shown = end;
         }
+        let ready = std::mem::take(&mut c.run_ready);
         if end.is_some() {
-            // The run messages chosen in the `before` are not drawn.
-            c.run_ui = RunUi::default();
+            // Only the partner's Ready is drawn on the death and end screen.
+            c.run_ui = if end == Some(END_GAME_OVER) {
+                ready.clone()
+            } else {
+                RunUi::default()
+            };
+        }
+        c.end_place = end_place;
+        // The partner's Ready only (a lost link's notice there says its own).
+        if !ready.bars.is_empty()
+            && (end.is_none() || end == Some(END_GAME_OVER))
+            && c.core.linked()
+            && c.loadout.partner_ready()
+        {
+            let place = if end.is_some() {
+                end_place.unwrap_or(ui::run::ReadyPlace::EndScreen)
+            } else {
+                ui::run::ReadyPlace::Run
+            };
+            let text = ready.bars[0].text.clone();
+            ui::glue::ready_shown(c, place, &text);
         }
         items
     };
@@ -1188,10 +1496,13 @@ fn run_end_shown(call: &Call<'_>, s: &Shared) -> Option<&'static str> {
     )
 }
 
+/// [`run_end_reason`] for the death and end screen.
+const END_GAME_OVER: &str = "game over";
+
 /// [`run_end_shown`]'s rule.
 fn run_end_reason(game_ending: bool, hide_gui: bool, game_over: bool) -> Option<&'static str> {
     if game_over {
-        Some("game over")
+        Some(END_GAME_OVER)
     } else if game_ending {
         Some("the ending")
     } else if hide_gui {
@@ -1205,7 +1516,7 @@ fn player_step(call: &mut Call<'_>, s: &Shared) {
     let now = Instant::now();
     let Some(me) = call.instance() else { return };
     // Downed or reviving: written before the ship is read and sent.
-    rules::glue::player_step(&me, s);
+    rules::glue::player_step(call, &me, s);
     let read = |n: &str| me.builtin_f64(n);
     let (Some(x), Some(y)) = (read(bv::X), read(bv::Y)) else {
         warn_once("ship-xy", "co-op: unable to read the ship's position");
@@ -1400,10 +1711,81 @@ fn enemy_init(call: &mut Call<'_>, s: &Shared) {
     }
 }
 
+/// How long after a link wait ends the return's state line is written. The
+/// partner's reliable `Downed`, `GameOver` and `RunLeft` have arrived by then.
+const RETURN_LINE_AFTER: Duration = Duration::from_secs(2);
+
+/// A game's state after a link wait ended: its partner's as learned, or
+/// its own ship (`own_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartnerAtReturn {
+    /// In the run, its ship up.
+    Up,
+    /// In the run, its ship down.
+    Down,
+    /// The run is over (a game over, told or seen here).
+    RunOver,
+    /// It left the run for the menu (`RunLeft`).
+    LeftRun,
+    /// Not linked any more.
+    Gone,
+}
+
+/// This game's state at a link wait's end, in words: frozen or not, and
+/// its ship or the run's end (`at`: `Up`, `Down` or `RunOver`).
+fn own_state(host: bool, frozen: bool, at: PartnerAtReturn) -> String {
+    let mut s = String::from(match (frozen, host) {
+        (true, _) => "frozen in the link wait",
+        (false, true) => "playing on",
+        (false, false) => "not frozen",
+    });
+    s.push_str(match at {
+        PartnerAtReturn::RunOver => ", the run over",
+        PartnerAtReturn::Down => ", in the run, its ship down",
+        _ => ", in the run, its ship up",
+    });
+    s
+}
+
+/// The return's state line: no names or ids.
+fn return_text(own: &str, partner: PartnerAtReturn) -> String {
+    let p = match partner {
+        PartnerAtReturn::Up => "in the run, its ship up",
+        PartnerAtReturn::Down => "in the run, its ship down",
+        PartnerAtReturn::RunOver => "the run over",
+        PartnerAtReturn::LeftRun => "left the run for the menu",
+        PartnerAtReturn::Gone => "not linked",
+    };
+    format!("co-op link: at the return this game was {own}; the partner since: {p}")
+}
+
 ndml_sdk::export_mod!(init, defaults = include_str!("../config.toml"));
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_returns_state_line_says_both_states() {
+        use super::{PartnerAtReturn as P, own_state, return_text};
+        assert_eq!(
+            return_text(&own_state(false, true, P::Up), P::Up),
+            "co-op link: at the return this game was frozen in the link wait, in the run, its ship up; the partner since: in the run, its ship up"
+        );
+        assert_eq!(
+            return_text(&own_state(true, false, P::Down), P::LeftRun),
+            "co-op link: at the return this game was playing on, in the run, its ship down; the partner since: left the run for the menu"
+        );
+        assert!(
+            return_text(&own_state(true, false, P::RunOver), P::Down).contains(
+                "was playing on, the run over; the partner since: in the run, its ship down"
+            )
+        );
+        assert!(
+            return_text(&own_state(false, false, P::Up), P::Gone)
+                .ends_with("not frozen, in the run, its ship up; the partner since: not linked")
+        );
+        assert!(return_text("x", P::RunOver).ends_with("the partner since: the run over"));
+    }
+
     #[test]
     fn the_run_end_hides_co_op_drawing() {
         use super::run_end_reason as r;

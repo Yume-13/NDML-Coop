@@ -23,16 +23,22 @@
 //! The session rules' hooks and game calls. Pause and upgrade calls run from
 //! the run tick (as `oController`); the downed state is held on `oPowers`
 //! and `oPlayer`. The mod's own pause calls are flagged so its hooks let
-//! them through; hot-path hooks return after one atomic load when off.
+//! them through; hot-path hooks (`checkDestroyPlayer`, `pressPause`,
+//! `oPowers`' Begin Step and Step) return after one atomic load when off.
+//!
+//! On the held card (`Rules::frozen_unseen`) `oController.pause` reads 1
+//! only around `oPowers_Step_1` and `oPowers_Step_0`, which freezes `oPowers`
+//! without running or drawing the pause menu.
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ndml_sdk::{Builtin, Call, Error, Instance, ModContext, Script, Value, Variable};
 
+use super::banish::{RunLatch, SESSION_BANISHED};
 use super::machine::{
     Action, Death, Observed, PauseCall, PlayerAct, PowersAct, RunCtx, UnpauseCall,
 };
@@ -41,6 +47,7 @@ use super::xp::XpRead;
 use crate::game::{self, call_b, info_once, num, truthy, warn_once};
 use crate::gate::GatePhase;
 use crate::names::{self, rules_fn, rules_obj, rules_var as rv};
+use crate::ui::run::{CountKind, SessionEvent};
 use crate::{Shared, net};
 
 /// Everything the rules resolve at init, plus the hot-path flags.
@@ -50,6 +57,9 @@ pub struct RulesHooks {
     own: AtomicBool,
     /// The rules are on for this run.
     active: AtomicBool,
+    /// The world is held frozen where the game cannot tell (the card after
+    /// choosing): `oPowers`' steps see `oController.pause = 1`.
+    frozen_unseen: AtomicBool,
     xp: Option<Variable>,
     max_exp: Option<Variable>,
     base_level: Option<Variable>,
@@ -62,6 +72,7 @@ pub struct RulesHooks {
     iframes: Option<Variable>,
     control: Option<Variable>,
     can_fire: Option<Variable>,
+    attraction: Option<Variable>,
     shield_max: Option<Variable>,
     hull_reserved: Option<Variable>,
     last_stand: Option<Variable>,
@@ -70,15 +81,47 @@ pub struct RulesHooks {
     leave_upgrade: Option<Script>,
     refresh_loadout: Option<Script>,
     update_score: Option<Script>,
+    release_shoot: Option<Script>,
+    banish_mod: Option<Script>,
+    /// `oPowers.banishMods` and `ds_list_find_index`: the banish read back.
+    banish_list: Option<Variable>,
+    list_find: Option<Builtin>,
+    /// The session's banished upgrades applied for this run ([`banish`]).
+    banished: Mutex<RunLatch<(usize, Option<f64>)>>,
     window_has_focus: Option<Builtin>,
     asset_get_index: Option<Builtin>,
     kb_pressed: Option<Builtin>,
+    /// The respawn's fly-in: `event_perform` and the kaleidoscope setting it
+    /// holds off for the call ([`fly_in`]).
+    event_perform: Option<Builtin>,
+    no_kaleidoscope: Option<Variable>,
+    /// The respawn's protected frames, watched from the fly-in's start
+    /// (`protect`).
+    respawn_watch: Mutex<Option<super::protect::Watch>>,
     /// `oPowers` looked up yet, and what was found.
     powers: Mutex<(bool, Option<Value>)>,
+    /// `oController`, the same way.
+    controller: Mutex<(bool, Option<Value>)>,
     /// What a down does to what follows the ship (`downed`).
     pub(crate) downed: super::downed::Downed,
     /// What follows the ship is gone (this game's ship is down; `downed`).
     followers_hidden: AtomicBool,
+    firing: Option<Variable>,
+    ataraxia: Option<Variable>,
+    alpha: Option<Variable>,
+    alpha_max: Option<Variable>,
+    /// Steps left of a fade-in ([`FADE_STEPS`]; 0: none).
+    fade: AtomicU32,
+    /// The upgrade screen's pieces ([`names::UPGRADE_PIECES`]), looked up
+    /// once.
+    pieces: Mutex<Option<Vec<Value>>>,
+}
+
+/// Milliseconds since the Unix epoch (for the count's log lines).
+pub(crate) fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl RulesHooks {
@@ -91,6 +134,7 @@ impl RulesHooks {
         Self {
             own: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            frozen_unseen: AtomicBool::new(false),
             xp: v(rv::XP),
             max_exp: v(rv::MAX_EXP),
             base_level: v(rv::BASE_LEVEL),
@@ -107,6 +151,7 @@ impl RulesHooks {
             iframes: v(rv::IFRAMES),
             control: v(rv::PLAYER_CONTROL),
             can_fire: v(rv::CAN_FIRE),
+            attraction: v(rv::POWERUP_ATTRACTION),
             shield_max: v(rv::SHIELD_MAX),
             hull_reserved: v(rv::HULL_RESERVED),
             last_stand: v(rv::LAST_STAND),
@@ -115,12 +160,27 @@ impl RulesHooks {
             leave_upgrade: sc(names::LEAVE_UPGRADE),
             refresh_loadout: sc(names::REFRESH_LOADOUT),
             update_score: sc(names::UPDATE_SCORE),
+            release_shoot: sc(names::RELEASE_SHOOT),
+            banish_mod: sc(names::BANISH_MOD),
+            banish_list: v(rv::BANISH_MODS),
+            list_find: b(rules_fn::DS_LIST_FIND_INDEX),
+            banished: Mutex::new(RunLatch::default()),
             window_has_focus: b(rules_fn::WINDOW_HAS_FOCUS),
             asset_get_index: b(rules_fn::ASSET_GET_INDEX),
             kb_pressed: b(rules_fn::KEYBOARD_CHECK_PRESSED),
+            event_perform: b(rules_fn::EVENT_PERFORM),
+            no_kaleidoscope: v(rv::DISABLE_KALEIDOSCOPE),
             powers: Mutex::new((false, None)),
+            controller: Mutex::new((false, None)),
             downed: super::downed::Downed::resolve(ctx),
             followers_hidden: AtomicBool::new(false),
+            respawn_watch: Mutex::new(None),
+            firing: v(rv::FIRING),
+            ataraxia: v(rv::ATARAXIA),
+            alpha: v(rv::ALPHA),
+            alpha_max: v(rv::ALPHA_MAX),
+            fade: AtomicU32::new(0),
+            pieces: Mutex::new(None),
         }
     }
 
@@ -128,7 +188,13 @@ impl RulesHooks {
     /// run is over.
     pub fn deactivate(&self) {
         self.active.store(false, Ordering::Relaxed);
+        self.frozen_unseen.store(false, Ordering::Relaxed);
+        self.fade.store(0, Ordering::Relaxed);
         self.downed.end_run();
+        self.banished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reset();
     }
 
     fn own(&self) -> bool {
@@ -141,23 +207,56 @@ impl RulesHooks {
 
     /// `oPowers` as an object ref (`asset_get_index`, cached).
     fn powers_obj(&self, call: &Call<'_>) -> Option<Value> {
-        let mut cache = self.powers.lock().unwrap_or_else(PoisonError::into_inner);
+        self.object_ref(
+            call,
+            &self.powers,
+            rules_obj::POWERS,
+            "co-op rules: oPowers not found; the downed state is off",
+        )
+    }
+
+    /// `oController` as an object ref (cached).
+    fn controller_obj(&self, call: &Call<'_>) -> Option<Value> {
+        self.object_ref(
+            call,
+            &self.controller,
+            rules_obj::CONTROLLER,
+            "co-op rules: oController not found; the held card does not freeze oPowers",
+        )
+    }
+
+    fn object_ref(
+        &self,
+        call: &Call<'_>,
+        slot: &Mutex<(bool, Option<Value>)>,
+        name: &'static str,
+        missing: &str,
+    ) -> Option<Value> {
+        let mut cache = slot.lock().unwrap_or_else(PoisonError::into_inner);
         if cache.0 {
             return cache.1.clone();
         }
-        let found =
-            call_b(call, self.asset_get_index, &[rules_obj::POWERS.into()]).filter(|v| match v {
-                Value::Ref(_) => true,
-                other => other.as_f64().is_some_and(|x| x >= 0.0),
-            });
+        let found = call_b(call, self.asset_get_index, &[name.into()]).filter(|v| match v {
+            Value::Ref(_) => true,
+            other => other.as_f64().is_some_and(|x| x >= 0.0),
+        });
         if found.is_none() {
-            warn_once(
-                "rules-powers",
-                "co-op rules: oPowers not found; the downed state is off",
-            );
+            warn_once(name, missing);
         }
         *cache = (true, found.clone());
         found
+    }
+
+    /// The rules' "held where the game cannot tell", for the `oPowers`
+    /// steps (logged as it starts).
+    fn set_frozen_unseen(&self, on: bool) {
+        if !on {
+            self.frozen_unseen.store(false, Ordering::Relaxed);
+        } else if !self.frozen_unseen.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "co-op rules: held on the card: oPowers' steps see the game's pause (its timers stand)"
+            );
+        }
     }
 }
 
@@ -189,35 +288,36 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
             unpause_before(call, &c);
         }),
     );
-    let c = Arc::clone(shared);
+    let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
+    hook_or_warn(
+        names::GOTO_UPGRADE,
+        ctx.hook(
+            names::GOTO_UPGRADE,
+            move |call| {
+                note_start_ask(&c1);
+                lift_before(call, &c1, "gotoUpgrade")
+            },
+            move |call, lifted| lift_after(call, &c2, lifted),
+        ),
+    );
+    let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
     hook_or_warn(
         names::GOTO_UPGRADE_DEFERRED,
-        ctx.hook_after(names::GOTO_UPGRADE_DEFERRED, move |_| {
-            if c.rules.active() {
-                let mut g = c.lock();
-                g.rules.upgrade_opened();
-                let outs = g.rules.take_outs();
-                net::apply(&g.net, outs);
-            }
-        }),
+        ctx.hook(
+            names::GOTO_UPGRADE_DEFERRED,
+            move |call| lift_before(call, &c1, "gotoUpgradeDeferred"),
+            move |call, lifted| {
+                lift_after(call, &c2, lifted);
+                upgrade_opened_after(call, &c2);
+            },
+        ),
     );
+    register_fade(ctx, shared);
     let c = Arc::clone(shared);
     hook_or_warn(
         names::LEAVE_UPGRADE_DEFERRED,
         ctx.hook_before(names::LEAVE_UPGRADE_DEFERRED, move |call| {
-            if !c.rules.active() {
-                return;
-            }
-            let hold = {
-                let mut g = c.lock();
-                let hold = g.rules.upgrade_leaving(Instant::now());
-                let outs = g.rules.take_outs();
-                net::apply(&g.net, outs);
-                hold
-            };
-            if hold {
-                call.skip_original();
-            }
+            leave_before(call, &c);
         }),
     );
     let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
@@ -255,6 +355,17 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
             ),
         );
     }
+    register_pull(ctx, shared);
+    register_salvage(ctx, shared);
+    // The ending's cutscene uses the ship: a downed ship's makes are not
+    // ended from here on.
+    let c = Arc::clone(shared);
+    hook_or_warn(
+        names::BEGIN_GAME_ENDING,
+        ctx.hook_before(names::BEGIN_GAME_ENDING, move |call| {
+            c.rules.downed.release(call, "the ending begins");
+        }),
+    );
     let c = Arc::clone(shared);
     hook_or_warn(
         names::CHECK_DESTROY_PLAYER,
@@ -262,6 +373,260 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
             death_before(call, &c);
         }),
     );
+}
+
+/// While this ship is down and hidden, a construct's death drops no armour
+/// fragment (`Downed::salvage_off`).
+fn register_salvage(ctx: &ModContext, shared: &Arc<Shared>) {
+    let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
+    hook_or_warn(
+        names::DESTROY_CONSTRUCT,
+        ctx.hook(
+            names::DESTROY_CONSTRUCT,
+            move |call| c1.rules.downed.salvage_off(call),
+            move |call, out| c2.rules.downed.salvage_back(call, &out),
+        ),
+    );
+}
+
+/// While this ship is down and hidden, no pickup is pulled to it.
+fn register_pull(ctx: &ModContext, shared: &Arc<Shared>) {
+    for name in [names::POWERUP_ATTRACT, names::POWERUP_ATTRACT_PERM] {
+        let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
+        hook_or_warn(
+            name,
+            ctx.hook(
+                name,
+                move |call| pull_off(call, &c1),
+                move |call, was| pull_back(call, &c2, was),
+            ),
+        );
+    }
+}
+
+/// Before a pickup's pull, while this ship is down and hidden: Magnetism
+/// (`oPowers.powerupAttraction`) reads 0, so the pickup takes the game's
+/// out-of-range branch. Returns the value to put back after the call.
+fn pull_off(call: &Call<'_>, c: &Shared) -> Option<f64> {
+    let h = &c.rules;
+    if !h.downed.hidden() {
+        return None;
+    }
+    let (Some(var), Some(powers)) = (h.attraction, h.powers_obj(call)) else {
+        return None;
+    };
+    let mut was = None;
+    let _ = call.with(&powers, |p, _| {
+        if let Some(a) = p.get_f64(var)
+            && p.set_f64(var, 0.0)
+        {
+            was = Some(a);
+        }
+    });
+    was
+}
+
+/// A number of `obj`'s first instance (for a log line).
+fn num_of(call: &Call<'_>, obj: &Value, v: Option<Variable>) -> Option<f64> {
+    let mut out = None;
+    let _ = call.with(obj, |p, _| {
+        if out.is_none() {
+            out = num(&p, v);
+        }
+    });
+    out
+}
+
+/// After a pickup's pull: the Magnetism value back as it was.
+fn pull_back(call: &Call<'_>, c: &Shared, was: Option<f64>) {
+    let (Some(a), Some(var)) = (was, c.rules.attraction) else {
+        return;
+    };
+    let Some(powers) = c.rules.powers_obj(call) else {
+        return;
+    };
+    let _ = call.with(&powers, |p, _| {
+        if !p.set_f64(var, a) {
+            warn_once(
+                "rules-pull-back",
+                "co-op rules: oPowers.powerupAttraction could not be put back after a pickup's pull",
+            );
+        }
+    });
+}
+
+/// Before `leaveUpgradeDeferred`: hold the card, the original skipped, while
+/// the partner chooses.
+fn leave_before(call: &mut Call<'_>, c: &Shared) {
+    if !c.rules.active() {
+        return;
+    }
+    let hold = {
+        let mut g = c.lock();
+        let hold = g.rules.upgrade_leaving(Instant::now());
+        let outs = g.rules.take_outs();
+        net::apply(&g.net, outs);
+        c.rules.set_frozen_unseen(g.rules.frozen_unseen());
+        hold
+    };
+    if hold {
+        call.skip_original();
+    }
+}
+
+/// After `gotoUpgradeDeferred`: a screen opened unless the result is false.
+/// A round the partner opened starts the fade-in.
+fn upgrade_opened_after(call: &Call<'_>, s: &Shared) {
+    if !s.rules.active() {
+        return;
+    }
+    if call.result().as_ref().and_then(as_flag) == Some(false) {
+        info_once(
+            "rules-goto-refused",
+            "co-op rules: gotoUpgradeDeferred opened no screen (the game's guards)",
+        );
+        return;
+    }
+    let forced = {
+        let mut g = s.lock();
+        let forced = g.rules.upgrade_opened();
+        let outs = g.rules.take_outs();
+        net::apply(&g.net, outs);
+        s.rules.set_frozen_unseen(g.rules.frozen_unseen());
+        forced
+    };
+    if forced {
+        s.rules.fade.store(FADE_STEPS, Ordering::Relaxed);
+        log::info!("co-op rules: the partner's round opened this screen: it fades in");
+    } else {
+        // The player's own screen (or a chained one): the game's own timing.
+        s.rules.fade.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Before `gotoUpgrade` and `gotoUpgradeDeferred`: `playerControl` is 1 for
+/// the call when `Rules::lifts_control` (the game's guards refuse at 0).
+/// Returns the value to put back, if it was lifted.
+fn lift_before(call: &Call<'_>, s: &Shared, what: &str) -> Option<f64> {
+    if !s.rules.active() || !s.lock().rules.lifts_control() {
+        return None;
+    }
+    let (powers, var) = (s.rules.powers_obj(call)?, s.rules.control?);
+    let mut old = None;
+    let mut firing = None;
+    let _ = call.with(&powers, |p, _| {
+        if old.is_none()
+            && let Some(back) = p.get_f64(var).and_then(control_to_restore)
+            && p.set_f64(var, 1.0)
+        {
+            old = Some(back);
+            firing = truthy(&p, s.rules.firing);
+        }
+    });
+    let old = old?;
+    log::info!(
+        "co-op rules: down: playerControl lifted for {what} (the partner's round; firing {firing:?})"
+    );
+    Some(old)
+}
+
+/// The `playerControl` value to put back after a lift. `None` when it was 1.
+fn control_to_restore(found: f64) -> Option<f64> {
+    ((found - 1.0).abs() > f64::EPSILON).then_some(found)
+}
+
+/// After those calls: control as it was found.
+fn lift_after(call: &Call<'_>, s: &Shared, saved: Option<f64>) {
+    let (Some(old), Some(powers)) = (saved, s.rules.powers_obj(call)) else {
+        return;
+    };
+    let _ = call.with(&powers, |p, _| set(&p, s.rules.control, old));
+}
+
+/// Steps a screen the partner opened takes to fade in (the game's own is
+/// 20). Picks, Esc, rerolls and banishes wait for them.
+pub const FADE_STEPS: u32 = 60;
+
+/// The held card's freeze of `oPowers` (`freeze_before`), the fade-in and
+/// its locks.
+fn register_fade(ctx: &ModContext, shared: &Arc<Shared>) {
+    for name in [names::POWERS_BEGIN_STEP, names::POWERS_STEP] {
+        let (c1, c2) = (Arc::clone(shared), Arc::clone(shared));
+        hook_or_warn(
+            name,
+            ctx.hook(
+                name,
+                move |call| freeze_before(call, &c1),
+                move |call, saved| freeze_after(call, &c2, saved),
+            ),
+        );
+    }
+    let c = Arc::clone(shared);
+    hook_or_warn(
+        names::UPGRADE_STEP,
+        ctx.hook_before(names::UPGRADE_STEP, move |call| fade_step(call, &c)),
+    );
+    for name in [
+        names::CONFIRM_UPGRADE,
+        names::DECLINE_UPGRADE,
+        names::REROLL_UPGRADE,
+        names::BANISH_UPGRADE,
+    ] {
+        let c = Arc::clone(shared);
+        hook_or_warn(
+            name,
+            ctx.hook_before(name, move |call| {
+                let left = c.rules.fade.load(Ordering::Relaxed);
+                if left > 0 {
+                    call.skip_original();
+                    log::info!("co-op rules: {name} waits for the fade-in ({left} steps left)");
+                }
+            }),
+        );
+    }
+}
+
+/// Before `oUpgrade_Step_0` (as `oUpgrade`) while a fade runs: the screen
+/// and its pieces no brighter than the fade's share so far. The game's step
+/// then adds 0.05 to `alpha`.
+fn fade_step(call: &Call<'_>, s: &Shared) {
+    let h = &s.rules;
+    let left = h.fade.load(Ordering::Relaxed);
+    if left == 0 {
+        return;
+    }
+    h.fade.store(left - 1, Ordering::Relaxed);
+    let share = f64::from(FADE_STEPS - left + 1) / f64::from(FADE_STEPS);
+    if let Some(me) = call.instance()
+        && num(&me, h.alpha).is_some_and(|a| a > share - 0.05)
+    {
+        set(&me, h.alpha, (share - 0.05).max(0.0));
+    }
+    let pieces = {
+        let mut cache = h.pieces.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .get_or_insert_with(|| {
+                names::UPGRADE_PIECES
+                    .iter()
+                    .filter_map(|n| {
+                        call_b(call, h.asset_get_index, &[(*n).into()])
+                            .filter(|v| v.as_f64().is_none_or(|x| x >= 0.0))
+                    })
+                    .collect()
+            })
+            .clone()
+    };
+    for p in &pieces {
+        let _ = call.with(p, |i, _| {
+            let cap = share * num(&i, h.alpha_max).unwrap_or(1.0);
+            if i.builtin_f64("image_alpha").is_some_and(|a| a > cap) {
+                let _ = i.set_builtin_f64("image_alpha", cap);
+            }
+        });
+    }
+    if left == 1 {
+        log::info!("co-op rules: the fade-in is over ({FADE_STEPS} steps)");
+    }
 }
 
 /// Register the shared score's hook (`updateScore`, skipped on the joining
@@ -387,6 +752,36 @@ pub(crate) fn end_screen_before(call: &Call<'_>, s: &Shared) {
     );
 }
 
+/// Before `oPowers_Step_1` and `oPowers_Step_0` (as `oPowers`): on the held
+/// card, `oController.pause = 1` for the event. Returns the value to put back.
+fn freeze_before(call: &Call<'_>, s: &Shared) -> Option<f64> {
+    if !s.rules.frozen_unseen.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (ctl, var) = (s.rules.controller_obj(call)?, s.h.pause?);
+    let mut old = None;
+    let _ = call.with(&ctl, |c, _| {
+        if old.is_none()
+            && let Some(p) = c.get_f64(var)
+            && (p - 1.0).abs() > f64::EPSILON
+            && c.set_f64(var, 1.0)
+        {
+            old = Some(p);
+        }
+    });
+    old
+}
+
+/// After those events: `oController.pause` as it was read.
+fn freeze_after(call: &Call<'_>, s: &Shared, saved: Option<f64>) {
+    let (Some(p), Some(ctl), Some(var)) = (saved, s.rules.controller_obj(call), s.h.pause) else {
+        return;
+    };
+    let _ = call.with(&ctl, |c, _| {
+        let _ = c.set_f64(var, p);
+    });
+}
+
 fn as_flag(v: &Value) -> Option<bool> {
     v.as_bool().or_else(|| v.as_f64().map(|x| x > 0.5))
 }
@@ -434,10 +829,13 @@ fn unpause_before(call: &mut Call<'_>, s: &Shared) {
                 c.core.gate_phase(),
                 GatePhase::Holding | GatePhase::Refused { .. }
             );
-        // The link wait holds the game like the gate (`wait`): the last row
-        // (Leave Co-op Run) is the way out, not Resume; a joining game
-        // whose run is over stands until it leaves.
+        // The link wait and a run that is over hold the game like the gate.
         let d = if c.core.wait_hold() || c.core.run_over().is_some() {
+            UnpauseCall::Block
+        } else if c.rules.counting() {
+            // Closing the pause screen while the resume count runs: "hold
+            // on", and the screen stays. The count resumes the game.
+            c.rules.count_hold_on(Instant::now());
             UnpauseCall::Block
         } else {
             c.rules.unpause_request(gate_holding, Instant::now())
@@ -499,15 +897,24 @@ fn death_before(call: &mut Call<'_>, s: &Shared) {
         net::apply(&g.net, outs);
         d
     };
+    if d != Death::Down {
+        // The game's own death runs now: what it makes with the ship as
+        // `self` is never ended as a downed ship's.
+        h.downed.release(call, "the game's own death runs");
+    }
     if d == Death::Down {
         call.skip_original();
+        if let Some(me) = call.instance() {
+            release_trigger(&me, s);
+        }
         // Hold the recipe from this very frame on.
         let _ = call.with(&powers, |p, _| hold_powers(&p, s));
         if let Some(me) = call.instance() {
             hold_player(&me, s);
         }
+        let magnetism = num_of(call, &powers, h.attraction);
         log::info!(
-            "co-op rules: ship down (hidden, invulnerable, no control; hull {hull:.1}, hullReserved {reserved})"
+            "co-op rules: ship down (hidden, invulnerable, no control; hull {hull:.1}, hullReserved {reserved}; Magnetism {magnetism:?}, read as 0 by the pickups' pull while down)"
         );
     }
 }
@@ -519,6 +926,25 @@ fn set(inst: &Instance<'_>, v: Option<Variable>, x: f64) {
         warn_once(
             "rules-set",
             "co-op rules: a ship variable is not a number; the downed state may show",
+        );
+    }
+}
+
+/// At the down, on `oPlayer`: let go of the trigger with `releaseShoot`, as
+/// the game does when it takes control away. A charged weapon releases its
+/// charge once.
+pub(super) fn release_trigger(me: &Instance<'_>, s: &Shared) {
+    let Some(script) = s.rules.release_shoot else {
+        warn_once(
+            "rules-release",
+            "co-op rules: releaseShoot not found; a charge held at a down goes on",
+        );
+        return;
+    };
+    if let Err(e) = me.call_script(script, &[Value::Undefined]) {
+        warn_once(
+            "rules-release-call",
+            &format!("co-op rules: releaseShoot at the down: {e}"),
         );
     }
 }
@@ -564,11 +990,15 @@ pub(crate) fn powers_step(call: &Call<'_>, me: &Instance<'_>, s: &Shared) {
             let shield_max = num(me, h.shield_max).unwrap_or(0.0);
             set(me, s.h.hull, hull_max);
             set(me, s.h.shield, shield_max);
-            set(me, h.invulnerable, 74.0);
+            // The respawn's protection (`protect`) from here, so the frame
+            // before the fly-in is covered too.
+            set(me, h.invulnerable, f64::from(super::protect::FRAMES));
             set(me, h.control, 1.0);
             set(me, s.h.cloaked, 0.0);
             set(me, h.can_fire, 1.0);
             let before_refresh = num(me, s.h.hull);
+            // The value the down left, read before the refresh recomputes it.
+            let magnetism = num(me, h.attraction);
             // checkDestroyPlayer's Last Stand revive calls it inside `with (oPowers)`.
             if let Some(refresh) = h.refresh_loadout
                 && let Err(e) = me.call_script(refresh, &[])
@@ -585,44 +1015,170 @@ pub(crate) fn powers_step(call: &Call<'_>, me: &Instance<'_>, s: &Shared) {
             h.downed.rebuilt(call);
             s.lock().rules.powers_applied();
             log::info!(
-                "co-op rules: revived (hull {hull_max}, shield {shield_max}; hull read back {before_refresh:?} before refreshLoadout, {after_refresh:?} after, {:?} at the end)",
+                "co-op rules: revived (hull {hull_max}, shield {shield_max}; hull read back {before_refresh:?} before refreshLoadout, {after_refresh:?} after, {:?} at the end; Magnetism {magnetism:?} before refreshLoadout, {:?} after)",
                 num(me, s.h.hull),
+                num(me, h.attraction),
             );
         }
         PowersAct::ForceDeath => {
+            *h.respawn_watch
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            h.downed
+                .release(call, "everyone is down; the game's own death follows");
             set(me, h.invulnerable, 0.0);
             set(me, s.h.hull, 0.0);
             s.lock().rules.powers_applied();
-            log::info!("co-op rules: everyone is down; the game's own death follows");
+            log::info!(
+                "co-op rules: everyone is down; the game's own death follows (Magnetism {:?})",
+                num(me, h.attraction)
+            );
         }
     }
 }
 
 /// From `oPlayer_Step_0` (as `oPlayer`), before the ship is read.
-pub(crate) fn player_step(me: &Instance<'_>, s: &Shared) {
+pub(crate) fn player_step(call: &Call<'_>, me: &Instance<'_>, s: &Shared) {
     let act = s.lock().rules.player_action();
     match act {
-        PlayerAct::None => {}
-        PlayerAct::HoldDown => hold_player(me, s),
-        PlayerAct::Revive(pos) => {
-            set(me, s.rules.iframes, 180.0);
+        PlayerAct::None => watch_protection(call, s),
+        PlayerAct::HoldDown => {
+            *s.rules
+                .respawn_watch
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            hold_player(me, s);
+        }
+        PlayerAct::Revive => {
+            set(me, s.rules.iframes, f64::from(super::protect::FRAMES));
             let _ = me.set_builtin_f64("visible", 1.0);
-            if let Some((x, y)) = pos {
-                let _ = me.set_builtin_f64("x", x);
-                let _ = me.set_builtin_f64("y", y);
-                let _ = me.set_builtin_f64("hspeed", 0.0);
-                let _ = me.set_builtin_f64("vspeed", 0.0);
-                log::info!(
-                    "co-op rules: ship back at ({x:.0}, {y:.0}), next to the partner; iFrames 180"
-                );
-            } else {
-                log::info!(
-                    "co-op rules: ship back where it went down (no partner pose); iFrames 180"
-                );
-            }
+            fly_in(call, me, s);
+            protect_from_now(call, s);
             s.lock().rules.player_applied();
+            watch_protection(call, s);
         }
     }
+}
+
+/// The respawn's protection from the fly-in's start (`protect`):
+/// `invulnerableTime` set again, and the watch of what the ship takes in it.
+fn protect_from_now(call: &Call<'_>, s: &Shared) {
+    let h = &s.rules;
+    let frames = f64::from(super::protect::FRAMES);
+    let mut read = None;
+    if let Some(powers) = h.powers_obj(call) {
+        let _ = call.with(&powers, |p, _| {
+            if read.is_none() {
+                set(&p, h.invulnerable, frames);
+                read = Some((num(&p, s.h.hull), num(&p, s.h.shield)));
+            }
+        });
+    }
+    let watch = if let Some((Some(hull), Some(shield))) = read {
+        Some(super::protect::Watch::start(hull, shield))
+    } else {
+        warn_once(
+            "rules-protect",
+            "co-op rules: oPowers not read at the respawn; its protection is the revive's",
+        );
+        None
+    };
+    *h.respawn_watch
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = watch;
+}
+
+/// One ship step of the respawn's protected frames (`protect`): what the
+/// ship took in them, logged at their end.
+fn watch_protection(call: &Call<'_>, s: &Shared) {
+    let h = &s.rules;
+    let mut watch = h
+        .respawn_watch
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(w) = watch.as_mut() else { return };
+    let Some(powers) = h.powers_obj(call) else {
+        *watch = None;
+        return;
+    };
+    let mut read = None;
+    let _ = call.with(&powers, |p, _| {
+        read.get_or_insert((
+            num(&p, s.h.hull),
+            num(&p, s.h.shield),
+            num(&p, h.invulnerable),
+        ));
+    });
+    let Some((Some(hull), Some(shield), Some(invulnerable))) = read else {
+        *watch = None;
+        return;
+    };
+    if let Some(r) = w.frame(hull, shield, invulnerable) {
+        *watch = None;
+        log::info!(
+            "co-op rules: respawn protection over: {} frames from the fly-in (invulnerableTime and iFrames {}); {}: hull {:.1}, lowest {:.1}; shield {:.1}, lowest {:.1}; invulnerableTime {:.0} on the first frame, {:.0} on the last",
+            r.frames,
+            super::protect::FRAMES,
+            if r.hurt() { "hurt" } else { "not hurt" },
+            r.hull,
+            r.lowest_hull,
+            r.shield,
+            r.lowest_shield,
+            r.first_invulnerable,
+            r.last_invulnerable,
+        );
+    }
+}
+
+/// The ship flies back in as after the Singularity: the game's own
+/// `oPlayer_Alarm_3`, run now as the ship. The kaleidoscope cutscene is held
+/// off for the call with the game's own setting.
+fn fly_in(call: &Call<'_>, me: &Instance<'_>, s: &Shared) {
+    let h = &s.rules;
+    let Some(perform) = h.event_perform else {
+        warn_once(
+            "rules-flyin",
+            "co-op rules: event_perform not found; the ship comes back where it went down",
+        );
+        return;
+    };
+    let global = call.global();
+    // Held off only when it could be read, then put back exactly.
+    let kaleidoscope = h
+        .no_kaleidoscope
+        .zip(global.as_ref())
+        .and_then(|(v, g)| g.get_value(v).map(|was| (v, was)))
+        .filter(|(v, _)| global.as_ref().is_some_and(|g| g.set(*v, 1.0).is_ok()));
+    // `ev_alarm` is event type 2.
+    let ran = me.call_builtin(perform, &[2.0.into(), 3.0.into()]);
+    if let (Some((v, was)), Some(g)) = (kaleidoscope, global.as_ref())
+        && g.set(v, was).is_err()
+    {
+        warn_once(
+            "rules-flyin-setting",
+            "co-op rules: the kaleidoscope setting could not be put back after the fly-in",
+        );
+    }
+    if let Err(e) = ran {
+        warn_once(
+            "rules-flyin-call",
+            &format!("co-op rules: the respawn's fly-in (oPlayer_Alarm_3): {e}"),
+        );
+        return;
+    }
+    let read = |n: &str| me.builtin_f64(n);
+    let wire = {
+        let g = s.lock();
+        ndml_net::time::to_wire_ms(g.net.local_time(Instant::now()))
+    };
+    log::info!(
+        "co-op rules: respawn fly-in: the game's own (oPlayer_Alarm_3) from ({:.0}, {:.0}), speed {:.1}, direction {:.1}, no kaleidoscope; at wire {wire} ms, wall {} ms",
+        read("x").unwrap_or(f64::NAN),
+        read("y").unwrap_or(f64::NAN),
+        read("speed").unwrap_or(f64::NAN),
+        read("direction").unwrap_or(f64::NAN),
+        wall_ms()
+    );
 }
 
 /// What the run tick read about the run.
@@ -632,6 +1188,51 @@ pub(crate) struct Tick {
     pub paused: bool,
     pub gameplay: bool,
     pub game_over: bool,
+}
+
+/// Before `gotoUpgrade`, ahead of the gate's release: the screen is kept to
+/// ask for at the release (`gate::StartAsk`).
+fn note_start_ask(s: &Shared) {
+    if s.lock().core.note_start_ask() {
+        log::info!(
+            "co-op: the game asked for an upgrade screen before the start gate let the run go; asked again at the release"
+        );
+    }
+}
+
+/// The upgrade screen asked for before the start gate's release, asked for
+/// again with `gotoUpgrade` on the first unpaused frame after it.
+pub(crate) fn start_ask_step(call: &Call<'_>, s: &Shared, paused: bool) {
+    let due = {
+        let mut c = s.lock();
+        let open = c.rules.upgrade_choosing();
+        let due = c.core.start_ask_due(paused, open);
+        if due {
+            // Its screen is this player's own, even if the partner's round
+            // asked for one this frame too (no fade-in).
+            c.rules.start_screen_asked();
+        }
+        due
+    };
+    if !due {
+        return;
+    }
+    let Some(script) = s.rules.goto_upgrade else {
+        warn_once(
+            "start-ask",
+            "co-op: unable to find gotoUpgrade; the run's opening screen stays unasked",
+        );
+        return;
+    };
+    log::info!(
+        "co-op: the start gate let the run go: the upgrade screen asked for before it, asked for again"
+    );
+    if let Err(e) = call.call_script(script, &[]) {
+        warn_once(
+            "start-ask-call",
+            &format!("co-op: unable to ask for the run's opening upgrade screen ({e})"),
+        );
+    }
 }
 
 /// The run tick's part (as `oController`, after the start gate's hold).
@@ -650,7 +1251,12 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
         _ => None,
     };
     let score = globals.as_ref().and_then(|g| read_score(g, hooks));
-    let (actions, poll_escape, poll_pause, down) = {
+    let ataraxia = ataraxia_taken(call, s);
+    let mut ready_cue = false;
+    let mut ticks: Vec<(CountKind, Option<u8>)> = Vec::new();
+    let hidden;
+    let poll_count;
+    let (actions, poll_pause, down, banish_ready) = {
         let mut guard = s.lock();
         let c = &mut *guard;
         let ctx = RunCtx {
@@ -662,17 +1268,11 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
             is_host: c.core.is_host(),
             partners: c.core.partners().keys().copied().collect(),
         };
+        let banish_ready = ctx.coop_run && ctx.gate_running && tick.gameplay;
+        // The partner's new Ready on its new game screen: the same cue,
+        // wherever this player is in its run.
+        ready_cue |= c.ready_notice.take_cue();
         c.rules.sync_run(&ctx);
-        let partner = c.core.partners().values().next().and_then(|p| {
-            p.ship.latest().map(|ps| {
-                (
-                    f64::from(ps.x),
-                    f64::from(ps.y),
-                    f64::from(ps.vx) / 60.0,
-                    f64::from(ps.vy) / 60.0,
-                )
-            })
-        });
         let obs = Observed {
             paused: tick.paused,
             gameplay: tick.gameplay,
@@ -680,8 +1280,18 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
             levelup,
             xp,
             score,
-            partner,
+            held: c.core.wait_hold() || c.core.run_over().is_some(),
+            ataraxia,
         };
+        let rtt = c
+            .net
+            .lobby_status()
+            .as_ref()
+            .and_then(|st| st.connected_peers().next().map(|p| p.rtt_ms))
+            .filter(|ms| ms.is_finite() && *ms >= 0.0);
+        if let Some(ms) = rtt {
+            c.rules.set_rtt(Duration::from_secs_f64(ms / 1000.0));
+        }
         let actions = c.rules.frame(&obs, now);
         let _ = c.rules.take_score_sent();
         let outs = c.rules.take_outs();
@@ -689,18 +1299,36 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
         let facts = c.rules.facts(now, tick.paused);
         c.run_msgs.set_session(facts);
         for e in c.rules.take_events() {
+            ready_cue |= e == SessionEvent::PartnerReady;
+            match e {
+                SessionEvent::CountTick(k, n) => ticks.push((k, Some(n))),
+                SessionEvent::CountGo(k) => ticks.push((k, None)),
+                SessionEvent::ResumedNoCount => {
+                    log::info!(
+                        "co-op rules: play resumes with no count at wall {} ms",
+                        wall_ms()
+                    );
+                }
+                _ => {}
+            }
             c.run_msgs.session_event(e);
         }
+        poll_count = c.rules.counting_on_card();
         let down = c.rules.is_down();
+        hidden = c.rules.ship_hidden();
         c.core.set_downed(down);
         hooks.active.store(c.rules.active(), Ordering::Relaxed);
-        (
-            actions,
-            c.rules.held_escape_offered(now),
-            c.rules.held_on_card(),
-            down,
-        )
+        hooks.set_frozen_unseen(c.rules.frozen_unseen());
+        (actions, c.rules.held_on_card(), down, banish_ready)
     };
+    let banish_due = hooks
+        .banished
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(tick.key, banish_ready);
+    if banish_due {
+        banish_for_session(call, s);
+    }
     if down != hooks.followers_hidden.load(Ordering::Relaxed) {
         // A down applied in a frozen frame (the death and a level-up's
         // freeze together) would find no ship (`oPlayer` is deactivated)
@@ -714,9 +1342,35 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
     } else if down {
         hooks.downed.hold(call);
     }
-    if poll_escape && back_pressed(call, s) {
+    if !hidden {
+        // Everyone down, or up: from here nothing the ship makes is ended.
+        hooks
+            .downed
+            .release(call, "the ship is no longer down and hidden (the rules)");
+    }
+    // A count's numbers and its go (a count called off has no go).
+    for (k, n) in &ticks {
+        let (said, cue) = n.map_or_else(
+            || ("go".to_owned(), crate::ui::cues::Cue::Go),
+            |n| (n.to_string(), crate::ui::cues::Cue::Tick(n)),
+        );
+        log::info!(
+            "co-op rules: {} count: {said} at wall {} ms",
+            k.name(),
+            wall_ms()
+        );
+        crate::ui::glue::play_cue(call, s, cue, now);
+    }
+    if ready_cue {
+        crate::ui::glue::play_cue(call, s, crate::ui::cues::Cue::PartnerReady, now);
+    } else if ticks.is_empty() {
+        crate::ui::glue::cue_tick(call, s, now);
+    }
+    if poll_count && (back_pressed(call, s) || pause_pressed(call, s)) {
+        // Esc or the pause key on the held card while the resume count
+        // runs: "hold on".
         let mut g = s.lock();
-        g.rules.escape(now);
+        g.rules.count_hold_on(now);
         let outs = g.rules.take_outs();
         net::apply(&g.net, outs);
     }
@@ -726,6 +1380,68 @@ pub(crate) fn run_tick(call: &Call<'_>, s: &Shared, tick: Tick, now: Instant) {
     for a in actions {
         execute(call, &me, s, a);
     }
+}
+
+/// Whether the build has Ataraxia (`oPowers.ataraxia`).
+fn ataraxia_taken(call: &Call<'_>, s: &Shared) -> bool {
+    let h = &s.rules;
+    let Some(powers) = h.powers_obj(call) else {
+        return false;
+    };
+    let mut taken = false;
+    let _ = call.with(&powers, |p, _| {
+        taken |= truthy(&p, h.ataraxia).unwrap_or(false);
+    });
+    taken
+}
+
+/// The session's banished upgrades ([`super::banish`]), through the game's
+/// own `banishMod` as `oPowers`, once per co-op run past the start gate.
+fn banish_for_session(call: &Call<'_>, s: &Shared) {
+    let h = &s.rules;
+    let (Some(script), Some(powers)) = (h.banish_mod, h.powers_obj(call)) else {
+        warn_once(
+            "rules-banish",
+            "co-op rules: banishMod or oPowers not found; Last Stand stays in the pools",
+        );
+        return;
+    };
+    let mut done = Vec::new();
+    for name in SESSION_BANISHED {
+        let Some(idx) = call_b(call, h.asset_get_index, &[(*name).into()])
+            .as_ref()
+            .and_then(crate::world::classify::object_index)
+        else {
+            warn_once(
+                "rules-banish-name",
+                &format!("co-op rules: {name} not found"),
+            );
+            continue;
+        };
+        // An object reference, as the game's own calls pass it.
+        let r = Value::Ref(ndml_sdk::abi::OBJECT_REF_TAG | u64::from(idx));
+        let mut list = None;
+        let _ = call.with(&powers, |p, _| {
+            match p.call_script(script, std::slice::from_ref(&r)) {
+                Ok(_) => list = h.banish_list.and_then(|v| p.get_value(v)),
+                Err(e) => warn_once(
+                    "rules-banish-call",
+                    &format!("co-op rules: banishMod({name}): {e}"),
+                ),
+            }
+        });
+        // Read back from the game's own list (`ds_list_find_index`).
+        if let Some(list) = list {
+            let at = call_b(call, h.list_find, &[list, r])
+                .and_then(|v| v.as_f64())
+                .map_or_else(|| "?".to_owned(), |i| format!("{i:.0}"));
+            done.push(format!("{name} (banishMods index {at})"));
+        }
+    }
+    log::info!(
+        "co-op rules: banished for this co-op run (the game's own banish): {}",
+        done.join(", ")
+    );
 }
 
 fn execute(call: &Call<'_>, me: &Instance<'_>, s: &Shared, a: Action) {
@@ -759,9 +1475,10 @@ fn execute(call: &Call<'_>, me: &Instance<'_>, s: &Shared, a: Action) {
     }
 }
 
-/// The pause key or pad button this frame, read as the game's Step reads
-/// them; polled on the held upgrade card, where `pressPause` also comes
-/// from focus loss.
+/// The pause key or pad button this frame, read as the game's own Step
+/// reads them (`inputButtonPressed(menuKey)`, `gamepadPressed(player1,
+/// gamepadTogglePause)`). On the held card the game's `pressPause` cannot
+/// tell the key from a focus-loss pause, so the rules poll this instead.
 fn pause_pressed(call: &Call<'_>, s: &Shared) -> bool {
     let k = &s.ui.keys;
     let global = |v: Option<Variable>| call.global().and_then(|g| g.get_value(v?));
@@ -814,4 +1531,15 @@ fn back_pressed(call: &Call<'_>, s: &Shared) -> bool {
         _ => false,
     };
     esc || key || pad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_to_restore;
+
+    #[test]
+    fn the_control_lift_puts_back_what_it_found() {
+        assert_eq!(control_to_restore(0.0), Some(0.0), "down: lifted, 0 after");
+        assert_eq!(control_to_restore(1.0), None, "already 1: left alone");
+    }
 }

@@ -306,17 +306,22 @@ impl HostWorld {
             self.remove(old, DespawnCause::Removed);
         }
         let net_id = self.take_id();
+        let hull = finite(f.hull.unwrap_or(0.0));
         let spawn = EnemySpawn {
             net_id,
             object: f.object,
             x: finite(f.x),
             y: finite(f.y),
             angle: finite(f.angle),
-            hull: finite(f.hull.unwrap_or(0.0)),
+            hull,
+            // The base of the hull fractions: a hull above its `hullMax` (an
+            // absolute reset after the health scaling) is carried as it is,
+            // not clamped to the max. The copy's own `hullMax` is the host's,
+            // from its first state.
             hull_max: if f.hull_max.is_finite() && f.hull_max > 0.0 {
-                f.hull_max
+                f.hull_max.max(hull)
             } else {
-                f.hull.unwrap_or(0.0).max(1.0)
+                hull.max(1.0)
             },
             flags: if f.dependency {
                 EnemySpawn::DEPENDENCY
@@ -407,6 +412,12 @@ impl HostWorld {
     /// The local ship stepped (the world is running).
     pub fn player_stepped(&mut self) {
         self.player_seen = true;
+    }
+
+    /// A message that goes out with this frame's spawns and despawns, in the
+    /// order queued (an on-death part's word before its enemy's `Despawn`).
+    pub fn queue(&mut self, m: Message) {
+        self.outbox.push(m);
     }
 
     /// `checkDestroy*` destroyed the enemy at `key`: send the kill now.
@@ -618,6 +629,13 @@ impl HostWorld {
         self.outbox.push(Message::SpawnMarker(m));
     }
 
+    /// Every tracked enemy with a player: (key, that player).
+    pub fn assignments(&self) -> impl Iterator<Item = (usize, PeerId)> + '_ {
+        self.enemies
+            .values()
+            .filter_map(|e| e.target.map(|p| (e.key, p)))
+    }
+
     /// The player the enemy at `key` is assigned to.
     #[must_use]
     pub fn assignment(&self, key: usize) -> Option<PeerId> {
@@ -699,6 +717,146 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, vec![false, true]);
+    }
+
+    /// A hull raised above its spawn's base after the spawn (a part whose
+    /// hull is scaled by its leader's size after its create) reaches the
+    /// copy as the host's hull over the wire, and the joining player's kill
+    /// is claimed at that hull, not at the base.
+    #[test]
+    fn a_hull_raised_after_the_spawn_arrives_as_the_hosts() {
+        use super::super::client::{ClientWorld, Tick};
+        use std::time::Duration;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let mut host = HostWorld::default();
+        host.begin_frame(players());
+        let id = host.add(
+            7,
+            FirstSight {
+                hull: Some(400.0),
+                hull_max: 400.0,
+                ..sight(0x2e3, 900.0)
+            },
+        );
+        let msgs = normalized(host.take_messages(0));
+        let Some(Message::EnemySpawn(first)) = msgs.first().cloned() else {
+            unreachable!("{msgs:?}")
+        };
+        assert!(near(first.hull_max, 400.0), "{first:?}");
+        let mut snap = Vec::new();
+        for t in 1..=8 {
+            host.tick(id, read(900.0, 2000.0));
+            host.begin_frame(players());
+            snap.extend(host.take_messages(t * 33).into_iter().filter_map(|m| {
+                let wire = Message::decode(&m.encode().ok()?).ok()?.normalized();
+                matches!(wire, Message::EnemySnapshot(_)).then_some(wire)
+            }));
+            if !snap.is_empty() {
+                break;
+            }
+        }
+        assert!(!snap.is_empty(), "a snapshot");
+        let mut client = ClientWorld::default();
+        client.on_message(Message::EnemySpawn(first));
+        client.player_stepped();
+        let _ = client.begin_frame(None);
+        client.spawned(first.net_id, 11, Value::Real(100_900.0));
+        for msg in snap {
+            client.on_message(msg);
+        }
+        let _ = client.begin_frame(Some(Duration::from_secs(1)));
+        let Tick::Puppet(puppet) = client.tick(11) else {
+            unreachable!("a live copy")
+        };
+        let host_hull = puppet.hull.expect("a hull of the host's");
+        assert!(near(host_hull, 2000.0), "{host_hull}");
+        // The joining player's hits: 1700 leave 300, no claim (on the base
+        // it would be one); the rest of the host's hull makes the claim.
+        let net = first.net_id;
+        let mut dmg = crate::damage::ClientDamage::new();
+        dmg.on_message(PeerId(1), &Message::EnemySpawn(first));
+        let _ = dmg.begin_frame();
+        let _ = dmg.tick(net, 11, host_hull, Some(host_hull));
+        let _ = dmg.begin_frame();
+        assert!(!dmg.tick(net, 11, host_hull, Some(host_hull - 1700.0)).dying);
+        assert_eq!(dmg.counts().claims, 0, "not before the host's hull");
+        let _ = dmg.begin_frame();
+        assert!(dmg.tick(net, 11, host_hull, Some(-0.5)).dying);
+        assert_eq!(dmg.counts().claims, 1);
+    }
+
+    /// A hull above its max (an absolute `hullMax` reset after the health
+    /// scaling) reaches the joining game as the host's number over the wire,
+    /// in a later spawn of the enemy too, and the joining player's kill of it
+    /// is claimed at that hull, not before.
+    #[test]
+    fn a_hull_above_its_max_arrives_as_the_hosts() {
+        use super::super::client::{ClientWorld, Tick};
+        use std::time::Duration;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let mut host = HostWorld::default();
+        host.begin_frame(players());
+        let id = host.add(
+            7,
+            FirstSight {
+                hull: Some(160.0),
+                hull_max: 130.0,
+                ..sight(0x325, 900.0)
+            },
+        );
+        let msgs = normalized(host.take_messages(0));
+        let Some(Message::EnemySpawn(first)) = msgs.first().cloned() else {
+            unreachable!("{msgs:?}")
+        };
+        assert!(
+            near(first.hull, 160.0) && near(first.hull_max, 160.0),
+            "{first:?}"
+        );
+        host.begin_frame(players());
+        let snap = normalized(host.take_messages(1000));
+        // The copy: the host's hull, not the max.
+        let mut client = ClientWorld::default();
+        client.on_message(Message::EnemySpawn(first));
+        client.player_stepped();
+        let _ = client.begin_frame(None);
+        client.spawned(first.net_id, 11, Value::Real(100_007.0));
+        for msg in snap {
+            client.on_message(msg);
+        }
+        let _ = client.begin_frame(Some(Duration::from_secs(1)));
+        let Tick::Puppet(puppet) = client.tick(11) else {
+            unreachable!("a live copy")
+        };
+        let host_hull = puppet.hull.expect("a hull of the host's");
+        assert!(near(host_hull, 160.0), "{host_hull}");
+        // A later spawn (a refused claim, a resync) keeps the base.
+        host.tick(id, read(905.0, 100.0));
+        host.respawn(id);
+        let again = normalized(host.take_messages(1033));
+        let Some(Message::EnemySpawn(resent)) = again
+            .iter()
+            .find(|msg| matches!(msg, Message::EnemySpawn(_)))
+        else {
+            unreachable!("{again:?}")
+        };
+        assert!(
+            near(resent.hull, 100.0) && near(resent.hull_max, 160.0),
+            "{resent:?}"
+        );
+        // The joining player's hits: 140 leave 20, no claim (on the
+        // max it would be one); the rest of the host's hull makes the claim.
+        let net = first.net_id;
+        let mut dmg = crate::damage::ClientDamage::new();
+        dmg.on_message(PeerId(1), &Message::EnemySpawn(first));
+        let _ = dmg.begin_frame();
+        let _ = dmg.tick(net, 11, host_hull, Some(host_hull));
+        let _ = dmg.begin_frame();
+        let short = dmg.tick(net, 11, host_hull, Some(host_hull - 140.0));
+        assert!(!short.dying);
+        assert_eq!(dmg.counts().claims, 0, "not before the host's hull");
+        let _ = dmg.begin_frame();
+        assert!(dmg.tick(net, 11, host_hull, Some(-0.5)).dying);
+        assert_eq!(dmg.counts().claims, 1);
     }
 
     #[test]

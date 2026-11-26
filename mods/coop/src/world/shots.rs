@@ -389,6 +389,23 @@ pub const BEAM_COLLISIONS: [&str; 18] = [
     "gml_Object_oScionLance_Collision_oPlayerConstruct",
 ];
 
+/// Every collision event with the `oEnemyBlast` family's own objects
+/// (`oEnemyBlast`, `oEnemyBlastLenDir`, `oEnemyBlastPos`; the reflected ones
+/// are the player's) on either side: on a joining game a scratch blast (a
+/// copy's own, `windup::blast_shared`) touches nothing in the frame it lives.
+pub const BLAST_COLLISIONS: [&str; 10] = [
+    "gml_Object_oAsteroid_Collision_oEnemyBlast",
+    "gml_Object_oBlade_Collision_oEnemyBlast",
+    "gml_Object_oConstructMine_Collision_oEnemyBlast",
+    "gml_Object_oConstructSwarm_Collision_oEnemyBlast",
+    "gml_Object_oCosmicEgg_Collision_oEnemyBlast",
+    "gml_Object_oPlayer_Collision_oEnemyBlast",
+    "gml_Object_oPlayerConstruct_Collision_oEnemyBlast",
+    "gml_Object_oPlayerSegment_Collision_oEnemyBlast",
+    "gml_Object_oShieldBastion_Collision_oEnemyBlast",
+    "gml_Object_oSwordObject_Collision_oEnemyBlast",
+];
+
 /// The shared kinds, by root (`classify::parent::ENEMY_SHOTS` order).
 pub const KINDS: [&str; 3] = ["shots", "blasts", "beams"];
 /// A place reference ([`FiredShot::places`]): variable index, object, x, y.
@@ -421,6 +438,12 @@ pub struct Born {
     /// For a host beam: the host's clock at its birth, sent as its time so
     /// it shows in step with its maker; 0 otherwise (the read's time).
     pub born_ms: u32,
+    /// A wind-up candidate (`windup.rs`): kept only when it follows an enemy
+    /// at the end of its birth frame, then read a frame later like a beam.
+    pub windup: bool,
+    /// Its shot id when another shared birth named it first
+    /// ([`HostShots::sid_for`]); `None`: given at its read.
+    pub sid: Option<u32>,
 }
 
 /// One live shared shot on the host.
@@ -448,12 +471,19 @@ pub struct HostShots {
     pub live: HashMap<usize, HostShot>,
     /// The joining view (rect, when it arrived).
     pub view: Option<(Rect, Instant)>,
+    /// The batch being read now, by key, with the ids it was given
+    /// ([`Self::sid_for`]).
+    pub reading: HashMap<usize, u32>,
     /// To send at the next run step.
     pub fires: Vec<FiredShot>,
     /// Ends to send at the next run step.
     pub ends: Vec<ShotEnd>,
     /// Steer changes to send at the next run step.
     pub steers: Vec<SteerChange>,
+    /// Wind-up births of this frame that are the host's wherever they are
+    /// (`windup::free`: what a shared shot's ending made, and its lineage):
+    /// kept with no follow test.
+    pub free: HashSet<usize>,
 }
 
 impl HostShots {
@@ -481,6 +511,25 @@ impl HostShots {
     #[must_use]
     pub fn shared(&self, key: usize) -> bool {
         self.live.contains_key(&key) || self.born.iter().any(|b| b.key == key)
+    }
+
+    /// The shot id of the shared shot or wind-up at `key`: a live one's, or
+    /// one given now to a birth not read yet (its read keeps it), so that a
+    /// birth read first can name it ([`ndml_net::shots::FiredShot::links`]).
+    pub fn sid_for(&mut self, key: usize) -> Option<u32> {
+        if let Some(s) = self.live.get(&key) {
+            return Some(s.id);
+        }
+        if let Some(&sid) = self.reading.get(&key) {
+            return Some(sid);
+        }
+        let i = self.born.iter().position(|b| b.key == key)?;
+        if let Some(sid) = self.born[i].sid {
+            return Some(sid);
+        }
+        let sid = self.next_id();
+        self.born[i].sid = Some(sid);
+        Some(sid)
     }
 
     /// The player the live shared shot at `key` goes after.
@@ -545,6 +594,8 @@ impl HostShots {
                 target: s.target,
                 wait: 0,
                 born_ms: 0,
+                windup: false,
+                sid: None,
             })
             .collect();
         again.sort_by_key(|b| b.key);
@@ -588,6 +639,49 @@ pub struct Due {
     pub waited: u64,
 }
 
+/// A made birth's reference to another shared birth, waiting until that one
+/// is made here.
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// The made instance that holds the reference, and its object.
+    pub holder: Value,
+    pub object: u16,
+    /// The variable's index into the object's names.
+    pub var: u16,
+    /// The shot id it names.
+    pub sid: u32,
+    /// The frame it was made in (it waits at most [`WAIT_FRAMES`]).
+    pub frame: u64,
+}
+
+impl ClientShots {
+    /// The instance made here for shot `sid`, while it lives.
+    #[must_use]
+    pub fn made_value(&self, sid: u32) -> Option<&Value> {
+        self.made
+            .get(&sid)
+            .filter(|m| m.gone_at.is_none())
+            .map(|m| &m.value)
+    }
+
+    /// The links whose shot is made here now (taken out with its instance),
+    /// and those waited for too long (dropped); the rest wait on.
+    pub fn take_links(&mut self, frame: u64) -> Vec<(Link, Value)> {
+        let mut out = Vec::new();
+        let mut keep = Vec::new();
+        for l in std::mem::take(&mut self.links) {
+            if let Some(v) = self.made_value(l.sid) {
+                let v = v.clone();
+                out.push((l, v));
+            } else if frame.saturating_sub(l.frame) < WAIT_FRAMES {
+                keep.push(l);
+            }
+        }
+        self.links = keep;
+        out
+    }
+}
+
 /// A joining game's tables.
 #[derive(Debug, Default)]
 pub struct ClientShots {
@@ -607,6 +701,16 @@ pub struct ClientShots {
     pub scratch: Vec<(usize, Value)>,
     /// The keys of [`Self::scratch`].
     pub scratch_keys: HashSet<usize>,
+    /// Wind-up candidates the copies made this frame (key, id): scratch
+    /// when they follow at the frame's end (`windup.rs`), else left alone.
+    pub windups: Vec<(usize, Value)>,
+    pub windup_keys: HashSet<usize>,
+    /// Of those, the ones a made shot's ending or its lineage made
+    /// (`windup::free`): scratch whether they follow or not.
+    pub windups_free: HashSet<usize>,
+    /// Made births' references to another shared birth by shot id
+    /// ([`ndml_net::shots::FiredShot::links`]), until that one is made here.
+    pub links: Vec<Link>,
     /// The view rect last sent (frame).
     pub view_sent: u64,
     /// Reports to send at the next run step.
@@ -1067,6 +1171,7 @@ mod tests {
             places: Vec::new(),
             place_fills: Vec::new(),
             replaces: false,
+            links: Vec::new(),
         }
     }
 
@@ -1178,6 +1283,67 @@ mod tests {
         assert!(r.is_none());
         assert_eq!(h.ends.len(), 2, "the host's end and the forwarded report");
         assert!(h.live.is_empty());
+    }
+
+    #[test]
+    fn a_birth_named_before_its_read_keeps_the_id_it_was_given() {
+        let mut h = HostShots::default();
+        let born = |key| Born {
+            key,
+            value: Value::Real(1.0),
+            object: 7,
+            frame: 3,
+            target: None,
+            wait: 1,
+            born_ms: 100,
+            windup: true,
+            sid: None,
+        };
+        h.born.push(born(1));
+        h.born.push(born(2));
+        let ring = h.sid_for(2).unwrap();
+        assert_eq!(h.sid_for(2), Some(ring), "given once");
+        assert_eq!(h.born[1].sid, Some(ring));
+        assert_eq!(h.born[0].sid, None, "the other gets its own at its read");
+        assert_eq!(h.sid_for(9), None, "not shared");
+        h.reading.insert(9, 31);
+        assert_eq!(h.sid_for(9), Some(31), "in the batch being read");
+        h.live.insert(
+            4,
+            HostShot {
+                id: 77,
+                value: Value::Real(4.0),
+                object: 7,
+                target: None,
+                steer: 0,
+            },
+        );
+        assert_eq!(h.sid_for(4), Some(77));
+    }
+
+    #[test]
+    fn a_link_waits_for_its_shot_to_be_made_here() {
+        let mut c = ClientShots::default();
+        let link = |sid, frame| Link {
+            holder: Value::Real(100_001.0),
+            object: 7,
+            var: 2,
+            sid,
+            frame,
+        };
+        c.links.push(link(5, 10));
+        c.links.push(link(6, 10));
+        assert!(c.take_links(11).is_empty(), "neither made yet");
+        c.made(5, 50, Value::Real(100_005.0), 7);
+        let got = c.take_links(12);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].0.sid, got[0].1.clone()),
+            (5, Value::Real(100_005.0))
+        );
+        assert_eq!(c.links.len(), 1, "6 waits on");
+        assert!(c.take_links(10 + WAIT_FRAMES).is_empty());
+        assert!(c.links.is_empty(), "6 waited too long");
     }
 
     #[test]

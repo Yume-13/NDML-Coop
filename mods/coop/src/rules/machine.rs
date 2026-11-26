@@ -32,11 +32,12 @@ use std::time::{Duration, Instant};
 use ndml_net::msg::{Message, PeerId};
 use ndml_net::session::{DownOutcome, PauseGate, PeerSet, RespawnRules, UpgradeEvent, UpgradeGate};
 
+use super::countdown::{Countdown, Step, alert_number};
 use super::score::{ClientScore, HostScore, Score};
 use super::settings::RulesSettings;
 use super::xp::{ClientXp, HostXp, XpRead, XpStep};
 use crate::net::Out;
-use crate::ui::run::{SessionEvent, SessionFacts, SharedPause, UpgradeWait};
+use crate::ui::run::{CountKind, CountView, SessionEvent, SessionFacts, SharedPause, UpgradeWait};
 
 mod state_sync;
 
@@ -48,6 +49,9 @@ const OWN_WINDOW: u64 = 15;
 const PRESS_EVERY: u64 = 30;
 /// Frames a forced `gotoUpgrade` may take to open the screen.
 const GOTO_WAIT: u64 = 20;
+/// Frames after the start gate's ask (`Rules::start_screen_asked`) in which
+/// the screen that opens is this player's own.
+const START_SCREEN_FRAMES: u64 = GOTO_WAIT;
 /// Frames a release (`leaveUpgrade`) may take before it is called again.
 const RELEASE_RETRY: u64 = 20;
 /// Retries between two warn lines about a release that does not take.
@@ -56,8 +60,14 @@ const RELEASE_WARN_EVERY: u32 = 90;
 const OWED_WAIT: u64 = 90;
 /// A client re-sends an unconfirmed downed report this often.
 const DOWN_RESEND: Duration = Duration::from_secs(2);
-/// How far behind the partner a respawned ship appears, pixels.
-pub const RESPAWN_OFFSET: f64 = 140.0;
+/// The "partner ready" cue sounds only for a partner who became ready at
+/// least this long after this game entered the round.
+pub const READY_CUE_AFTER: Duration = Duration::from_secs(1);
+/// The count before play resumes after a shared hold.
+pub const RESUME_COUNT: Duration = ndml_net::session::RESUME_COUNT;
+/// After an upgrade round the count runs only when a player has waited this
+/// long after picking, without a break. The host's word counts.
+pub const UPGRADE_COUNT_AFTER: Duration = ndml_net::session::UPGRADE_COUNT_AFTER;
 
 /// The run as the rules need it, each run tick.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +87,7 @@ pub struct RunCtx {
 
 /// What the run tick read from the game this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[allow(clippy::struct_excessive_bools)] // the frame's facts, one each
 pub struct Observed {
     /// `oController.pause != 0`.
     pub paused: bool,
@@ -90,8 +101,10 @@ pub struct Observed {
     pub xp: Option<XpRead>,
     /// The score numbers and kill counters (for the shared score).
     pub score: Option<Score>,
-    /// The partner's ship: `x`, `y`, `vx`, `vy` (for the respawn point).
-    pub partner: Option<(f64, f64, f64, f64)>,
+    /// The session holds this game frozen (`state::Core`): the rules never unpause it.
+    pub held: bool,
+    /// `oPowers.ataraxia`: this player took Ataraxia.
+    pub ataraxia: bool,
 }
 
 /// A game action for the run tick (as `oController`).
@@ -152,8 +165,8 @@ pub enum PlayerAct {
     None,
     /// Hold `iFrames` and `visible = false`.
     HoldDown,
-    /// Visible again, brief `iFrames`, moved here (`None`: where it is).
-    Revive(Option<(f64, f64)>),
+    /// Visible again, then the game's own fly-in (`oPlayer_Alarm_3`).
+    Revive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,10 +188,8 @@ enum Ship {
     Down {
         reported: Option<Instant>,
     },
-    /// Respawning: position resolved at the next frame, then `oPowers`, then `oPlayer`.
+    /// Respawning: `oPowers`, then `oPlayer` (the fly-in).
     Reviving {
-        pos: Option<(f64, f64)>,
-        resolved: bool,
         powers_done: bool,
     },
     /// Everyone is down: the forced death was (or is to be) applied.
@@ -187,22 +198,16 @@ enum Ship {
     },
 }
 
-/// The point [`RESPAWN_OFFSET`] behind the partner's motion (to its left when
-/// it hardly moves); the game's `wrapPlayer` wraps a point past the edge.
-#[must_use]
-pub fn respawn_point(partner: (f64, f64, f64, f64)) -> (f64, f64) {
-    let (px, py, vx, vy) = partner;
-    let speed = vx.hypot(vy);
-    let (dx, dy) = if speed > 1.0 {
-        (-vx / speed, -vy / speed)
-    } else {
-        (-1.0, 0.0)
-    };
-    (px + dx * RESPAWN_OFFSET, py + dy * RESPAWN_OFFSET)
-}
-
 fn wire_ms(d: Duration) -> u32 {
     ndml_net::time::to_wire_ms(d)
+}
+
+/// 0 to 1 as thousandths.
+fn permille(x: f64) -> u16 {
+    // 0..=1000 by the clamp.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let p = (x.clamp(0.0, 1.0) * 1000.0).round() as u16;
+    p
 }
 
 fn ceil_secs(d: Duration) -> u64 {
@@ -241,8 +246,6 @@ pub struct Rules {
     to_pause_screen: bool,
     proposed: Option<u16>,
     done_sent: Option<u16>,
-    escaped: Option<u16>,
-    wait_since: Option<Instant>,
     goto_sent: Option<u64>,
     owed_since: Option<u64>,
     // Downed.
@@ -252,6 +255,9 @@ pub struct Rules {
     game_over_seen: bool,
     /// A respawn timed by this game alone (nobody confirmed its report).
     solo_respawn: Option<Duration>,
+    /// A joining game's ship came back on its own clock before the host's
+    /// `Respawned`.
+    back_untold: bool,
     game_time: Duration,
     control: Option<bool>,
     // XP.
@@ -274,10 +280,40 @@ pub struct Rules {
     own_unpause: Option<u64>,
     last_press: Option<(bool, u64)>,
     interrupted_at: Option<Instant>,
+    /// The partner was down when its link was lost: it stays down for the wait.
+    partner_down_at_loss: bool,
+    /// Host: the run ended while the link was lost, to be told at the return.
+    over_untold: bool,
     outs: Vec<Out>,
     events: Vec<SessionEvent>,
     /// Converging from the partner's statement (`state_sync`).
     sync: state_sync::Sync,
+    /// Since when this game is in a round it waits in ([`Self::in_round`]).
+    round_entered: Option<Instant>,
+    /// The "ready and waiting" bar showed last frame.
+    partner_ready: bool,
+    /// The count before play resumes, from a round's release.
+    count: Option<Countdown>,
+    /// The open round's picks, each with the time its unbroken wait began.
+    picks: Vec<(PeerId, Instant)>,
+    /// The release's word on its count, for the release being taken now.
+    release_counts: Option<bool>,
+    /// Host: the last release counted ([`RulesState::COUNTED`]).
+    last_release_counted: bool,
+    /// An upgrade round ended with no count: play resumes then.
+    quiet: Option<Instant>,
+    /// The link's round trip (the host's count waits half of it).
+    rtt: Duration,
+    /// The latest time an entry point was called with.
+    now: Option<Instant>,
+    /// The respawn alert's number last told.
+    respawn_told: Option<u8>,
+    /// Ataraxia: the round held without a screen, and whether Space asked for one.
+    ataraxia_round: Option<u16>,
+    choose_own: bool,
+    /// The frame the start gate asked for this player's own opening screen
+    /// (`gate::StartAsk`), for [`START_SCREEN_FRAMES`].
+    start_screen: Option<u64>,
 }
 
 impl Rules {
@@ -304,8 +340,6 @@ impl Rules {
             to_pause_screen: false,
             proposed: None,
             done_sent: None,
-            escaped: None,
-            wait_since: None,
             goto_sent: None,
             owed_since: None,
             respawn: RespawnRules::new(PeerSet::EMPTY, respawn),
@@ -313,6 +347,7 @@ impl Rules {
             force_death: false,
             game_over_seen: false,
             solo_respawn: None,
+            back_untold: false,
             game_time: Duration::ZERO,
             control: None,
             host_xp: HostXp::default(),
@@ -329,9 +364,24 @@ impl Rules {
             own_unpause: None,
             last_press: None,
             interrupted_at: None,
+            partner_down_at_loss: false,
+            over_untold: false,
             outs: Vec::new(),
             events: Vec::new(),
             sync: state_sync::Sync::default(),
+            round_entered: None,
+            partner_ready: false,
+            count: None,
+            picks: Vec::new(),
+            release_counts: None,
+            last_release_counted: false,
+            quiet: None,
+            rtt: Duration::ZERO,
+            now: None,
+            respawn_told: None,
+            ataraxia_round: None,
+            choose_own: false,
+            start_screen: None,
         }
     }
 
@@ -347,7 +397,7 @@ impl Rules {
         self.active
     }
 
-    /// The partner left this run for good: each game plays alone until it ends.
+    /// The partner left this run for good: its rounds and messages are ignored.
     #[must_use]
     pub fn separated(&self) -> bool {
         self.separated
@@ -370,6 +420,14 @@ impl Rules {
         self.i_hold()
     }
 
+    /// The world is frozen by the rules where the game cannot tell: on the card
+    /// after choosing, or in its release. `oUpgrade` is gone and `pause` is 0
+    /// there, so `oPowers_Step_1` reads "running".
+    #[must_use]
+    pub fn frozen_unseen(&self) -> bool {
+        self.active && matches!(self.screen, Screen::Held | Screen::Releasing(_))
+    }
+
     /// The local player is on the upgrade screen, choosing.
     #[must_use]
     pub fn upgrade_choosing(&self) -> bool {
@@ -380,6 +438,18 @@ impl Rules {
     #[must_use]
     pub fn is_down(&self) -> bool {
         !matches!(self.down, Ship::Up)
+    }
+
+    /// The run is over in these rules (a game over seen or decided here).
+    #[must_use]
+    pub fn run_over(&self) -> bool {
+        self.run_ended()
+    }
+
+    /// `peer`'s ship is down as these rules know it.
+    #[must_use]
+    pub fn peer_down(&self, peer: PeerId) -> bool {
+        self.respawn.is_down(peer)
     }
 
     /// Game time of this run (advances only while the world runs).
@@ -393,9 +463,21 @@ impl Rules {
         self.control = control;
     }
 
-    /// The session's upgrade wait (the host's when sent, else the local one).
-    pub fn set_upgrade_wait(&mut self, upgrade_wait: Option<Duration>) {
-        self.cfg.upgrade_wait = upgrade_wait;
+    /// The link's round trip, as measured (each run tick).
+    pub fn set_rtt(&mut self, rtt: Duration) {
+        self.rtt = rtt;
+    }
+
+    /// A count before play resumes is running.
+    #[must_use]
+    pub fn counting(&self) -> bool {
+        self.count.is_some()
+    }
+
+    /// Held on the card while the count runs ([`Self::count_hold_on`]).
+    #[must_use]
+    pub fn counting_on_card(&self) -> bool {
+        self.count.is_some() && self.screen == Screen::Held
     }
 
     /// The session's respawn time (the host's when sent, else the local one),
@@ -478,6 +560,7 @@ impl Rules {
     /// A partner left. `interrupted`: its link is lost and it may come back;
     /// otherwise it is gone for this run.
     pub fn peer_left(&mut self, peer: PeerId, interrupted: bool, now: Instant) {
+        self.now = Some(now);
         self.sync_link_lost(peer);
         if !self.active {
             return;
@@ -503,12 +586,18 @@ impl Rules {
             let ev = self.upgrade.set_peers(self.peers);
             self.on_upgrade(ev);
         }
-        self.respawn.remove_peer(peer);
         if interrupted {
+            self.partner_down_at_loss = self.respawn.is_down(peer);
             self.interrupted_at = Some(now);
         } else {
             self.separated = true;
         }
+        self.respawn.remove_peer(peer);
+    }
+
+    /// The partner's link is lost and the run waits for it (`crate::wait`).
+    fn partner_away(&self) -> bool {
+        self.interrupted_at.is_some() && !self.separated
     }
 
     /// Left alone: its unanswered pause requests are decided as the host would.
@@ -531,14 +620,15 @@ impl Rules {
             self.upgrade.done(self.me, r);
         }
         self.proposed = None;
-        self.escaped = None;
     }
 
     /// A partner came back: rounds held apart are dropped. Whoever is still
     /// on their pause menu pauses everyone again; the host announces its open
     /// upgrade round, and a joining game on its screen proposes one.
     fn rejoin_rounds(&mut self, now: Instant) {
-        let on_menu = self.pause.holds(self.me) && !self.close_sent;
+        // A game whose run is over holds nobody.
+        let over = self.run_ended();
+        let on_menu = self.pause.holds(self.me) && !self.close_sent && !over;
         self.pause = PauseGate::new(self.peers);
         self.pause_since = None;
         self.pause_request = None;
@@ -550,7 +640,7 @@ impl Rules {
             self.local_pause(now);
         }
         if self.is_host {
-            if let Some(r) = self.upgrade.active() {
+            if let Some(r) = self.upgrade.active().filter(|_| !over) {
                 log::info!(
                     "co-op rules: upgrade round {r} is open here; telling the returning game"
                 );
@@ -560,9 +650,8 @@ impl Rules {
             // The host's numbering from here: a gate with no history.
             self.upgrade = UpgradeGate::new(self.peers);
             self.proposed = None;
-            self.escaped = None;
             self.done_sent = None;
-            if self.screen == Screen::Choosing {
+            if self.screen == Screen::Choosing && !over {
                 let r = self.upgrade.next_round();
                 log::info!("co-op rules: on the upgrade screen at the return; proposing round {r}");
                 self.proposed = Some(r);
@@ -578,6 +667,7 @@ impl Rules {
         }
         self.peers.insert(peer);
         self.interrupted_at = None;
+        self.partner_down_at_loss = false;
         self.pause.set_peers(self.peers);
         let ev = self.upgrade.set_peers(self.peers);
         self.on_upgrade(ev);
@@ -586,6 +676,17 @@ impl Rules {
         self.host_xp.resend();
         self.host_score.resend();
         log::info!("co-op rules: {peer} is back");
+        if std::mem::take(&mut self.over_untold) {
+            // Everyone went down while the link was lost: told at the return.
+            log::info!("co-op rules: the run ended while the link was lost; telling {peer}");
+            self.bcast(Message::Downed {
+                peer: self.me,
+                respawn_ms: 0,
+            });
+            self.score_last_word();
+            self.bcast(Message::GameOver);
+            return;
+        }
         // Tell the sequencer where this game's ship stands.
         if matches!(self.down, Ship::Down { .. }) {
             // The time left: the own timer if one ran alone (handed over),
@@ -599,6 +700,8 @@ impl Rules {
                 .unwrap_or(self.cfg.respawn);
             let respawn_ms = wire_ms(left).max(1);
             if self.is_host {
+                // A down from the wait moves from this game's timer to the sequencer's.
+                let _ = self.respawn.downed_until(self.me, gt + left);
                 self.bcast(Message::Downed {
                     peer: self.me,
                     respawn_ms,
@@ -622,6 +725,7 @@ impl Rules {
 
     /// A session message. Returns false for messages that are not the rules'.
     pub fn on_message(&mut self, from: PeerId, msg: &Message, now: Instant) -> bool {
+        self.now = Some(now);
         if let Message::RulesState(s) = msg {
             self.on_state(from, s, now);
             return true;
@@ -638,7 +742,10 @@ impl Rules {
             Message::Pause { by } => self.on_pause(from, by, now),
             Message::Unpause { by } => self.on_unpause(by),
             Message::UpgradeOpen { round } => self.on_upgrade_open(round),
-            Message::UpgradeDone { peer, round } => self.on_upgrade_done(peer, round),
+            Message::UpgradeDone { peer, round, count } => {
+                self.on_upgrade_done(from, peer, round, count);
+            }
+            Message::UpgradeChoosing { peer, round } => self.on_upgrade_choosing(peer, round),
             Message::Downed { peer, respawn_ms } => self.on_downed(peer, respawn_ms),
             Message::Respawned { peer } => {
                 if self.active && !self.seq() && self.respawn.respawned(peer) {
@@ -677,6 +784,7 @@ impl Rules {
                 | Message::Unpause { .. }
                 | Message::UpgradeOpen { .. }
                 | Message::UpgradeDone { .. }
+                | Message::UpgradeChoosing { .. }
                 | Message::Downed { .. }
                 | Message::Respawned { .. }
                 | Message::GameOver
@@ -689,6 +797,13 @@ impl Rules {
     /// player in it, or `by` is back in the open one.
     fn on_pause(&mut self, from: PeerId, by: PeerId, now: Instant) {
         if !self.active {
+            return;
+        }
+        if self.is_host && self.run_ended() {
+            // This run is over: no round to hold anyone in. The requester's pause is its own.
+            if by != self.me && !self.pause.holds(by) {
+                self.send_to(from, Message::Unpause { by });
+            }
             return;
         }
         if self.is_host && self.upgrade.active().is_some() {
@@ -709,6 +824,16 @@ impl Rules {
     }
 
     fn pause_opened(&mut self, by: PeerId, now: Instant) {
+        if self.quiet.take().is_some() {
+            log::info!("co-op rules: the resume with no count stopped: {by} paused");
+        }
+        if self.count.take().is_some() {
+            log::info!("co-op rules: resume count stopped: {by} paused (hold on)");
+            if self.screen == Screen::Held {
+                // Counting on the held card: to the pause screen.
+                self.to_pause_screen = true;
+            }
+        }
         if self.pause.pause(by) {
             self.pause_since = Some(now);
             log::info!("co-op rules: paused by {by}; everyone is on their pause menu");
@@ -741,6 +866,7 @@ impl Rules {
         if released {
             self.pause_since = None;
             log::info!("co-op rules: {by} resumed, the last one paused; play resumes");
+            self.begin_count("the shared pause ended");
         } else {
             log::info!("co-op rules: {by} resumed; waiting for the others to resume");
         }
@@ -761,21 +887,101 @@ impl Rules {
         self.on_upgrade(ev);
     }
 
-    fn on_upgrade_done(&mut self, peer: PeerId, round: u16) {
+    fn on_upgrade_done(&mut self, from: PeerId, peer: PeerId, round: u16, count: bool) {
         if !self.active {
             return;
         }
-        let round = if self.is_host {
+        if self.is_host {
+            if peer != from {
+                // A player reports only their own pick.
+                log::debug!("co-op rules: {from} reported {peer} done in round {round}; ignored");
+                return;
+            }
             let Some(r) = self.upgrade.resolve_done(round) else {
                 return;
             };
-            self.bcast(Message::UpgradeDone { peer, round: r });
-            r
+            self.host_done(peer, r);
         } else {
-            round
-        };
-        let ev = self.upgrade.done(peer, round);
+            // The host's word on the release's count.
+            self.release_counts = Some(count);
+            let ev = self.take_done(peer, round);
+            self.on_upgrade(ev);
+            self.release_counts = None;
+        }
+    }
+
+    /// `peer` is done with `round`, noting when this game learned of it.
+    fn take_done(&mut self, peer: PeerId, round: u16) -> UpgradeEvent {
+        let now = self.now.unwrap_or_else(Instant::now);
+        if self.upgrade.active() == Some(round) && !self.picks.iter().any(|(p, _)| *p == peer) {
+            self.picks.push((peer, now));
+        }
+        self.upgrade.done(peer, round)
+    }
+
+    /// The longest unbroken wait after a pick in the open round.
+    fn round_waited(&self, now: Instant) -> Duration {
+        self.picks
+            .iter()
+            .map(|(_, t)| now.saturating_duration_since(*t))
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// Host: `peer` is done with `round`: relayed with the count, then taken.
+    fn host_done(&mut self, peer: PeerId, round: u16) {
+        let now = self.now.unwrap_or_else(Instant::now);
+        let waited = self.round_waited(now);
+        let ev = self.take_done(peer, round);
+        let count = matches!(ev, UpgradeEvent::Released(_)) && waited >= UPGRADE_COUNT_AFTER;
+        if let UpgradeEvent::Released(r) = ev {
+            log::info!(
+                "co-op rules: upgrade round {r}: the longest wait after a pick {:.1} s: {}",
+                waited.as_secs_f64(),
+                if count {
+                    "the resume count"
+                } else {
+                    "no count"
+                }
+            );
+        }
+        self.bcast(Message::UpgradeDone { peer, round, count });
+        self.release_counts = Some(count);
         self.on_upgrade(ev);
+        self.release_counts = None;
+    }
+
+    /// `peer` chooses again in `round`. The host relays it while the round is open.
+    fn on_upgrade_choosing(&mut self, peer: PeerId, round: u16) {
+        if !self.active {
+            return;
+        }
+        if self.is_host {
+            if self.upgrade.undone(peer, round) {
+                // A reopened screen ends that player's wait.
+                self.picks.retain(|(p, _)| *p != peer);
+                log::info!(
+                    "co-op rules: {peer} chooses in round {round} after all; the round waits"
+                );
+                self.bcast(Message::UpgradeChoosing { peer, round });
+            } else if peer != self.me && self.upgrade.last_released().is_some_and(|l| round <= l) {
+                // The joining player's Space crossed the round's end: tell it the round ended.
+                log::info!(
+                    "co-op rules: {peer} would choose in round {round}, already released; told so"
+                );
+                self.send_to(
+                    peer,
+                    Message::UpgradeDone {
+                        peer,
+                        round,
+                        count: self.last_release_counted,
+                    },
+                );
+            }
+        } else if peer != self.me && self.upgrade.undone(peer, round) {
+            self.picks.retain(|(p, _)| *p != peer);
+            log::info!("co-op rules: {peer} chooses in round {round} after all; the round waits");
+        }
     }
 
     fn on_upgrade(&mut self, ev: UpgradeEvent) {
@@ -784,9 +990,13 @@ impl Rules {
             match ev {
                 UpgradeEvent::Opened(r) => {
                     log::info!("co-op rules: upgrade round {r} open");
+                    if self.count.take().is_some() {
+                        log::info!("co-op rules: resume count stopped: a new upgrade round");
+                    }
+                    self.quiet = None;
+                    self.picks.clear();
                     self.goto_sent = None;
                     self.owed_since = None;
-                    self.escaped = None;
                     if let Some(p) = self.proposed.take()
                         && self.done_sent == Some(p)
                         && p != r
@@ -797,17 +1007,32 @@ impl Rules {
                         self.send_host(Message::UpgradeDone {
                             peer: self.me,
                             round: r,
+                            count: false,
                         });
                     }
                     return;
                 }
                 UpgradeEvent::Released(r) => {
                     log::info!("co-op rules: upgrade round {r} released");
-                    self.wait_since = None;
                     self.proposed = None;
-                    match self.upgrade.next_queued() {
-                        Some(next) => ev = next,
-                        None => return,
+                    self.picks.clear();
+                    // The host's word. A release without one counts.
+                    let counts = self.release_counts.take().unwrap_or(true);
+                    if self.is_host {
+                        self.last_release_counted = counts;
+                    }
+                    if let Some(next) = self.upgrade.next_queued() {
+                        ev = next;
+                    } else {
+                        // Not for a player still on its own screen.
+                        if self.screen != Screen::Choosing {
+                            if counts {
+                                self.begin_count("the upgrade round ended");
+                            } else {
+                                self.begin_quiet(r);
+                            }
+                        }
+                        return;
                     }
                 }
                 UpgradeEvent::Nothing => return,
@@ -890,30 +1115,64 @@ impl Rules {
     }
 
     fn on_game_over(&mut self) {
+        self.count = None;
+        self.quiet = None;
         if !self.game_over_seen {
             self.game_over_seen = true;
             self.events.push(SessionEvent::AllDown);
         }
         self.force_death = true;
-        if matches!(self.down, Ship::Down { .. } | Ship::Reviving { .. }) {
+        if matches!(self.down, Ship::Down { .. } | Ship::Reviving { .. })
+            || (self.down == Ship::Up && std::mem::take(&mut self.back_untold))
+        {
+            // Back on its own clock but down on the host's count: the host's word holds.
             self.down = Ship::Dying { applied: false };
         }
+        self.leave_rounds();
+    }
+
+    /// The run is over here: it leaves its rounds as a Resume or choice would, holding nobody.
+    fn leave_rounds(&mut self) {
+        if (self.pause.holds(self.me) && !self.close_sent) || self.pause_request.is_some() {
+            log::info!("co-op rules: the run is over here; out of the shared pause");
+            self.local_unpause();
+        }
+        if let Some(r) = self.open_round().filter(|_| self.i_owe()) {
+            log::info!("co-op rules: the run is over here; done with upgrade round {r}");
+            self.local_done(r);
+        }
+    }
+
+    /// The run is over here: this game's game over or the host's.
+    fn run_ended(&self) -> bool {
+        self.game_over_seen || self.respawn.is_game_over()
+    }
+
+    /// The session rules keep this game paused (a pause round, or held for the
+    /// partner's upgrade round). A lifting link-wait freeze leaves it paused.
+    #[must_use]
+    pub fn holds_game(&self) -> bool {
+        self.active
+            && !self.run_ended()
+            && ((self.pause.is_paused() && !self.only_my_close_pending()) || self.hold_for_round())
     }
 
     fn respawned(&mut self, peer: PeerId) {
         if peer == self.me {
+            if std::mem::take(&mut self.back_untold) {
+                log::info!("co-op rules: the host's word on this ship's respawn (back already)");
+                return;
+            }
             if !matches!(self.down, Ship::Down { .. }) {
                 // Up already: a second revive would teleport a flying ship.
                 log::info!("co-op rules: told this ship respawned, but it is not down; ignored");
                 return;
             }
             log::info!("co-op rules: respawning");
-            self.down = Ship::Reviving {
-                pos: None,
-                resolved: false,
-                powers_done: false,
-            };
+            self.down = Ship::Reviving { powers_done: false };
             self.events.push(SessionEvent::Back);
+            // The respawn alert's go, on the returning game only.
+            self.events.push(SessionEvent::CountGo(CountKind::Respawn));
         } else {
             log::info!("co-op rules: {peer} respawned");
             self.events.push(SessionEvent::PartnerBack);
@@ -956,16 +1215,12 @@ impl Rules {
             let Some(r) = self.upgrade.resolve_done(round) else {
                 return;
             };
-            self.bcast(Message::UpgradeDone {
-                peer: self.me,
-                round: r,
-            });
-            let ev = self.upgrade.done(self.me, r);
-            self.on_upgrade(ev);
+            self.host_done(self.me, r);
         } else {
             self.send_host(Message::UpgradeDone {
                 peer: self.me,
                 round,
+                count: false,
             });
         }
     }
@@ -975,7 +1230,7 @@ impl Rules {
     /// The link wait's pause becomes this player's (`crate::wait`): the shared
     /// pause opens. Call after [`Self::peer_joined`].
     pub fn adopt_pause(&mut self, now: Instant) {
-        if !self.active || self.separated || self.i_hold() {
+        if !self.active || self.separated || self.i_hold() || self.run_ended() {
             return;
         }
         log::info!("co-op rules: the link wait's pause becomes the shared pause");
@@ -1030,42 +1285,81 @@ impl Rules {
         if gate_holding {
             return UnpauseCall::Block;
         }
-        if !self.active || self.screen != Screen::Idle {
+        self.now = Some(now);
+        if !self.active || self.screen != Screen::Idle || self.run_ended() {
             return UnpauseCall::Allow;
+        }
+        if self.resuming() {
+            // The count or the quiet resume resumes the game.
+            return UnpauseCall::Block;
         }
         if self.pause.is_paused() || self.pause_request.is_some() {
             if self.i_hold() {
-                // This player's Resume: out of the round; the last one out resumes.
+                // This player's Resume: out of the round. Alone, the last one
+                // out resumes here. Otherwise the count resumes this game.
                 let others = self.others_hold();
                 self.local_unpause();
-                if !others {
+                if !others && self.alone() {
                     return UnpauseCall::Allow;
                 }
             }
             return UnpauseCall::Block;
         }
         if self.hold_for_round() {
-            if self.escape_offered(now) {
-                self.escape(now);
-                return UnpauseCall::Allow;
-            }
+            // Held for the partner's round: it ends when both are done.
             return UnpauseCall::Block;
         }
         UnpauseCall::Allow
     }
 
-    /// `gotoUpgradeDeferred` ran: the upgrade screen (or a chained one) opened.
-    pub fn upgrade_opened(&mut self) {
+    /// The glue lifts `oPowers.playerControl` around `gotoUpgrade` and
+    /// `gotoUpgradeDeferred` while the ship is out of play (down, coming back or
+    /// `Dying`) and the screen is one the rules opened or its chain. Both calls
+    /// refuse while `playerControl` is 0.
+    #[must_use]
+    pub fn lifts_control(&self) -> bool {
+        self.active
+            && !matches!(self.down, Ship::Up)
+            && (matches!(self.screen, Screen::Choosing | Screen::Releasing(_))
+                || self.goto_sent.is_some())
+    }
+
+    /// `gotoUpgradeDeferred` ran: an upgrade screen opened. True for the first
+    /// screen of a round the partner opened here.
+    pub fn upgrade_opened(&mut self) -> bool {
         if !self.active || self.screen == Screen::Choosing {
-            return;
+            return false;
         }
+        let was_held = self.screen == Screen::Held;
         self.screen = Screen::Choosing;
         let expected = self.goto_sent.take().is_some();
-        if expected || self.respawn.is_game_over() {
-            return;
+        let own = std::mem::take(&mut self.choose_own);
+        let start = self
+            .start_screen
+            .take()
+            .is_some_and(|f| self.frame.saturating_sub(f) <= START_SCREEN_FRAMES);
+        if expected {
+            // A screen of the partner's round fades in.
+            return !own && !start;
+        }
+        if self.respawn.is_game_over() {
+            return false;
+        }
+        if !matches!(self.down, Ship::Up) {
+            // A ship out of play opens no round: a screen here is a released card's chain.
+            log::info!("co-op rules: a screen chained here while down; it opens no round");
+            return false;
         }
         if self.upgrade.active().is_some() && self.upgrade.is_waiting_on(self.me) {
-            return; // choosing for the open round
+            return false; // choosing for the open round
+        }
+        if let Some(r) = self.upgrade.active().filter(|_| was_held) {
+            // The upgrade key on the waiting card: its own screen, and the round waits.
+            log::info!(
+                "co-op rules: this player's own screen opened again on the wait; round {r} waits for it"
+            );
+            self.choose_again(r);
+            return false;
         }
         log::info!("co-op rules: the upgrade screen opened here");
         if self.seq() {
@@ -1078,11 +1372,13 @@ impl Rules {
             self.proposed = Some(r);
             self.send_host(Message::UpgradeOpen { round: r });
         }
+        false
     }
 
     /// `leaveUpgradeDeferred` is about to run. Returns true to skip it: the
     /// world stays frozen until the round is released.
     pub fn upgrade_leaving(&mut self, now: Instant) -> bool {
+        self.now = Some(now);
         if !self.active {
             return false;
         }
@@ -1099,8 +1395,12 @@ impl Rules {
         }
         if self.others_choosing() || self.pending_open() {
             self.screen = Screen::Held;
-            self.wait_since = Some(now);
             log::info!("co-op rules: chose; holding the upgrade screen for the partner");
+            true
+        } else if self.resuming() || (!self.alone() && self.open_round().is_some()) {
+            // The last to choose: held on the card until the count ends.
+            self.screen = Screen::Held;
+            log::info!("co-op rules: chose last; held on the card for the resume count");
             true
         } else {
             false
@@ -1108,7 +1408,8 @@ impl Rules {
     }
 
     /// The ship would die now (`checkDestroyPlayer`, no Last Stand left).
-    /// Solo or alone: the game's own death.
+    /// Solo or alone: the game's own death. While the link is lost: a down on
+    /// this game's own timer, or the game over if the partner was down too.
     pub fn death(&mut self, now: Instant) -> Death {
         if !self.active || self.force_death || self.respawn.is_game_over() {
             return Death::Die;
@@ -1117,7 +1418,11 @@ impl Rules {
             return Death::Down;
         }
         if self.alone() {
-            return Death::Die;
+            return if self.partner_away() {
+                self.down_while_away()
+            } else {
+                Death::Die
+            };
         }
         if self.is_host {
             if self.host_downed(self.me, None) == DownOutcome::GameOver {
@@ -1138,18 +1443,38 @@ impl Rules {
         Death::Down
     }
 
+    /// [`death`](Self::death) while the partner's link is lost.
+    fn down_while_away(&mut self) -> Death {
+        if self.partner_down_at_loss {
+            // The partner, down at the loss, stays down: nobody is left standing.
+            log::info!(
+                "co-op rules: this ship is down while the link is lost and the partner is down too: game over (told at the return)"
+            );
+            self.respawn.end();
+            self.over_untold = self.is_host;
+            self.on_game_over();
+            return Death::Die;
+        }
+        let respawn = self.cfg.respawn;
+        log::info!(
+            "co-op rules: this ship is down while the link is lost; respawn in {} s on this game's own timer",
+            respawn.as_secs()
+        );
+        self.down = Ship::Down { reported: None };
+        self.solo_respawn = Some(self.game_time + respawn);
+        self.events.push(SessionEvent::Down);
+        Death::Down
+    }
+
     /// What `oPowers_Step_0` does this frame.
     #[must_use]
     pub fn powers_action(&self) -> PowersAct {
         match self.down {
             Ship::Down { .. } => PowersAct::HoldDown,
-            Ship::Reviving {
-                resolved: true,
-                powers_done: false,
-                ..
-            } => PowersAct::Revive,
-            Ship::Dying { applied: false } => PowersAct::ForceDeath,
-            Ship::Reviving { .. } | Ship::Up | Ship::Dying { applied: true } => PowersAct::None,
+            Ship::Reviving { powers_done: false } => PowersAct::Revive,
+            // Not while its upgrade screen is open or held: `refreshLoadout` gives the hull back.
+            Ship::Dying { applied: false } if self.screen == Screen::Idle => PowersAct::ForceDeath,
+            Ship::Reviving { .. } | Ship::Up | Ship::Dying { .. } => PowersAct::None,
         }
     }
 
@@ -1162,15 +1487,19 @@ impl Rules {
         }
     }
 
+    /// The ship is down and hidden: down, or respawning but not back yet.
+    /// False when up and once the game's own death follows (`Dying`).
+    #[must_use]
+    pub fn ship_hidden(&self) -> bool {
+        matches!(self.down, Ship::Down { .. } | Ship::Reviving { .. })
+    }
+
     /// What `oPlayer_Step_0` does this frame.
     #[must_use]
     pub fn player_action(&self) -> PlayerAct {
         match self.down {
-            Ship::Down { .. }
-            | Ship::Reviving {
-                powers_done: false, ..
-            } => PlayerAct::HoldDown,
-            Ship::Reviving { pos, .. } => PlayerAct::Revive(pos),
+            Ship::Down { .. } | Ship::Reviving { powers_done: false } => PlayerAct::HoldDown,
+            Ship::Reviving { powers_done: true } => PlayerAct::Revive,
             Ship::Up | Ship::Dying { .. } => PlayerAct::None,
         }
     }
@@ -1204,7 +1533,7 @@ impl Rules {
     }
 
     fn open_round(&self) -> Option<u16> {
-        self.upgrade.active().filter(|r| self.escaped != Some(*r))
+        self.upgrade.active()
     }
 
     /// A client's own open not yet numbered by the host.
@@ -1226,42 +1555,199 @@ impl Rules {
         self.screen == Screen::Idle && self.others_choosing() && !self.i_owe()
     }
 
-    fn escape_offered(&self, now: Instant) -> bool {
-        self.cfg.upgrade_wait.is_some_and(|w| {
-            self.wait_since
-                .is_some_and(|t| now.saturating_duration_since(t) >= w)
-        })
-    }
-
-    /// Held on the upgrade screen and Esc would stop waiting (the run tick
-    /// polls the back key then).
-    #[must_use]
-    pub fn held_escape_offered(&self, now: Instant) -> bool {
-        self.screen == Screen::Held && self.others_choosing() && self.escape_offered(now)
-    }
-
-    /// Stop waiting for the partners still choosing: mark them done for this
-    /// round (they keep choosing; their game resumes when they finish).
-    pub fn escape(&mut self, _now: Instant) {
-        let Some(r) = self.open_round() else { return };
-        log::info!("co-op rules: stopped waiting for upgrade round {r}");
-        let waiting: Vec<PeerId> = self
-            .upgrade
-            .waiting_on()
-            .minus(one(self.me))
-            .iter()
-            .collect();
-        for p in waiting {
-            if self.seq() {
-                self.bcast(Message::UpgradeDone { peer: p, round: r });
-                let ev = self.upgrade.done(p, r);
-                self.on_upgrade(ev);
-            } else {
-                self.send_host(Message::UpgradeDone { peer: p, round: r });
-            }
+    /// A round was released here. With the partner, both games count 3, 2, 1,
+    /// the host after half the round trip. Alone or with the run over, the game
+    /// resumes at once.
+    fn begin_count(&mut self, why: &str) {
+        if !self.active || self.alone() || self.run_ended() {
+            self.mod_paused = true;
+            return;
         }
-        self.escaped = Some(r);
-        self.wait_since = None;
+        if self.pause.is_paused() || self.open_round().is_some() {
+            // The other hold goes on: its end counts.
+            log::info!("co-op rules: {why}; the other hold goes on, its end counts");
+            return;
+        }
+        let now = self.now.unwrap_or_else(Instant::now);
+        let lead = if self.is_host {
+            self.rtt / 2
+        } else {
+            Duration::ZERO
+        };
+        log::info!(
+            "co-op rules: resume count: {why}; {} s after a lead of {} ms",
+            RESUME_COUNT.as_secs(),
+            lead.as_millis()
+        );
+        self.count = Some(Countdown::new(now, RESUME_COUNT, lead));
+    }
+
+    /// An upgrade round ended with nobody waiting [`UPGRADE_COUNT_AFTER`]:
+    /// play resumes with no count, the host after half the round trip.
+    fn begin_quiet(&mut self, round: u16) {
+        if !self.active || self.alone() || self.run_ended() {
+            self.mod_paused = true;
+            return;
+        }
+        if self.pause.is_paused() || self.open_round().is_some() {
+            log::info!(
+                "co-op rules: upgrade round {round} ended with no count; the other hold goes on, its end counts"
+            );
+            return;
+        }
+        let now = self.now.unwrap_or_else(Instant::now);
+        let lead = if self.is_host {
+            self.rtt / 2
+        } else {
+            Duration::ZERO
+        };
+        log::info!(
+            "co-op rules: upgrade round {round} ended with nobody waiting {} s: play resumes with no count after a lead of {} ms",
+            UPGRADE_COUNT_AFTER.as_secs(),
+            lead.as_millis()
+        );
+        self.quiet = Some(now + lead);
+    }
+
+    /// The count, or the quiet resume, is on its way.
+    fn resuming(&self) -> bool {
+        self.count.is_some() || self.quiet.is_some()
+    }
+
+    /// The count's numbers and its end.
+    fn count_tick(&mut self, now: Instant) {
+        if self.quiet.is_some_and(|t| now >= t) {
+            self.quiet = None;
+            self.mod_paused = true;
+            log::info!("co-op rules: play resumes with no count");
+            self.events.push(SessionEvent::ResumedNoCount);
+        }
+        let Some(c) = &mut self.count else { return };
+        match c.step(now) {
+            Step::Tick(n) => self
+                .events
+                .push(SessionEvent::CountTick(CountKind::Resume, n)),
+            Step::Go => {
+                self.count = None;
+                // Resumed by the mod, whoever closed last.
+                self.mod_paused = true;
+                log::info!("co-op rules: resume count over: play resumes");
+                self.events.push(SessionEvent::CountGo(CountKind::Resume));
+            }
+            Step::Wait => {}
+        }
+    }
+
+    /// Esc (or the pause key on the held card) while the count runs: the
+    /// count stops and a new shared pause opens with this player in it.
+    pub fn count_hold_on(&mut self, now: Instant) {
+        self.now = Some(now);
+        if self.count.take().is_none() {
+            return;
+        }
+        log::info!("co-op rules: Esc in the resume count: hold on (a new shared pause)");
+        if self.screen == Screen::Held {
+            self.to_pause_screen = true;
+        }
+        self.local_pause(now);
+    }
+
+    /// Time left on this ship's respawn clock (game time).
+    fn my_respawn_left(&self) -> Option<Duration> {
+        let gt = self.game_time;
+        self.respawn
+            .remaining(self.me, gt)
+            .or_else(|| self.solo_respawn.map(|at| at.saturating_sub(gt)))
+    }
+
+    /// The downed player's 3, 2, 1 before its ship's return, on the respawn clock.
+    fn respawn_alert(&mut self) {
+        let n = if matches!(self.down, Ship::Down { .. }) && !self.run_ended() {
+            self.my_respawn_left().and_then(alert_number)
+        } else {
+            None
+        };
+        if n != self.respawn_told {
+            if let Some(n) = n {
+                log::info!("co-op rules: respawn alert: {n}");
+                self.events
+                    .push(SessionEvent::CountTick(CountKind::Respawn, n));
+            }
+            self.respawn_told = n;
+        }
+    }
+
+    /// Held on the pause screen for the partner's round with Ataraxia: Space opens its own.
+    fn ataraxia_held(&self) -> bool {
+        self.ataraxia_round.is_some()
+            && self.ataraxia_round == self.open_round()
+            && self.hold_for_round()
+    }
+
+    /// The start gate asks for this player's own opening screen (`gate::StartAsk`).
+    pub fn start_screen_asked(&mut self) {
+        self.start_screen = Some(self.frame);
+    }
+
+    /// Space on the Ataraxia hold (row 0 "Choose Upgrade"): its own screen opens. True when taken.
+    pub fn choose_own(&mut self) -> bool {
+        if !self.ataraxia_held() || self.choose_own {
+            return false;
+        }
+        let Some(r) = self.open_round() else {
+            return false;
+        };
+        log::info!(
+            "co-op rules: Ataraxia: Space; this player's own upgrade screen opens, round {r} waits for it"
+        );
+        self.choose_own = true;
+        self.choose_again(r);
+        true
+    }
+
+    /// This player chooses again in the open round `r`, which waits for its pick.
+    fn choose_again(&mut self, r: u16) {
+        self.done_sent = None;
+        self.picks.retain(|(p, _)| *p != self.me);
+        let msg = Message::UpgradeChoosing {
+            peer: self.me,
+            round: r,
+        };
+        self.upgrade.undone(self.me, r);
+        if self.seq() {
+            self.bcast(msg);
+        } else {
+            self.send_host(msg);
+        }
+    }
+
+    /// Open the screen [`Self::choose_own`] asked for: out of the pause, then `gotoUpgrade`.
+    fn direct_own(&mut self, o: &Observed, actions: &mut Vec<Action>) {
+        let f = self.frame;
+        if let Some(t) = self.goto_sent {
+            if f.saturating_sub(t) > GOTO_WAIT {
+                log::warn!("co-op rules: Ataraxia: the upgrade screen did not open");
+                self.goto_sent = None;
+                self.choose_own = false;
+            }
+            return;
+        }
+        if self.open_round().is_none() {
+            // The round ended first: nothing to open for.
+            self.choose_own = false;
+            return;
+        }
+        if o.paused {
+            if !o.held && self.press_ok(false) {
+                self.own_unpause = Some(f);
+                actions.push(Action::PressUnpause);
+            }
+            return;
+        }
+        if o.gameplay {
+            self.goto_sent = Some(f);
+            actions.push(Action::GotoUpgrade);
+        }
     }
 
     fn press_ok(&mut self, pause: bool) -> bool {
@@ -1279,11 +1765,15 @@ impl Rules {
     /// One run tick. Returns the game actions, in order (at most one deferred
     /// script call).
     pub fn frame(&mut self, o: &Observed, now: Instant) -> Vec<Action> {
+        self.now = Some(now);
         self.frame += 1;
         let f = self.frame;
         let mut actions = Vec::new();
         // Stated at the game over too (a joining game that missed it).
         self.state_tick();
+        if self.active && (o.game_over || self.run_ended()) {
+            self.leave_rounds();
+        }
         if !self.active || o.game_over {
             self.last_paused = Some(o.paused);
             return actions;
@@ -1319,14 +1809,54 @@ impl Rules {
         if !o.paused && self.own_pause.is_none() {
             self.mod_paused = false;
         }
-        self.downed_tick(o, now);
+        self.downed_tick(now);
+        self.respawn_alert();
+        self.count_tick(now);
         self.xp_tick(o, running, now, &mut actions);
         self.score_tick(o, running, now, &mut actions);
-        self.direct(o, now, &mut actions);
+        self.direct(o, &mut actions);
+        self.ready_cue(o.paused, now);
         actions
     }
 
-    fn downed_tick(&mut self, o: &Observed, now: Instant) {
+    /// This game holds up an open round: on its pause menu, or choosing its upgrade.
+    fn in_round(&self) -> bool {
+        !self.alone()
+            && ((self.pause.is_paused() && self.i_hold())
+                || (self.screen == Screen::Choosing && self.open_round().is_some()))
+    }
+
+    /// [`SessionEvent::PartnerReady`] once as the "ready and waiting" bar starts,
+    /// for a partner ready [`READY_CUE_AFTER`] or more into the round.
+    fn ready_cue(&mut self, paused: bool, now: Instant) {
+        if !self.in_round() {
+            self.round_entered = None;
+            self.partner_ready = false;
+            return;
+        }
+        let entered = *self.round_entered.get_or_insert(now);
+        let f = self.facts(now, paused);
+        let ready = f.pause == Some(SharedPause::PartnerReady)
+            || f.upgrade == Some(UpgradeWait::PartnerReady);
+        if ready && !self.partner_ready {
+            let after = now.saturating_duration_since(entered);
+            if after >= READY_CUE_AFTER {
+                log::info!(
+                    "co-op rules: the partner is ready ({:.1} s into the round): the cue",
+                    after.as_secs_f64()
+                );
+                self.events.push(SessionEvent::PartnerReady);
+            } else {
+                log::info!(
+                    "co-op rules: the partner is ready ({:.1} s into the round): no cue",
+                    after.as_secs_f64()
+                );
+            }
+        }
+        self.partner_ready = ready;
+    }
+
+    fn downed_tick(&mut self, now: Instant) {
         if let Ship::Down { reported: Some(at) } = self.down {
             if self.alone() {
                 // Nobody to confirm: the own timer (the partner left, it did
@@ -1350,18 +1880,24 @@ impl Rules {
                     self.respawned(p);
                 }
             }
+        } else if matches!(self.down, Ship::Down { reported: None })
+            && !self.run_ended()
+            && self
+                .respawn
+                .remaining(self.me, self.game_time)
+                .is_some_and(|left| left.is_zero())
+        {
+            // A joining ship comes back at its confirmed time on its own clock, not at `Respawned`.
+            self.respawn.respawned(self.me);
+            log::info!("co-op rules: this ship's respawn time came on this game's clock");
+            self.respawned(self.me);
+            self.back_untold = true;
         }
         if self.solo_respawn.is_some_and(|at| self.game_time >= at) {
             self.solo_respawn = None;
             if matches!(self.down, Ship::Down { .. }) {
                 self.respawned(self.me);
             }
-        }
-        if let Ship::Reviving { pos, resolved, .. } = &mut self.down
-            && !*resolved
-        {
-            *pos = o.partner.map(respawn_point);
-            *resolved = true;
         }
     }
 
@@ -1462,23 +1998,36 @@ impl Rules {
         (s, w, self.client_score.host())
     }
 
-    fn direct(&mut self, o: &Observed, now: Instant, actions: &mut Vec<Action>) {
-        if self.direct_screen(now, actions) {
+    fn direct(&mut self, o: &Observed, actions: &mut Vec<Action>) {
+        if self.direct_screen(actions) {
             return;
         }
         let f = self.frame;
+        if self.run_ended() {
+            // Everyone is down: out of any pause, since the forced death runs only while
+            // the world does. Not while the session holds the game.
+            if o.paused && !o.held && self.press_ok(false) {
+                self.own_unpause = Some(f);
+                actions.push(Action::PressUnpause);
+            }
+            return;
+        }
         let mine = self.i_hold();
+        if self.choose_own {
+            // This player owes the round again (Space): its screen opens here.
+            self.direct_own(o, actions);
+            return;
+        }
         if let Some(r) = self.open_round().filter(|_| self.i_owe()) {
             self.direct_choose(r, o, mine, actions);
             return;
         }
         let hold_round = self.hold_for_round();
-        if hold_round && self.wait_since.is_none() {
-            self.wait_since = Some(now);
-        }
         // The shared pause holds this game while anyone is on a pause menu,
-        // except while only its own Resume awaits the host's relay.
-        let held = self.pause.is_paused() && !self.only_my_close_pending();
+        // except while only its own Resume awaits the host's relay. A joining
+        // game's own pause on its way to the host holds it too.
+        let held = (self.pause.is_paused() || self.pause_request.is_some())
+            && !self.only_my_close_pending();
         if held || hold_round {
             // Paused in the round (on a menu or held): this game is resumed
             // by the mod at the release, unless its own Resume ends it.
@@ -1489,14 +2038,27 @@ impl Rules {
                 self.mod_paused = true;
                 actions.push(Action::PressPause);
             }
-        } else if o.paused && self.mod_paused && !mine && self.press_ok(false) {
+        } else if self.only_my_close_pending() {
+            // This game's Resume ended the round: it stays on its pause
+            // screen until the relay, and the count after it resumes it.
+            if o.paused {
+                self.mod_paused = true;
+            }
+        } else if o.paused
+            && self.mod_paused
+            && !mine
+            && !o.held
+            && self.count.is_none()
+            && self.press_ok(false)
+        {
+            // Not while the session holds the game (`mod_paused` stays).
             self.own_unpause = Some(f);
             actions.push(Action::PressUnpause);
         }
     }
 
     /// The upgrade screen's own states. True when it decided this frame.
-    fn direct_screen(&mut self, now: Instant, actions: &mut Vec<Action>) -> bool {
+    fn direct_screen(&mut self, actions: &mut Vec<Action>) -> bool {
         let f = self.frame;
         match self.screen {
             Screen::Choosing => {
@@ -1509,10 +2071,12 @@ impl Rules {
                     // announced at a return): this player chose already.
                     self.local_done(r);
                 }
-                if self.others_choosing() || self.pending_open() || self.others_hold() {
-                    if self.wait_since.is_none() {
-                        self.wait_since = Some(now);
-                    }
+                let waits = self.others_choosing()
+                    || self.pending_open()
+                    || self.others_hold()
+                    || self.resuming()
+                    || (!self.alone() && self.open_round().is_some());
+                if !self.run_ended() && waits {
                     if self.to_pause_screen {
                         // The pause key: the card goes; `direct` then holds
                         // this game on its pause screen.
@@ -1525,7 +2089,6 @@ impl Rules {
                     actions.push(Action::ReleaseUpgrade);
                     self.screen = Screen::Releasing(f);
                     self.release_retries = 0;
-                    self.wait_since = None;
                 }
                 self.to_pause_screen = false;
                 true
@@ -1549,22 +2112,30 @@ impl Rules {
         }
     }
 
-    /// A round is open and this player still has to choose.
+    /// A round is open and this player has not chosen. A downed player
+    /// with levels chooses too ([`Self::lifts_control`]).
     fn direct_choose(&mut self, r: u16, o: &Observed, mine: bool, actions: &mut Vec<Action>) {
         let f = self.frame;
-        if self.is_down() {
-            self.local_done(r);
-            return;
-        }
         if self.client_xp.owed() > 0 {
             let since = *self.owed_since.get_or_insert(f);
             if f.saturating_sub(since) < OWED_WAIT {
                 return;
             }
         }
-        let can = o.levelup.is_some_and(|l| l >= 1.0) && self.control != Some(false);
+        // The downed recipe holds `playerControl` at 0: not a reason here.
+        let can =
+            o.levelup.is_some_and(|l| l >= 1.0) && (self.control != Some(false) || self.is_down());
         if !can {
             log::info!("co-op rules: nothing to choose in round {r}; waiting for the partner");
+            self.local_done(r);
+            return;
+        }
+        if o.ataraxia {
+            // Ataraxia: done at once, held on the pause screen ([`Self::choose_own`]).
+            log::info!(
+                "co-op rules: Ataraxia: no upgrade screen for round {r}; waiting for the partner (Space opens this player's own)"
+            );
+            self.ataraxia_round = Some(r);
             self.local_done(r);
             return;
         }
@@ -1579,7 +2150,8 @@ impl Rules {
             return;
         }
         if o.paused {
-            if !mine && self.press_ok(false) {
+            // Not while the session holds the game: the screen opens after.
+            if !mine && !o.held && self.press_ok(false) {
                 self.own_unpause = Some(f);
                 actions.push(Action::PressUnpause);
             }
@@ -1612,18 +2184,15 @@ impl Rules {
             pause,
             ..SessionFacts::default()
         };
-        let long = self.escape_offered(now);
         s.upgrade = match self.screen {
-            Screen::Held if self.others_choosing() || self.pending_open() => Some(if long {
-                UpgradeWait::PartnerChoosingLong
-            } else {
-                UpgradeWait::PartnerChoosing
-            }),
+            Screen::Held if self.others_choosing() || self.pending_open() => {
+                Some(UpgradeWait::PartnerChoosing)
+            }
             Screen::Choosing if self.open_round().is_some() && !self.others_choosing() => {
                 Some(UpgradeWait::PartnerReady)
             }
-            Screen::Idle if self.hold_for_round() => Some(if long {
-                UpgradeWait::HeldPausedLong
+            Screen::Idle if self.hold_for_round() => Some(if self.ataraxia_held() {
+                UpgradeWait::AtaraxiaHeld
             } else {
                 UpgradeWait::HeldPaused
             }),
@@ -1632,10 +2201,32 @@ impl Rules {
             }
             _ => None,
         };
+        if s.upgrade.is_some() {
+            s.upgrade_counts = self.round_waited(now) >= UPGRADE_COUNT_AFTER;
+        }
+        s.count = self.count.as_ref().and_then(|c| {
+            c.number(now).map(|n| CountView {
+                kind: CountKind::Resume,
+                number: n,
+                phase_pm: permille(c.phase(now)),
+            })
+        });
         if self.respawn.is_game_over() {
             return s;
         }
         let gt = self.game_time;
+        if s.count.is_none()
+            && matches!(self.down, Ship::Down { .. })
+            && let Some(left) = self.my_respawn_left()
+            && let Some(n) = alert_number(left)
+        {
+            let into = 1000 - u16::try_from(left.as_millis() % 1000).unwrap_or(0);
+            s.count = Some(CountView {
+                kind: CountKind::Respawn,
+                number: n,
+                phase_pm: into % 1000,
+            });
+        }
         if matches!(self.down, Ship::Down { .. }) {
             let left = self
                 .respawn
@@ -1643,7 +2234,6 @@ impl Rules {
                 .or_else(|| self.solo_respawn.map(|at| at.saturating_sub(gt)))
                 .unwrap_or(self.cfg.respawn);
             s.me_down = Some(ceil_secs(left));
-            s.me_down_alone = self.alone();
         }
         s.partner_down = self
             .respawn
@@ -1792,6 +2382,12 @@ mod tests {
             self.client.peer_joined(HOST, self.t);
             self.deliver();
         }
+
+        /// The resume count runs out: past its end, one frame.
+        fn count_out(&mut self, h: Observed, c: Observed) -> (Vec<Action>, Vec<Action>) {
+            self.later(RESUME_COUNT + Duration::from_millis(50));
+            self.frame(h, c)
+        }
     }
 
     #[test]
@@ -1858,12 +2454,15 @@ mod tests {
         );
         let (h, c) = p.frame(paused(), paused());
         assert!(h.is_empty() && c.is_empty(), "both stay paused");
-        // The host resumes last: its game resumes, the client is resumed.
-        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Allow);
+        // The host resumes last: both count, then both are resumed.
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
         assert!(!p.host.pause.is_paused() && !p.client.pause.is_paused());
-        let (h, c) = p.frame(running(), paused());
-        assert!(h.is_empty(), "the host's own Resume was the last one");
+        assert!(p.host.counting() && p.client.counting());
+        let (h, c) = p.frame(paused(), paused());
+        assert!(h.is_empty() && c.is_empty(), "counting: {h:?} {c:?}");
+        let (h, c) = p.count_out(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
         assert_eq!(c, vec![Action::PressUnpause]);
         let (h, c) = p.frame(running(), running());
         assert!(h.is_empty() && c.is_empty());
@@ -1891,12 +2490,13 @@ mod tests {
             p.client.facts(p.t, true).pause,
             Some(SharedPause::PartnerReady)
         );
-        // The client resumes through its game's own Resume (the flag falls).
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
-        p.frame(paused(), running());
+        // The client resumes last: both count, then both are resumed.
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.frame(paused(), paused());
         assert!(!p.host.pause.is_paused(), "released");
-        let (h, _) = p.frame(paused(), running());
+        let (h, c) = p.count_out(paused(), paused());
         assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     #[test]
@@ -1909,11 +2509,12 @@ mod tests {
         assert_eq!(p.client.pause.holders().len(), 2);
         assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
-        p.frame(paused(), running());
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.frame(paused(), paused());
         assert!(!p.host.pause.is_paused() && !p.client.pause.is_paused());
-        let (h, _) = p.frame(paused(), running());
+        let (h, c) = p.count_out(paused(), paused());
         assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     #[test]
@@ -1958,7 +2559,8 @@ mod tests {
         }
         assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
+        // Blocked: the round's end counts down first.
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
         let in_flight = p.client.take_outs();
         assert!(p.client.close_sent && !in_flight.is_empty());
         in_flight
@@ -1972,6 +2574,14 @@ mod tests {
         }
     }
 
+    fn to_client(p: &mut Pair, outs: Vec<Out>) {
+        for o in outs {
+            if let Out::Broadcast(m) | Out::Send(_, m) = o {
+                p.client.on_message(HOST, &m, p.t);
+            }
+        }
+    }
+
     /// The joining game resuming last is not paused again while its Resume
     /// waits for the host's relay.
     #[test]
@@ -1979,53 +2589,48 @@ mod tests {
         let mut p = Pair::new(cfg());
         let in_flight = client_resumes_last(&mut p);
         for _ in 0..5 {
-            let c = p.client.frame(&running(), p.t);
-            assert!(!c.contains(&Action::PressPause), "paused again: {c:?}");
+            let c = p.client.frame(&paused(), p.t);
+            assert!(c.is_empty(), "nothing before the relay: {c:?}");
         }
-        // The relay: nothing changes here; the host's game resumes.
+        // The relay: both count, then both are resumed.
         to_host(&mut p, in_flight);
         p.deliver();
         assert!(!p.client.close_sent);
         assert!(!p.client.pause.is_paused() && !p.host.pause.is_paused());
-        let c = p.client.frame(&running(), p.t);
+        let c = p.client.frame(&paused(), p.t);
         assert!(c.is_empty(), "{c:?}");
-        let h = p.host.frame(&paused(), p.t);
+        let (h, c) = p.count_out(paused(), paused());
         assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     #[test]
     fn the_hosts_player_pausing_again_while_the_clients_resume_is_in_flight_pauses_the_client() {
         let mut p = Pair::new(cfg());
         let in_flight = client_resumes_last(&mut p);
-        assert!(
-            !p.client
-                .frame(&running(), p.t)
-                .contains(&Action::PressPause)
-        );
-        // The host takes the client's Resume, resumes and pauses again.
+        assert!(p.client.frame(&paused(), p.t).is_empty());
+        // The host takes the client's Resume, then Esc in the count: both reach it in order.
         to_host(&mut p, in_flight);
         let h = p.host.frame(&paused(), p.t);
-        assert_eq!(h, vec![Action::PressUnpause]);
-        p.host.frame(&running(), p.t);
-        p.host.frame(&paused(), p.t);
-        assert!(p.host.pause.holds(HOST));
+        assert!(h.is_empty() && p.host.counting(), "{h:?}");
+        p.host.count_hold_on(p.t);
+        assert!(p.host.pause.holds(HOST) && !p.host.counting());
         p.deliver();
-        // A new round: everyone is in it (each game shows its pause menu).
+        // A new round with everyone in it, the client's count stopped.
         assert!(p.client.pause.holds(HOST) && p.client.pause.holds(CLIENT));
-        assert!(!p.client.close_sent);
-        let c = p.client.frame(&running(), p.t);
-        assert_eq!(
-            c,
-            vec![Action::PressPause],
-            "the new round pauses the client"
-        );
+        assert!(!p.client.close_sent && !p.client.counting());
+        let c = p.client.frame(&paused(), p.t);
+        assert!(c.is_empty(), "the new round holds the client: {c:?}");
+        let (h, c) = p.count_out(paused(), paused());
+        assert!(h.is_empty() && c.is_empty(), "held: {h:?} {c:?}");
         // The host's pause arrives with the client's Resume unanswered: held.
         let mut q = Pair::new(cfg());
         let in_flight = client_resumes_last(&mut q);
         q.client.on_message(HOST, &Message::Pause { by: HOST }, q.t);
         assert!(q.client.pause.holds(HOST) && q.client.close_sent);
-        let c = q.client.frame(&running(), q.t);
-        assert_eq!(c, vec![Action::PressPause]);
+        let c = q.client.frame(&paused(), q.t);
+        assert!(c.is_empty(), "held: {c:?}");
+        assert!(q.client.pause.is_paused());
         to_host(&mut q, in_flight);
     }
 
@@ -2141,11 +2746,16 @@ mod tests {
             p.client.facts(p.t, true).pause,
             Some(SharedPause::PartnerReady)
         );
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
-        p.frame(paused(), running());
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.frame(paused(), paused());
         assert!(!p.host.pause.is_paused());
-        let (h, _) = p.frame(paused(), running());
+        assert!(
+            p.host.counting() && p.client.counting(),
+            "the last hold's end"
+        );
+        let (h, c) = p.count_out(paused(), paused());
         assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     #[test]
@@ -2170,6 +2780,46 @@ mod tests {
         p.frame(paused(), running());
         assert_eq!(p.host.pause.paused_by(), None);
         assert!(p.client.frame(&running(), p.t).is_empty());
+    }
+
+    /// Draft's opening: the partner's round and the gate's ask in one frame give
+    /// the client its own screen in either order. Alone, a partner's round fades in.
+    #[test]
+    fn the_start_gates_own_screen_does_not_fade_in_whatever_the_order() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        let (_, c) = p.frame(running(), running());
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        p.client.start_screen_asked();
+        assert!(
+            !p.client.upgrade_opened(),
+            "the client's own opening screen: no fade"
+        );
+        let mut q = Pair::new(cfg());
+        q.frame(running(), running());
+        q.host.upgrade_opened();
+        q.deliver();
+        let (_, c) = q.frame(running(), running());
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        assert!(
+            q.client.upgrade_opened(),
+            "the partner's round alone fades in"
+        );
+        // An ask whose screen never came does not outlive its frames.
+        let mut r = Pair::new(cfg());
+        r.frame(running(), running());
+        r.client.start_screen_asked();
+        run_frames(
+            &mut r,
+            usize::try_from(START_SCREEN_FRAMES).unwrap_or(20) + 2,
+        );
+        r.host.upgrade_opened();
+        r.deliver();
+        let (_, c) = r.frame(running(), running());
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        assert!(r.client.upgrade_opened(), "a later round's screen fades in");
     }
 
     /// Host opens; the client is forced in; host finishes first and waits.
@@ -2200,16 +2850,22 @@ mod tests {
         );
         let (h, _) = p.frame(running(), running());
         assert!(h.is_empty(), "still held");
-        // The client chooses: not held, the round releases, the host leaves.
-        assert!(!p.client.upgrade_leaving(p.t));
+        p.later(UPGRADE_COUNT_AFTER);
+        // The client chooses last: both count on their cards, then leave.
+        assert!(p.client.upgrade_leaving(p.t), "held for the count");
         p.deliver();
         assert_eq!(p.host.upgrade.last_released(), Some(1));
-        let (h, _) = p.frame(running(), running());
+        assert!(p.host.counting() && p.client.counting());
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "counting: {h:?} {c:?}");
+        let (h, c) = p.count_out(running(), running());
         assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
         assert!(
             !p.host.upgrade_leaving(p.t),
             "the host's release goes through"
         );
+        assert!(!p.client.upgrade_leaving(p.t));
         assert_eq!(p.host.facts(p.t, false).upgrade, None);
         let (h, c) = p.frame(running(), running());
         assert!(h.is_empty() && c.is_empty());
@@ -2236,9 +2892,10 @@ mod tests {
         assert_eq!(h, vec![Action::GotoUpgrade]);
         assert!(c.is_empty(), "still held");
         p.host.upgrade_opened();
-        assert!(!p.host.upgrade_leaving(p.t));
+        assert!(p.host.upgrade_leaving(p.t), "the last choice: the count");
         p.deliver();
-        let (_, c) = p.frame(running(), running());
+        let (h, c) = p.count_out(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
         assert_eq!(c, vec![Action::ReleaseUpgrade]);
     }
 
@@ -2272,52 +2929,66 @@ mod tests {
             None,
             "the hold is not a shared pause"
         );
-        // After the wait, Esc plays on without the host.
+        // However long the wait, Resume is blocked until the host picks.
         p.later(Duration::from_secs(61));
+        p.frame(running(), held);
         assert_eq!(
             p.client.facts(p.t, true).upgrade,
-            Some(UpgradeWait::HeldPausedLong)
+            Some(UpgradeWait::HeldPaused)
         );
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
         assert!(
-            !p.host.upgrade.is_waiting_on(HOST),
-            "the host was marked done"
+            p.host.upgrade.is_waiting_on(HOST),
+            "nobody marks the host done"
         );
-        // The host is still on its screen; when it finishes it is not held.
         p.host.upgrade_opened();
-        assert!(!p.host.upgrade_leaving(p.t));
+        assert!(p.host.upgrade_leaving(p.t), "the last pick: the count");
+        assert_eq!(p.host.upgrade.active(), None);
     }
 
+    /// The held card stays after 61 s: the round waits for the partner's pick.
     #[test]
-    fn held_upgrade_screen_offers_esc_after_the_wait() {
+    fn the_held_card_waits_however_long() {
         let mut p = Pair::new(cfg());
         p.host.upgrade_opened();
         p.deliver();
         assert!(p.host.upgrade_leaving(p.t));
-        assert!(!p.host.held_escape_offered(p.t));
         p.later(Duration::from_secs(61));
-        assert!(p.host.held_escape_offered(p.t));
         assert_eq!(
             p.host.facts(p.t, false).upgrade,
-            Some(UpgradeWait::PartnerChoosingLong)
+            Some(UpgradeWait::PartnerChoosing)
         );
-        p.host.escape(p.t);
-        p.deliver();
         let (h, _) = p.frame(running(), running());
-        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert!(h.is_empty(), "the card stays: {h:?}");
+        assert!(p.host.upgrade.is_waiting_on(CLIENT));
+        assert!(p.host.held_on_card());
+    }
+
+    /// The host takes a pick only from the player who made it.
+    #[test]
+    fn nobody_marks_the_partner_done() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        let r = p.host.upgrade.active().unwrap();
+        let msg = Message::UpgradeDone {
+            peer: HOST,
+            round: r,
+            count: false,
+        };
+        assert!(p.host.on_message(CLIENT, &msg, p.t));
+        assert!(p.host.upgrade.is_waiting_on(HOST), "ignored");
+        assert_eq!(p.host.upgrade.active(), Some(r));
     }
 
     /// On the held card the pause key moves the game to its pause screen,
-    /// with any wait setting.
+    /// the round holding the game there (the partner idling, or only its pause menu).
     #[test]
     fn held_on_the_card_the_pause_key_waits_on_the_pause_screen() {
-        let never = RulesSettings {
-            upgrade_wait: None,
-            ..cfg()
-        };
-        // The partner idles on its upgrade screen; the wait is "never".
-        let mut p = Pair::new(never);
+        // The partner idles on its upgrade screen.
+        let mut p = Pair::new(cfg());
         p.frame(running(), running());
         p.host.upgrade_opened();
         p.deliver();
@@ -2335,7 +3006,6 @@ mod tests {
         assert!(p.client.upgrade_leaving(p.t), "held for the host");
         p.later(Duration::from_secs(600));
         p.frame(running(), running());
-        assert!(!p.client.held_escape_offered(p.t));
         assert_eq!(p.client.pause_request(true), PauseCall::Skip, "focus loss");
         assert!(!p.client.to_pause_screen);
         // The key: the card goes, the round holds the client paused.
@@ -2360,39 +3030,22 @@ mod tests {
         assert_eq!(p.host.pause.paused_by(), None);
         assert_eq!(p.client.pause.paused_by(), None);
         assert_eq!(p.host.screen, Screen::Choosing);
-        // Resume and Esc are held there (no wait set).
+        // Resume and Esc are held there, however long.
         p.later(Duration::from_secs(600));
         assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
-        // The host chooses: the client's game resumes with the round.
-        assert!(!p.host.upgrade_leaving(p.t));
+        // The host chooses last: both count, then both go.
+        assert!(p.host.upgrade_leaving(p.t));
         p.deliver();
-        let (_, c) = p.frame(running(), paused());
+        let (h, c) = p.frame(running(), paused());
+        assert!(h.is_empty() && c.is_empty(), "counting: {h:?} {c:?}");
+        let (h, c) = p.count_out(running(), paused());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
         assert_eq!(c, vec![Action::PressUnpause]);
+    }
 
-        // With the default wait, Play On (Esc) is offered there after it.
-        let mut p = Pair::new(cfg());
-        p.frame(running(), running());
-        p.host.upgrade_opened();
-        p.deliver();
-        p.frame(running(), running());
-        p.client.upgrade_opened();
-        assert!(p.client.upgrade_leaving(p.t));
-        p.client.pause_key_on_card();
-        p.frame(running(), running());
-        assert!(!p.client.upgrade_leaving(p.t));
-        p.frame(running(), running());
-        p.frame(running(), paused());
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
-        p.later(Duration::from_secs(61));
-        p.frame(running(), paused());
-        assert_eq!(
-            p.client.facts(p.t, true).upgrade,
-            Some(UpgradeWait::HeldPausedLong)
-        );
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
-
-        // Held only by the partner's pause menu: the key moves the client to
-        // the shared pause's screen.
+    /// The host chose last and holds on in the count: both cards go to the pause screens.
+    #[test]
+    fn esc_in_the_count_on_the_card_takes_both_to_the_pause_screen() {
         let mut p = Pair::new(cfg());
         p.frame(running(), running());
         p.host.upgrade_opened();
@@ -2401,15 +3054,22 @@ mod tests {
         p.client.upgrade_opened();
         assert!(p.client.upgrade_leaving(p.t));
         p.deliver();
-        // The host chooses and pauses before the client's card is released.
+        p.later(UPGRADE_COUNT_AFTER);
+        // The host chooses last and holds on in the count before the client's card goes.
+        assert!(p.host.upgrade_leaving(p.t), "held for the count");
+        p.deliver();
+        assert!(p.host.counting_on_card() && p.client.counting());
+        p.host.count_hold_on(p.t);
+        assert!(!p.host.counting() && p.host.pause.holds(HOST));
+        assert_eq!(p.host.frame(&running(), p.t), vec![Action::ReleaseUpgrade]);
         assert!(!p.host.upgrade_leaving(p.t));
+        assert_eq!(p.host.frame(&running(), p.t), vec![Action::PressPause]);
         p.host.frame(&paused(), p.t);
         p.deliver();
-        p.later(Duration::from_secs(600));
-        p.frame(paused(), running());
-        assert_eq!(p.client.screen, Screen::Held);
-        assert!(!p.client.held_escape_offered(p.t));
-        p.client.pause_key_on_card();
+        assert!(
+            !p.client.counting(),
+            "the client's count stopped at the host's pause"
+        );
         let (_, c) = p.frame(paused(), running());
         assert_eq!(c, vec![Action::ReleaseUpgrade]);
         assert!(!p.client.upgrade_leaving(p.t));
@@ -2558,10 +3218,10 @@ mod tests {
         // The client's player resumes (held), then the host's: both run.
         assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Allow);
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        let (h, c) = p.frame(running(), paused());
-        assert!(h.is_empty());
+        let (h, c) = p.count_out(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
         assert_eq!(c, vec![Action::PressUnpause]);
         assert!(!p.host.pause.is_paused() && !p.client.pause.is_paused());
     }
@@ -2623,9 +3283,13 @@ mod tests {
             !p.host.upgrade.is_waiting_on(CLIENT),
             "the held client answered"
         );
-        assert!(!p.host.upgrade_leaving(p.t), "the host is not held");
+        p.later(UPGRADE_COUNT_AFTER);
+        assert!(p.host.upgrade_leaving(p.t), "held for the count only");
         p.deliver();
-        let (_, c) = p.frame(running(), running());
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "counting: {h:?} {c:?}");
+        let (h, c) = p.count_out(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
         assert_eq!(c, vec![Action::ReleaseUpgrade]);
     }
 
@@ -2675,9 +3339,10 @@ mod tests {
             "the client waits for the host"
         );
         p.deliver();
-        assert!(!p.host.upgrade_leaving(p.t));
+        assert!(p.host.upgrade_leaving(p.t), "the last choice: the count");
         p.deliver();
-        let (_, c) = p.frame(running(), running());
+        let (h, c) = p.count_out(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
         assert_eq!(c, vec![Action::ReleaseUpgrade]);
     }
 
@@ -2740,10 +3405,11 @@ mod tests {
         // The host resumes: held until the joining player does.
         assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        let (h, _) = p.frame(paused(), running());
+        let (h, c) = p.count_out(paused(), paused());
         assert_eq!(h, vec![Action::PressUnpause], "both resumed: play on");
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     /// The same round after a long cut, the joining player resuming last
@@ -2764,17 +3430,18 @@ mod tests {
         }
         assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
         p.deliver();
-        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
         let in_flight = p.client.take_outs();
         for _ in 0..5 {
-            let c = p.client.frame(&running(), p.t);
-            assert!(!c.contains(&Action::PressPause), "paused again: {c:?}");
+            let c = p.client.frame(&paused(), p.t);
+            assert!(c.is_empty(), "nothing before the relay: {c:?}");
         }
         to_host(&mut p, in_flight);
         p.deliver();
-        let h = p.host.frame(&paused(), p.t);
-        assert_eq!(h, vec![Action::PressUnpause]);
         assert!(!p.client.pause.is_paused() && !p.client.close_sent);
+        let (h, c) = p.count_out(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
     }
 
     /// Both players resume at once: both resume, neither is paused again.
@@ -2803,17 +3470,18 @@ mod tests {
         }
         assert!(p.client.close_sent && p.client.pause.holders() == one(CLIENT));
         let c = p.client.frame(&paused(), p.t);
-        assert_eq!(c, vec![Action::PressUnpause], "the client resumes");
-        let c = p.client.frame(&running(), p.t);
-        assert!(!c.contains(&Action::PressPause), "{c:?}");
-        // The client's reaches the host: released there; its relay changes
-        // nothing.
+        assert!(c.is_empty(), "the client waits for the relay: {c:?}");
+        // The client's reaches the host: both count, then both resume.
         to_host(&mut p, client_outs);
         let h = p.host.frame(&paused(), p.t);
-        assert_eq!(h, vec![Action::PressUnpause]);
+        assert!(h.is_empty(), "counting: {h:?}");
         p.deliver();
-        let c = p.client.frame(&running(), p.t);
-        assert!(c.is_empty(), "{c:?}");
+        assert!(p.host.counting() && p.client.counting());
+        let (h, c) = p.count_out(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "{h:?} {c:?}");
         assert!(!p.client.pause.is_paused() && !p.host.pause.is_paused());
     }
 
@@ -2837,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn client_goes_down_and_respawns_next_to_the_host() {
+    fn client_goes_down_and_flies_back_in() {
         let mut p = Pair::new(cfg());
         run_frames(&mut p, 2);
         assert_eq!(p.client.death(p.t), Death::Down);
@@ -2855,21 +3523,18 @@ mod tests {
             p.frame(paused(), paused());
         }
         assert!(p.client.is_down());
-        let host_pos = Observed {
-            partner: Some((500.0, 300.0, 4.0, 0.0)),
-            ..running()
-        };
         for _ in 0..602 {
-            p.frame(running(), host_pos);
+            p.frame(running(), running());
         }
         assert_eq!(p.client.powers_action(), PowersAct::Revive);
-        p.client.powers_applied();
-        let act = p.client.player_action();
-        assert!(
-            matches!(act, PlayerAct::Revive(Some((x, y)))
-                if (x - (500.0 - RESPAWN_OFFSET)).abs() < 1e-6 && (y - 300.0).abs() < 1e-6),
-            "{act:?}"
+        assert_eq!(
+            p.client.player_action(),
+            PlayerAct::HoldDown,
+            "oPowers first"
         );
+        p.client.powers_applied();
+        // The game's own fly-in, wherever the partner is.
+        assert_eq!(p.client.player_action(), PlayerAct::Revive);
         p.client.player_applied();
         assert!(!p.client.is_down());
         assert!(p.client.take_events().contains(&SessionEvent::Back));
@@ -2897,28 +3562,348 @@ mod tests {
         assert_eq!(p.client.facts(p.t, false).me_down, None);
     }
 
+    /// A downed player with levels chooses in the partner's round, with none
+    /// waits on the pause screen, and never opens a round itself.
     #[test]
-    fn host_down_while_client_alive_and_downed_player_skips_rounds() {
+    fn a_downed_player_chooses_in_the_partners_round() {
         let mut p = Pair::new(cfg());
         run_frames(&mut p, 2);
         assert_eq!(p.host.death(p.t), Death::Down);
         p.deliver();
+        p.host.set_control(Some(false)); // the downed recipe holds it at 0
         assert!(p.client.respawn.is_down(HOST));
-        // The client opens a round: the downed host reports done and waits.
-        p.client.upgrade_opened();
+        assert!(!p.host.lifts_control(), "nothing of its own to open");
+        // The client opens a round: the downed host's screen opens too.
+        assert!(!p.client.upgrade_opened(), "the opener's own screen");
         p.deliver();
         let (h, _) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::GotoUpgrade]);
+        assert!(p.host.lifts_control(), "around the forced opening");
+        assert!(p.host.upgrade_opened(), "opened by the partner's round");
+        assert!(p.host.lifts_control(), "and its chained screens");
+        assert!(p.host.upgrade.is_waiting_on(HOST), "waited for like anyone");
+        // The client picks first: held for the downed host.
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        let (_, c) = p.frame(running(), running());
+        assert!(c.is_empty(), "still held: {c:?}");
+        // The host picks last: both count on their cards, then leave.
+        assert!(p.host.upgrade_leaving(p.t), "held for the count");
+        p.deliver();
+        assert!(!p.host.lifts_control(), "on the held card");
+        let (h, c) = p.count_out(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        assert!(!p.host.upgrade_leaving(p.t));
+        assert!(!p.host.lifts_control());
+        // Nothing to choose while down: done at once, held on the pause screen.
+        let none = Observed {
+            levelup: Some(0.0),
+            ..running()
+        };
+        assert!(!p.client.upgrade_leaving(p.t));
+        p.client.upgrade_opened();
+        p.deliver();
+        let (h, _) = p.frame(none, running());
         assert!(h.is_empty());
         assert!(
             !p.host.upgrade.is_waiting_on(HOST),
-            "a downed player is not waited for"
+            "nothing to choose: not waited for"
         );
-        let (h, _) = p.frame(running(), running());
+        let (h, _) = p.frame(none, running());
         assert_eq!(h, vec![Action::PressPause], "held on the pause screen");
     }
 
+    /// Two levels to take.
+    fn two() -> Observed {
+        Observed {
+            levelup: Some(2.0),
+            ..running()
+        }
+    }
+
+    /// One side down (the host when `host_down`) on the other's round's screen, two levels.
+    fn side(p: &mut Pair, host: bool) -> &mut Rules {
+        if host { &mut p.host } else { &mut p.client }
+    }
+
+    fn down_on_the_partners_screen(c: RulesSettings, host_down: bool) -> Pair {
+        let mut p = Pair::new(c);
+        run_frames(&mut p, 2);
+        let t = p.t;
+        assert_eq!(side(&mut p, host_down).death(t), Death::Down);
+        side(&mut p, host_down).set_control(Some(false));
+        p.deliver();
+        assert!(
+            !side(&mut p, !host_down).upgrade_opened(),
+            "the opener's own screen"
+        );
+        p.deliver();
+        let (h, c) = if host_down {
+            p.frame(two(), running())
+        } else {
+            p.frame(running(), two())
+        };
+        assert_eq!(if host_down { h } else { c }, vec![Action::GotoUpgrade]);
+        let down = side(&mut p, host_down);
+        assert!(down.lifts_control(), "around the forced opening");
+        assert!(down.upgrade_opened(), "opened by the partner's round");
+        assert!(down.lifts_control(), "its chained screens");
+        p
+    }
+
+    /// A game over with a downed player on its partner's round's screen: the
+    /// chain keeps its lift, its end holds nothing and the forced death follows.
     #[test]
-    fn last_partner_gone_while_down_respawns_on_our_own_timer() {
+    fn a_game_over_on_a_downed_players_screen_lets_its_chain_through() {
+        let mut p = down_on_the_partners_screen(cfg(), true);
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        p.frame(two(), running());
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.host.respawn.is_game_over(), "everyone down");
+        assert!(p.host.upgrade_choosing(), "still on its first screen");
+        assert!(p.host.lifts_control(), "the game's chain goes through");
+        assert_eq!(
+            p.host.powers_action(),
+            PowersAct::None,
+            "no forced death under the screen (a pick's refreshLoadout gives the hull back)"
+        );
+        // The chain ends (the last level, or Esc): nothing holds it.
+        assert!(!p.host.upgrade_leaving(p.t), "not held");
+        assert!(!p.host.frozen_unseen());
+        assert!(!p.host.lifts_control());
+        assert_eq!(p.host.powers_action(), PowersAct::ForceDeath, "now it goes");
+        p.host.powers_applied();
+        let (h, _) = p.frame(running(), running());
+        assert!(h.is_empty(), "nothing to release or open: {h:?}");
+        assert_eq!(
+            p.host.death(p.t),
+            Death::Die,
+            "the game's death and end screen"
+        );
+    }
+
+    /// The other exits for a downed player on its screen (the partner leaving,
+    /// the link lost): the chain keeps its lift, and leaving holds nothing.
+    #[test]
+    fn every_exit_of_the_round_keeps_a_downed_players_chain() {
+        for interrupted in [false, true] {
+            let mut p = down_on_the_partners_screen(cfg(), true);
+            p.drop_outs();
+            p.host.peer_left(CLIENT, interrupted, p.t);
+            assert!(
+                p.host.lifts_control(),
+                "the partner gone (interrupted {interrupted})"
+            );
+            assert!(!p.host.upgrade_leaving(p.t), "nothing to wait for");
+            assert!(p.host.frame(&running(), p.t).is_empty());
+        }
+    }
+
+    /// A downed player's held card released with levels left: lifted, no round.
+    #[test]
+    fn a_downed_players_released_card_chains_without_a_round() {
+        let mut p = down_on_the_partners_screen(cfg(), true);
+        assert!(p.host.upgrade_leaving(p.t), "held for the partner");
+        assert!(!p.host.lifts_control(), "not on the card");
+        p.deliver();
+        assert!(p.client.upgrade_leaving(p.t), "the last choice: the count");
+        p.deliver();
+        let (h, c) = p.count_out(two(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        assert!(!p.client.upgrade_leaving(p.t));
+        assert!(p.host.lifts_control(), "the release's chain");
+        assert!(!p.host.upgrade_opened(), "no round of its own");
+        p.deliver();
+        assert!(p.host.upgrade.active().is_none() && p.client.upgrade.active().is_none());
+        assert!(!p.host.upgrade_leaving(p.t), "nothing to wait for");
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "{h:?} {c:?}");
+    }
+
+    /// The held card is the one hold the game cannot see. The pause-screen holds are real.
+    #[test]
+    fn the_held_card_is_frozen_where_the_game_cannot_tell() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(
+            !p.host.frozen_unseen() && !p.client.frozen_unseen(),
+            "choosing"
+        );
+        assert!(p.host.upgrade_leaving(p.t));
+        assert!(p.host.frozen_unseen(), "held on the card");
+        p.deliver();
+        assert!(p.client.upgrade_leaving(p.t), "the last choice: the count");
+        assert!(p.client.frozen_unseen(), "held on the card for the count");
+        p.deliver();
+        let (h, c) = p.count_out(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        assert!(p.host.frozen_unseen(), "until the game has left the card");
+        assert!(!p.host.upgrade_leaving(p.t));
+        assert!(!p.client.upgrade_leaving(p.t));
+        assert!(!p.host.frozen_unseen() && !p.client.frozen_unseen());
+        // Nothing to choose: held on the pause screen, the game's own pause.
+        p.host.upgrade_opened();
+        p.deliver();
+        let none = Observed {
+            levelup: Some(0.0),
+            ..running()
+        };
+        p.frame(running(), none);
+        p.frame(running(), none);
+        assert_eq!(
+            p.client.facts(p.t, true).upgrade,
+            Some(UpgradeWait::HeldPaused)
+        );
+        assert!(!p.client.frozen_unseen());
+    }
+
+    fn cues(r: &mut Rules) -> usize {
+        r.take_events()
+            .iter()
+            .filter(|e| **e == SessionEvent::PartnerReady)
+            .count()
+    }
+
+    /// One cue as the bar starts, only for a partner ready a second into the round.
+    #[test]
+    fn the_partner_ready_cue_sounds_once_and_not_for_an_instant_done() {
+        // Upgrade round: the client picks 3 s in, and the host hears it once.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        p.frame(running(), running());
+        p.later(Duration::from_secs(3));
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        let mut n = 0;
+        for _ in 0..5 {
+            p.frame(running(), running());
+            n += cues(&mut p.host);
+            assert_eq!(cues(&mut p.client), 0, "the held one hears nothing");
+        }
+        assert_eq!(n, 1);
+        assert_eq!(
+            p.host.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerReady)
+        );
+        // Nothing to choose on the client: done at once, no cue.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        let none = Observed {
+            levelup: Some(0.0),
+            ..running()
+        };
+        let mut n = 0;
+        for _ in 0..5 {
+            p.frame(running(), none);
+            n += cues(&mut p.host);
+        }
+        assert_eq!(
+            p.host.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerReady)
+        );
+        assert_eq!(n, 0, "an instant done rings nothing");
+        // Shared pause: the client resumes 2 s in, and the host hears it.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        p.later(Duration::from_secs(2));
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        let mut n = 0;
+        for _ in 0..3 {
+            p.frame(paused(), paused());
+            n += cues(&mut p.host);
+            assert_eq!(cues(&mut p.client), 0);
+        }
+        assert_eq!(n, 1);
+        // ... and not when it resumes at once.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        p.later(Duration::from_millis(400));
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        let mut n = 0;
+        for _ in 0..3 {
+            p.frame(paused(), paused());
+            n += cues(&mut p.host);
+        }
+        assert_eq!(
+            p.host.facts(p.t, true).pause,
+            Some(SharedPause::PartnerReady)
+        );
+        assert_eq!(n, 0);
+    }
+
+    /// When the host's rules ask for the partner-ready sound: the client's Resume 2 s
+    /// into a shared pause, the host's Resume and Esc in the count, the client's after `again`.
+    fn ready_twice_on_the_pause_path(again: Duration) -> Vec<Instant> {
+        let mut p = Pair::new(cfg());
+        let mut asks = Vec::new();
+        let frames = |p: &mut Pair, asks: &mut Vec<Instant>| {
+            for _ in 0..3 {
+                p.frame(paused(), paused());
+                for _ in 0..cues(&mut p.host) {
+                    asks.push(p.t);
+                }
+            }
+        };
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        p.later(Duration::from_secs(2));
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        frames(&mut p, &mut asks);
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        p.frame(paused(), paused());
+        assert!(p.host.counting());
+        p.host.count_hold_on(p.t);
+        p.deliver();
+        frames(&mut p, &mut asks);
+        p.later(again);
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        frames(&mut p, &mut asks);
+        asks
+    }
+
+    /// The partner-ready sound is held back for `READY_SOUND_HOLD_OFF` after it
+    /// played: two Readies 1.2 s apart give one sound, 6 s apart two.
+    #[test]
+    fn the_pause_paths_ready_sound_is_held_off_after_it_played() {
+        use crate::ui::cues::ReadyHoldOff;
+        let rang = |asks: &[Instant]| {
+            let mut h = ReadyHoldOff::default();
+            asks.iter().filter(|&&t| h.ask(t).is_ok()).count()
+        };
+        let quick = ready_twice_on_the_pause_path(Duration::from_millis(1200));
+        assert_eq!(quick.len(), 2, "the rules ask twice: {quick:?}");
+        assert_eq!(rang(&quick), 1, "one sound");
+        let apart = ready_twice_on_the_pause_path(Duration::from_secs(6));
+        assert_eq!(apart.len(), 2);
+        assert_eq!(rang(&apart), 2, "two sounds");
+    }
+
+    #[test]
+    fn last_partner_gone_while_down_respawns_on_its_own_timer() {
         let mut p = Pair::new(cfg());
         run_frames(&mut p, 2);
         assert_eq!(p.client.death(p.t), Death::Down);
@@ -2929,14 +3914,384 @@ mod tests {
             p.client.frame(&running(), p.t);
         }
         assert_eq!(p.client.powers_action(), PowersAct::Revive);
-        // Alone, a death is a death.
         p.client.powers_applied();
         p.client.player_applied();
+        // Still waiting for the host: a death is a down.
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.client.take_events();
+        // The host gone for good: alone, a death is a death.
+        p.client.peer_left(HOST, false, p.t);
+        for _ in 0..602 {
+            p.client.frame(&running(), p.t);
+        }
+        p.client.powers_applied();
+        p.client.player_applied();
+        assert!(
+            !p.client.is_down(),
+            "a down when the wait became final respawns"
+        );
         assert_eq!(p.client.death(p.t), Death::Die);
     }
 
-    /// A down unconfirmed across a link wait hands the time left to the host
-    /// and revives once; the host never has it down while it flies.
+    /// The link is lost on the host's side only (the joining game is frozen).
+    fn host_waits(p: &mut Pair) {
+        p.drop_outs();
+        p.host.peer_left(CLIENT, true, p.t);
+        p.client.peer_left(HOST, true, p.t);
+        p.drop_outs();
+    }
+
+    /// The host dies while playing on in a link wait: a down on its own timer.
+    /// The joining game hears the time left at the return. The host respawns once.
+    #[test]
+    fn a_host_death_during_a_link_wait_is_a_down_told_at_the_return() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        assert_eq!(p.host.death(p.t), Death::Down, "not the run's end");
+        assert_eq!(p.host.take_events(), vec![SessionEvent::Down]);
+        assert!(p.host.take_outs().is_empty(), "nothing sent while apart");
+        assert_eq!(p.host.facts(p.t, false).me_down, Some(10));
+        // 3 s of play on, then the return (the client was frozen).
+        for _ in 0..180 {
+            p.host.frame(&running(), p.t);
+        }
+        p.back();
+        assert!(p.client.take_events().contains(&SessionEvent::PartnerDown));
+        let left = p
+            .client
+            .respawn
+            .remaining(HOST, p.client.game_time)
+            .unwrap();
+        assert!(
+            (Duration::from_secs(6)..=Duration::from_secs(7)).contains(&left),
+            "the time left: {left:?}"
+        );
+        let mut revives = 0;
+        for _ in 0..600 {
+            p.frame(running(), running());
+            if p.host.powers_action() == PowersAct::Revive {
+                revives += 1;
+                p.host.powers_applied();
+                p.host.player_applied();
+            }
+        }
+        assert_eq!(revives, 1);
+        assert!(!p.host.is_down() && !p.client.respawn.is_down(HOST));
+        assert!(p.client.take_events().contains(&SessionEvent::PartnerBack));
+        assert!(!p.host.respawn.is_game_over() && !p.client.respawn.is_game_over());
+    }
+
+    /// Down in the wait, then the partner dies after the return: game over on both.
+    #[test]
+    fn down_in_a_wait_then_the_partner_down_after_it_is_the_game_over() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        assert_eq!(p.host.death(p.t), Death::Down);
+        p.back();
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.host.respawn.is_game_over());
+        assert!(p.client.take_events().contains(&SessionEvent::AllDown));
+        assert_eq!(p.host.powers_action(), PowersAct::ForceDeath);
+    }
+
+    /// The partner was down when the link went: a host death in the wait is the
+    /// game's own death, and the joining game hears of it at the return.
+    #[test]
+    fn both_down_across_a_wait_is_the_game_over_told_at_the_return() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        host_waits(&mut p);
+        assert_eq!(p.host.death(p.t), Death::Die);
+        assert!(p.host.respawn.is_game_over());
+        assert!(p.host.take_outs().is_empty());
+        p.back();
+        assert!(p.client.respawn.is_game_over(), "told at the return");
+        assert!(p.client.take_events().contains(&SessionEvent::AllDown));
+        assert_eq!(p.client.powers_action(), PowersAct::ForceDeath);
+    }
+
+    /// Both ships down, in either order: game over. The host's ship leaves "down
+    /// and hidden" as the game over is known, before the forced death.
+    #[test]
+    fn a_game_over_ends_the_hidden_state_before_the_forced_death() {
+        // The host first, then the joining ship.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert!(!p.host.ship_hidden());
+        assert_eq!(p.host.death(p.t), Death::Down);
+        assert!(p.host.ship_hidden(), "down: hidden");
+        p.deliver();
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.host.respawn.is_game_over());
+        assert!(!p.host.ship_hidden(), "the game's own death follows");
+        assert_eq!(p.host.powers_action(), PowersAct::ForceDeath);
+        // The joining ship first, then the host.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.client.ship_hidden());
+        assert_eq!(p.host.death(p.t), Death::Die);
+        assert!(!p.host.ship_hidden());
+        p.deliver();
+        assert!(!p.client.ship_hidden(), "the game's own death follows");
+        assert_eq!(p.client.powers_action(), PowersAct::ForceDeath);
+    }
+
+    /// The respawn: hidden until the ship's own revive step is applied.
+    /// After a wait that became final the next death is the game's own.
+    #[test]
+    fn the_respawn_ends_the_hidden_state() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.host.death(p.t), Death::Down);
+        let mut seen = false;
+        for _ in 0..600 {
+            p.frame(running(), running());
+            if p.host.powers_action() == PowersAct::Revive {
+                assert!(p.host.ship_hidden(), "respawning: still hidden");
+                p.host.powers_applied();
+                p.host.player_applied();
+                seen = true;
+            }
+        }
+        assert!(seen);
+        assert!(!p.host.ship_hidden(), "back: not hidden");
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        assert_eq!(p.host.death(p.t), Death::Down);
+        p.host.peer_left(CLIENT, false, p.t);
+        for _ in 0..602 {
+            p.host.frame(&running(), p.t);
+        }
+        assert_eq!(p.host.powers_action(), PowersAct::Revive);
+        p.host.powers_applied();
+        p.host.player_applied();
+        assert!(!p.host.ship_hidden());
+        assert_eq!(p.host.death(p.t), Death::Die);
+        assert!(!p.host.ship_hidden(), "the game's own death");
+    }
+
+    /// The partner leaves for good in the wait while the host is down on its own
+    /// timer: nothing is held, and the next death is the game's own.
+    #[test]
+    fn a_wait_that_becomes_final_holds_nothing_in_the_rules() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        assert_eq!(p.host.death(p.t), Death::Down);
+        p.host.peer_left(CLIENT, false, p.t);
+        assert!(p.host.separated());
+        for _ in 0..602 {
+            p.host.frame(&running(), p.t);
+        }
+        assert_eq!(p.host.powers_action(), PowersAct::Revive);
+        p.host.powers_applied();
+        p.host.player_applied();
+        assert_eq!(p.host.death(p.t), Death::Die, "solo now: the run ends");
+    }
+
+    /// The joining game restarted and linked again while the host waited: its
+    /// `RunLeft` drops it, and no shared pause or upgrade round waits for it.
+    #[test]
+    fn a_partner_back_without_the_run_holds_no_pause_or_round() {
+        // The pause: the host on its menu through the wait and the return.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        p.host.frame(&paused(), p.t);
+        p.host.peer_joined(CLIENT, p.t);
+        p.drop_outs();
+        assert_eq!(
+            p.host.unpause_request(false, p.t),
+            UnpauseCall::Block,
+            "the pause again with the client in it"
+        );
+        p.host.peer_left(CLIENT, false, p.t);
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Allow);
+        // The round: the host's screen opened after the return, its pick.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        host_waits(&mut p);
+        p.host.peer_joined(CLIENT, p.t);
+        p.drop_outs();
+        let _ = p.host.upgrade_opened();
+        assert!(
+            p.host.upgrade.active().is_some() && p.host.upgrade.is_waiting_on(CLIENT),
+            "the round waits for the client"
+        );
+        p.host.peer_left(CLIENT, false, p.t);
+        assert!(!p.host.upgrade_leaving(p.t), "nobody to hold the card for");
+        p.host.frame(&running(), p.t);
+        assert!(!p.host.frozen_unseen() && !p.host.upgrade_choosing());
+    }
+
+    /// With the partner gone from the run or the session, a host death ends the run.
+    #[test]
+    fn a_death_after_a_real_departure_is_the_games_own() {
+        for interrupted_first in [false, true] {
+            let mut p = Pair::new(cfg());
+            run_frames(&mut p, 2);
+            if interrupted_first {
+                host_waits(&mut p);
+            }
+            p.host.peer_left(CLIENT, false, p.t);
+            assert_eq!(p.host.death(p.t), Death::Die, "{interrupted_first}");
+        }
+    }
+
+    /// A held round ends while the session holds the game: the rules unpause after.
+    #[test]
+    fn the_rules_never_unpause_a_game_the_session_holds() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        // The host pauses: the client is held paused by the rules.
+        p.frame(paused(), running());
+        let (_, c) = p.frame(paused(), running());
+        assert_eq!(c, vec![Action::PressPause]);
+        let (_, c) = p.frame(paused(), paused());
+        assert!(c.is_empty());
+        // The client resumes while the host stays on the menu: held.
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        let (_, c) = p.frame(paused(), paused());
+        assert!(c.is_empty());
+        // The host leaves the run: the round is released on the client.
+        p.client.peer_left(HOST, false, p.t);
+        let held = Observed {
+            held: true,
+            ..paused()
+        };
+        for _ in 0..60 {
+            let c = p.client.frame(&held, p.t);
+            assert!(!c.contains(&Action::PressUnpause), "{c:?}");
+        }
+        let c = p.client.frame(&paused(), p.t);
+        assert_eq!(c, vec![Action::PressUnpause], "once the hold lets go");
+    }
+
+    /// The host's round announced at the return unpauses the joining game after the hold.
+    #[test]
+    fn the_round_announced_at_the_return_waits_for_the_hold() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.timed_out();
+        let held = Observed {
+            held: true,
+            ..paused()
+        };
+        p.client.note_own(true);
+        for _ in 0..30 {
+            let c = p.client.frame(&held, p.t);
+            assert!(c.is_empty(), "in the wait: {c:?}");
+            p.host.frame(&running(), p.t);
+        }
+        p.host.upgrade_opened();
+        p.back();
+        let mut seen = Vec::new();
+        for _ in 0..90 {
+            seen.extend(p.client.frame(&held, p.t));
+            p.deliver();
+        }
+        assert!(!seen.contains(&Action::PressUnpause), "{seen:?}");
+        // The hold lets go: the rules unpause to open the screen.
+        let c = p.client.frame(&paused(), p.t);
+        assert_eq!(c, vec![Action::PressUnpause]);
+        p.lossy = true;
+    }
+
+    /// Both down across a long wait that becomes the shared pause: the host's end
+    /// screen is not held, and the joining game is unpaused for its forced death.
+    #[test]
+    fn told_game_over_behind_an_adopted_pause_reaches_the_death() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        host_waits(&mut p);
+        p.client.note_own(true);
+        p.client.frame(&paused(), p.t);
+        assert_eq!(p.host.death(p.t), Death::Die);
+        let over = Observed {
+            game_over: true,
+            ..running()
+        };
+        p.host.frame(&over, p.t);
+        p.later(Duration::from_secs(14));
+        // The return: the rules first, then the long freeze adopted.
+        p.host.peer_joined(CLIENT, p.t);
+        p.client.peer_joined(HOST, p.t);
+        p.client.adopt_pause(p.t);
+        p.deliver();
+        assert!(p.client.respawn.is_game_over(), "told at the return");
+        let mut acts = Vec::new();
+        for _ in 0..120 {
+            p.later(Duration::from_millis(17));
+            p.host.frame(&over, p.t);
+            acts.extend(p.client.frame(&paused(), p.t));
+            p.deliver();
+        }
+        assert!(!p.host.pause.holds(HOST), "the host holds nobody");
+        assert!(acts.contains(&Action::PressUnpause), "{acts:?}");
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Allow);
+        p.client.frame(&running(), p.t);
+        assert_eq!(p.client.powers_action(), PowersAct::ForceDeath);
+        p.lossy = true;
+    }
+
+    /// The same with the pause adopted first. A game whose run is over releases a held card.
+    #[test]
+    fn a_game_over_releases_pause_and_held_card() {
+        // Pause first: the client is on its menu in a shared round.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        p.frame(paused(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        // The host's game over arrives with the client on the pause menu.
+        assert!(p.client.holding_pause());
+        p.host.respawn.end();
+        p.host.on_game_over();
+        p.host.bcast(Message::GameOver);
+        p.deliver();
+        let over = Observed {
+            game_over: true,
+            ..running()
+        };
+        let mut acts = Vec::new();
+        for _ in 0..60 {
+            p.host.frame(&over, p.t);
+            acts.extend(p.client.frame(&paused(), p.t));
+            p.deliver();
+        }
+        assert!(!p.client.pause.is_paused() || !p.client.pause.holds(HOST));
+        assert!(acts.contains(&Action::PressUnpause), "{acts:?}");
+        // A held card is released, whatever the partner still chooses.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        p.client.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        assert!(p.host.upgrade_opened());
+        assert!(p.client.upgrade_leaving(p.t), "held after choosing");
+        p.deliver();
+        p.client.respawn.end();
+        p.client.on_game_over();
+        let c = p.client.frame(&running(), p.t);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        p.lossy = true;
+    }
+
+    /// A down unconfirmed across a link wait hands its time to the host and revives once.
     #[test]
     fn a_down_unconfirmed_across_a_link_wait_revives_once_on_the_time_left() {
         let mut p = Pair::new(cfg());
@@ -2983,7 +4338,6 @@ mod tests {
             host_down_at.is_some_and(|f| f <= 310),
             "back on the time left: {host_down_at:?}"
         );
-        // The host going down now is not a game over.
         assert_eq!(p.host.death(p.t), Death::Down);
     }
 
@@ -3011,8 +4365,7 @@ mod tests {
         );
     }
 
-    /// Never linked (a solo game with the mod installed): the game's own
-    /// death, every time.
+    /// Never linked (solo with the mod installed): the game's own death every time.
     #[test]
     fn a_solo_game_dies_as_the_game_does() {
         let mut r = Rules::new(cfg());
@@ -3115,16 +4468,847 @@ mod tests {
         assert!(p.host.active(), "and the rules start again at once");
     }
 
+    /// A joining ship flies back in on its own clock, with no second revive at `Respawned`.
     #[test]
-    fn respawn_point_is_behind_the_partner() {
-        // Past the edge: left as it is (the game wraps the ship).
-        let (x, y) = respawn_point((50.0, 400.0, 10.0, 0.0));
-        assert!((x - (50.0 - RESPAWN_OFFSET)).abs() < 1e-6);
-        assert!((y - 400.0).abs() < 1e-6);
-        let (x, _) = respawn_point((500.0, 400.0, 0.0, 0.0));
+    fn a_joining_ship_comes_back_on_its_own_clock() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        let _ = p.client.take_events();
+        let mut late = Vec::new();
+        let mut n = 0;
+        while p.client.powers_action() != PowersAct::Revive {
+            p.host.frame(&running(), p.t);
+            p.client.frame(&running(), p.t);
+            // The host's words are late. The client's reach it.
+            late.extend(p.host.take_outs());
+            for o in p.client.take_outs() {
+                if let Out::Broadcast(m) | Out::Send(_, m) = o {
+                    p.host.on_message(CLIENT, &m, p.t);
+                }
+            }
+            n += 1;
+            assert!(n < 3000, "never back");
+        }
+        let ev = p.client.take_events();
+        assert!(ev.contains(&SessionEvent::Back), "{ev:?}");
+        assert!(ev.contains(&SessionEvent::CountGo(CountKind::Respawn)));
+        p.client.powers_applied();
+        assert_eq!(p.client.player_action(), PlayerAct::Revive);
+        p.client.player_applied();
+        assert!(!p.client.is_down());
+        // The host's word arrives: nothing more happens to the ship.
+        for o in late {
+            if let Out::Broadcast(m) | Out::Send(_, m) = o {
+                p.client.on_message(HOST, &m, p.t);
+            }
+        }
+        assert!(!p.client.is_down());
+        assert_eq!(p.client.player_action(), PlayerAct::None);
+        assert!(!p.client.take_events().contains(&SessionEvent::Back));
+    }
+
+    /// The host goes down while the joining ship is up only on its own clock: game over on both.
+    #[test]
+    fn a_game_over_in_the_link_delay_after_the_clients_own_clock_ends_its_run() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        let mut n = 0;
+        while p.client.powers_action() != PowersAct::Revive {
+            // The client's clock a frame ahead: the host's due is not yet.
+            p.client.frame(&running(), p.t);
+            p.client.take_outs();
+            if p.client.powers_action() == PowersAct::Revive {
+                break;
+            }
+            p.host.frame(&running(), p.t);
+            p.host.take_outs();
+            n += 1;
+            assert!(n < 3000, "never back");
+        }
+        p.client.powers_applied();
+        p.client.player_applied();
+        assert!(!p.client.is_down());
         assert!(
-            (x - (500.0 - RESPAWN_OFFSET)).abs() < 1e-6,
-            "still: to the left"
+            p.host.respawn.is_down(CLIENT),
+            "not yet on the host's count"
         );
+        assert_eq!(p.host.death(p.t), Death::Die, "everyone down there");
+        p.deliver();
+        assert_eq!(p.client.powers_action(), PowersAct::ForceDeath);
+        assert_eq!(p.client.death(p.t), Death::Die);
+    }
+
+    /// The host's own ship flies back in too (on its own clock).
+    #[test]
+    fn the_host_flies_back_in() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.host.death(p.t), Death::Down);
+        p.deliver();
+        let mut n = 0;
+        while p.host.powers_action() != PowersAct::Revive {
+            p.frame(running(), running());
+            n += 1;
+            assert!(n < 3000, "never back");
+        }
+        p.host.powers_applied();
+        assert_eq!(p.host.player_action(), PlayerAct::Revive);
+        p.host.player_applied();
+        assert!(!p.host.is_down());
+        assert!(p.client.take_events().contains(&SessionEvent::PartnerBack));
+    }
+
+    // ---- the counts and Ataraxia ----------------------------------------------
+
+    /// Both games in the resume count after a shared pause the client resumed last.
+    fn counting_pair() -> Pair {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        for _ in 0..PRESS_EVERY * 2 {
+            p.frame(paused(), paused());
+        }
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        let (h, c) = p.frame(paused(), paused());
+        assert!(h.is_empty() && c.is_empty(), "{h:?} {c:?}");
+        assert!(p.host.counting() && p.client.counting());
+        p.host.take_events();
+        p.client.take_events();
+        p
+    }
+
+    fn count_events(r: &mut Rules, kind: CountKind) -> (Vec<u8>, bool) {
+        let mut ticks = Vec::new();
+        let mut go = false;
+        for e in r.take_events() {
+            match e {
+                SessionEvent::CountTick(k, n) if k == kind => ticks.push(n),
+                SessionEvent::CountGo(k) if k == kind => go = true,
+                _ => {}
+            }
+        }
+        (ticks, go)
+    }
+
+    /// The round's end counts 3, 2, 1 on both games, and both leave it in the same frame.
+    #[test]
+    fn the_resume_count_leaves_both_games_in_the_same_frame_at_a_link_delay() {
+        let one_way = Duration::from_millis(85);
+        let mut p = Pair::new(cfg());
+        p.host.set_rtt(2 * one_way);
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        // The client's Resume reaches the host, its relay the client one way later.
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        let outs = p.client.take_outs();
+        to_host(&mut p, outs);
+        assert!(p.host.counting() && !p.client.counting());
+        let relay = p.host.take_outs();
+        p.later(one_way);
+        for o in relay {
+            if let Out::Broadcast(m) | Out::Send(_, m) = o {
+                p.client.on_message(HOST, &m, p.t);
+            }
+        }
+        assert!(p.client.counting());
+        p.host.take_events();
+        p.client.take_events();
+        let (mut ticks, mut go) = ((Vec::new(), Vec::new()), (None, None));
+        for i in 0..240u32 {
+            let (h, c) = p.frame(paused(), paused());
+            let (hf, cf) = (p.host.facts(p.t, true), p.client.facts(p.t, true));
+            assert_eq!(
+                hf.count.map(|v| v.number),
+                cf.count.map(|v| v.number),
+                "frame {i}"
+            );
+            let (th, gh) = count_events(&mut p.host, CountKind::Resume);
+            let (tc, gc) = count_events(&mut p.client, CountKind::Resume);
+            assert_eq!(th, tc, "the same tick in the same frame ({i})");
+            ticks.0.extend(th);
+            ticks.1.extend(tc);
+            if gh {
+                assert_eq!(h, vec![Action::PressUnpause]);
+                go.0 = Some(i);
+            }
+            if gc {
+                assert_eq!(c, vec![Action::PressUnpause]);
+                go.1 = Some(i);
+            }
+            p.later(FRAME);
+        }
+        assert_eq!(ticks.0, vec![3, 2, 1]);
+        assert_eq!(ticks.1, vec![3, 2, 1]);
+        assert!(go.0.is_some() && go.0 == go.1, "{go:?}");
+        // About 3 s of 60 frames, from the relay.
+        assert!(go.0.is_some_and(|f| (178..=182).contains(&f)), "{go:?}");
+    }
+
+    /// Esc in the count stops it on both and opens a new pause. A Resume in it changes nothing.
+    #[test]
+    fn esc_in_the_resume_count_holds_on() {
+        let mut p = counting_pair();
+        p.later(Duration::from_secs(1));
+        p.frame(paused(), paused());
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        assert!(p.client.counting(), "a Resume in the count changes nothing");
+        assert_eq!(
+            p.client.facts(p.t, true).count.map(|c| (c.kind, c.number)),
+            Some((CountKind::Resume, 2))
+        );
+        p.client.count_hold_on(p.t);
+        assert!(!p.client.counting());
+        p.frame(paused(), paused());
+        assert!(
+            !p.host.counting(),
+            "the host's count stopped at the client's pause"
+        );
+        assert!(p.host.pause.holds(HOST) && p.host.pause.holds(CLIENT));
+        assert!(p.client.pause.holds(HOST) && p.client.pause.holds(CLIENT));
+        let (h, c) = p.count_out(paused(), paused());
+        assert!(h.is_empty() && c.is_empty(), "held: {h:?} {c:?}");
+        assert_eq!(p.host.facts(p.t, true).count, None);
+        assert_eq!(p.host.facts(p.t, true).pause, Some(SharedPause::BothPaused));
+        let (_, go) = count_events(&mut p.host, CountKind::Resume);
+        assert!(!go, "no go for a count held on");
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.frame(paused(), paused());
+        assert!(p.host.counting() && p.client.counting());
+        let (h, c) = p.count_out(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
+    }
+
+    /// A link lost in the count lets it run out under the wait's hold. A joining
+    /// game whose Resume was lost resumes at once, with no count.
+    #[test]
+    fn a_link_lost_in_the_resume_count_lets_it_run_out_under_the_wait() {
+        let mut p = counting_pair();
+        p.timed_out();
+        assert!(p.host.counting() && p.client.counting());
+        let held = Observed {
+            held: true,
+            ..paused()
+        };
+        let (h, c) = p.count_out(held, held);
+        assert!(h.is_empty() && c.is_empty(), "the wait holds: {h:?} {c:?}");
+        let (h, c) = p.frame(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause]);
+        assert_eq!(c, vec![Action::PressUnpause]);
+
+        let mut p = Pair::new(cfg());
+        let _lost = client_resumes_last(&mut p);
+        p.timed_out();
+        assert!(!p.client.counting(), "alone: no count");
+        let c = p.client.frame(&paused(), p.t);
+        assert_eq!(c, vec![Action::PressUnpause]);
+    }
+
+    /// A down during the count changes nothing. A game over ends it with no go.
+    #[test]
+    fn a_down_in_the_resume_count_keeps_it_and_a_game_over_ends_it() {
+        let mut p = counting_pair();
+        assert_eq!(p.host.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.host.counting() && p.client.counting(), "a down");
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        assert!(p.host.respawn.is_game_over() && p.client.game_over_seen);
+        assert!(!p.host.counting() && !p.client.counting());
+        let (h, c) = p.frame(paused(), paused());
+        assert_eq!(h, vec![Action::PressUnpause], "to the game's end screen");
+        assert_eq!(c, vec![Action::PressUnpause]);
+        let (h, c) = p.count_out(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "{h:?} {c:?}");
+        assert!(!count_events(&mut p.host, CountKind::Resume).1);
+        assert!(!count_events(&mut p.client, CountKind::Resume).1);
+    }
+
+    /// The upgrade round's count runs on both cards. The pause key on a card stops it.
+    #[test]
+    fn the_upgrade_rounds_end_counts_on_both_cards() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(p.host.upgrade_leaving(p.t));
+        p.deliver();
+        p.later(UPGRADE_COUNT_AFTER);
+        assert!(p.client.upgrade_leaving(p.t), "the last choice: held");
+        p.deliver();
+        assert!(p.host.counting_on_card() && p.client.counting_on_card());
+        assert!(p.client.frozen_unseen(), "the world stays frozen");
+        p.later(Duration::from_millis(1500));
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty());
+        assert_eq!(p.client.facts(p.t, false).count.map(|c| c.number), Some(2));
+        // The client's pause key on the card: both on their pause screens.
+        p.client.count_hold_on(p.t);
+        p.deliver();
+        let (h, c) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        assert!(!p.host.upgrade_leaving(p.t) && !p.client.upgrade_leaving(p.t));
+        let (h, c) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::PressPause]);
+        assert_eq!(c, vec![Action::PressPause]);
+        assert!(!p.host.counting() && p.host.pause.holds(CLIENT));
+    }
+
+    /// The respawn alert follows the respawn clock: a pause or a link wait
+    /// holds the number. It runs on the downed game only, with one go.
+    #[test]
+    fn the_respawn_alert_counts_the_last_seconds_on_the_downed_game_only() {
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.deliver();
+        p.host.take_events();
+        p.client.take_events();
+        let held = Observed {
+            held: true,
+            ..paused()
+        };
+        let mut alerts = Vec::new();
+        let mut goes = Vec::new();
+        let mut run = 0u32;
+        while p.client.is_down() && run < 700 {
+            // At 8 s of the 10 (the alert shows 2): a pause, then a link wait.
+            if run == 480 {
+                // A shared pause: on the menus, both resume, the count.
+                for _ in 0..300 {
+                    p.frame(paused(), paused());
+                }
+                assert_eq!(
+                    p.client.facts(p.t, true).count.map(|c| (c.kind, c.number)),
+                    Some((CountKind::Respawn, 2))
+                );
+                assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+                p.deliver();
+                assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+                let mut n = 0;
+                loop {
+                    let (h, _) = p.frame(paused(), paused());
+                    p.later(FRAME);
+                    n += 1;
+                    if h.contains(&Action::PressUnpause) {
+                        break;
+                    }
+                    assert!(n < 400, "the count never ended");
+                }
+                // A link wait (the session's hold).
+                for _ in 0..300 {
+                    p.frame(held, held);
+                }
+                assert_eq!(
+                    count_events(&mut p.client, CountKind::Respawn).0,
+                    Vec::<u8>::new(),
+                    "the clock is held"
+                );
+                assert_eq!(
+                    p.client.facts(p.t, true).count.map(|c| (c.kind, c.number)),
+                    Some((CountKind::Respawn, 2))
+                );
+            }
+            p.frame(running(), running());
+            run += 1;
+            let (ticks, go) = count_events(&mut p.client, CountKind::Respawn);
+            for n in ticks {
+                alerts.push((n, run));
+            }
+            if go {
+                goes.push(run);
+            }
+            assert_eq!(
+                count_events(&mut p.host, CountKind::Respawn),
+                (Vec::new(), false),
+                "nothing on the partner's game"
+            );
+            if p.client.powers_action() == PowersAct::Revive {
+                p.client.powers_applied();
+                p.client.player_applied();
+            }
+        }
+        assert!(!p.client.is_down(), "back");
+        let at: Vec<u8> = alerts.iter().map(|a| a.0).collect();
+        assert_eq!(at, vec![3, 2, 1]);
+        // A second apart, from 3 s before the return (frames of game time).
+        assert!((419..=422).contains(&alerts[0].1), "{alerts:?}");
+        assert!((479..=482).contains(&alerts[1].1), "{alerts:?}");
+        assert!((539..=542).contains(&alerts[2].1), "{alerts:?}");
+        assert_eq!(goes.len(), 1, "one go: {goes:?}");
+        assert!(
+            goes[0] >= alerts[2].1,
+            "the go after the 1: {goes:?} {alerts:?}"
+        );
+        for _ in 0..120 {
+            p.frame(running(), running());
+        }
+        assert_eq!(
+            count_events(&mut p.client, CountKind::Respawn),
+            (Vec::new(), false)
+        );
+        assert_eq!(p.host.facts(p.t, false).count, None);
+    }
+
+    fn ataraxia(o: Observed) -> Observed {
+        Observed {
+            ataraxia: true,
+            ..o
+        }
+    }
+
+    /// The host's round open, the client (with Ataraxia) on its waiting screen.
+    fn ataraxia_held_pair(c: RulesSettings) -> Pair {
+        let mut p = Pair::new(c);
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert!(c.is_empty(), "no upgrade screen: {c:?}");
+        assert!(!p.host.upgrade.is_waiting_on(CLIENT), "done at once");
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert_eq!(c, vec![Action::PressPause], "the waiting screen");
+        let (_, c) = p.frame(running(), ataraxia(paused()));
+        assert!(c.is_empty(), "{c:?}");
+        assert_eq!(
+            p.client.facts(p.t, true).upgrade,
+            Some(UpgradeWait::AtaraxiaHeld)
+        );
+        p
+    }
+
+    /// The host picks first, the client `wait` later: both on their cards at the last pick.
+    fn round_picked_after(wait: Duration) -> Pair {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(p.host.upgrade_leaving(p.t), "the host's pick: held");
+        p.deliver();
+        p.frame(running(), running());
+        p.later(wait);
+        p.frame(running(), running());
+        assert!(p.client.upgrade_leaving(p.t), "the last pick: held");
+        p.deliver();
+        p
+    }
+
+    /// Nobody waited `UPGRADE_COUNT_AFTER`: both leave their cards with no count or go sound.
+    fn resumes_with_no_count(p: &mut Pair) {
+        assert!(!p.host.counting() && !p.client.counting());
+        let (h, c) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        for r in [&mut p.host, &mut p.client] {
+            let ev = r.take_events();
+            assert!(ev.contains(&SessionEvent::ResumedNoCount), "{ev:?}");
+            assert!(
+                !ev.iter()
+                    .any(|e| matches!(e, SessionEvent::CountTick(..) | SessionEvent::CountGo(_))),
+                "{ev:?}"
+            );
+        }
+    }
+
+    /// The resume count after an upgrade round runs only when a player has
+    /// waited `UPGRADE_COUNT_AFTER` after picking when the last pick comes.
+    #[test]
+    fn the_rounds_end_counts_only_after_a_wait_of_8_s() {
+        // Both pick promptly: no count.
+        let mut p = round_picked_after(Duration::from_secs(2));
+        resumes_with_no_count(&mut p);
+        let mut p = round_picked_after(Duration::from_millis(7900));
+        assert!(!p.host.facts(p.t, false).upgrade_counts);
+        resumes_with_no_count(&mut p);
+        // 8.0 s and more: the count, on both.
+        for wait in [UPGRADE_COUNT_AFTER, Duration::from_secs(25)] {
+            let mut p = round_picked_after(wait);
+            assert!(p.host.counting() && p.client.counting(), "{wait:?}");
+            let (h, c) = p.frame(running(), running());
+            assert!(h.is_empty() && c.is_empty(), "counting: {h:?} {c:?}");
+            let (h, c) = p.count_out(running(), running());
+            assert_eq!(h, vec![Action::ReleaseUpgrade]);
+            assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        }
+    }
+
+    /// The host's `count` in the relay counts, not the joining game's clock.
+    /// With no count the host waits half the round trip.
+    #[test]
+    fn the_joining_game_takes_the_hosts_word_on_the_count() {
+        // The host's relay says "count" though the client saw a short wait.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(p.host.upgrade_leaving(p.t));
+        let held = p.host.take_outs();
+        p.later(UPGRADE_COUNT_AFTER);
+        to_client(&mut p, held);
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        assert!(p.host.counting() && p.client.counting(), "the host's word");
+        // No count, a round trip of 170 ms: the host leaves its card 85 ms
+        // after the release, the joining game at the relay.
+        let mut p = Pair::new(cfg());
+        p.host.set_rtt(Duration::from_millis(170));
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        assert!(
+            p.host.upgrade_leaving(p.t),
+            "the host's last pick: held for its lead"
+        );
+        p.deliver();
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty(), "the lead: {h:?}");
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        p.later(Duration::from_millis(85));
+        let (h, _) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+    }
+
+    /// Reopening the screen (Ataraxia's Space) takes the pick out and restarts its wait.
+    #[test]
+    fn a_reopened_screen_starts_the_wait_again() {
+        let reopen_then = |back: Duration| {
+            let mut p = ataraxia_held_pair(cfg());
+            // On the wait 9 s, then the client's own screen.
+            p.later(Duration::from_secs(9));
+            p.frame(running(), ataraxia(paused()));
+            assert!(p.client.choose_own());
+            p.deliver();
+            assert!(
+                !p.host.facts(p.t, false).upgrade_counts,
+                "the reopen ended the client's wait"
+            );
+            let (_, c) = p.frame(running(), ataraxia(paused()));
+            assert_eq!(c, vec![Action::PressUnpause]);
+            let (_, c) = p.frame(running(), ataraxia(running()));
+            assert_eq!(c, vec![Action::GotoUpgrade]);
+            p.client.upgrade_opened();
+            p.later(Duration::from_secs(2));
+            assert!(
+                p.client.upgrade_leaving(p.t),
+                "the client's pick: back on the wait"
+            );
+            p.deliver();
+            p.frame(running(), ataraxia(running()));
+            p.later(back);
+            p.frame(running(), ataraxia(running()));
+            assert!(p.host.upgrade_leaving(p.t), "the host's last pick");
+            p.deliver();
+            p
+        };
+        // Back on the wait 5 s when the last pick comes (16 s since the
+        // round opened, 9 s of it before the reopen): no count.
+        let mut p = reopen_then(Duration::from_secs(5));
+        assert!(!p.host.counting() && !p.client.counting());
+        let (h, _) = p.frame(running(), ataraxia(running()));
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        // An unbroken `UPGRADE_COUNT_AFTER` after the reopen: the count.
+        let p = reopen_then(UPGRADE_COUNT_AFTER);
+        assert!(p.host.counting() && p.client.counting());
+    }
+
+    /// The upgrade key on the waiting card reopens the screen. The round waits for both.
+    #[test]
+    fn the_upgrade_key_on_the_waiting_card_reopens_inside_the_round() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.host.upgrade_opened();
+        p.deliver();
+        p.frame(running(), running());
+        p.client.upgrade_opened();
+        assert!(p.client.upgrade_leaving(p.t), "its pick: the wait");
+        p.deliver();
+        p.later(Duration::from_secs(9));
+        p.frame(running(), running());
+        assert!(p.host.facts(p.t, false).upgrade_counts, "9 s on the wait");
+        // A point left: the client's upgrade key on the card.
+        assert!(!p.client.upgrade_opened(), "its own: no fade");
+        assert!(p.client.upgrade_choosing());
+        p.deliver();
+        assert!(
+            p.host.upgrade.is_waiting_on(CLIENT),
+            "the round waits for the client again"
+        );
+        assert!(
+            !p.host.facts(p.t, false).upgrade_counts,
+            "the client's wait starts over"
+        );
+        assert!(p.host.upgrade_leaving(p.t), "held: the client chooses");
+        p.deliver();
+        assert!(p.host.upgrade.active().is_some());
+        assert_eq!(
+            p.host.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerChoosing)
+        );
+        // The client's pick 2 s on ends the round for both (the host waited 2 s).
+        p.later(Duration::from_secs(2));
+        assert!(p.client.upgrade_leaving(p.t), "the last pick");
+        p.deliver();
+        assert!(p.host.upgrade.active().is_none() && p.client.upgrade.active().is_none());
+        assert!(!p.host.counting() && !p.client.counting());
+        let (h, c) = p.frame(running(), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+    }
+
+    /// A shared pause's end counts however short it was.
+    #[test]
+    fn a_short_pause_still_counts() {
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        p.frame(paused(), running());
+        p.frame(paused(), paused());
+        assert_eq!(p.host.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        p.deliver();
+        assert!(p.host.counting() && p.client.counting());
+    }
+
+    /// With Ataraxia, the waiting screen for the partner's round. Space opens its own screen.
+    #[test]
+    fn ataraxia_waits_on_the_pause_screen_and_space_opens_its_own() {
+        let mut p = ataraxia_held_pair(cfg());
+        assert_eq!(p.host.screen, Screen::Choosing, "the host chooses");
+        assert_eq!(p.client.pause.paused_by(), None, "the client's only");
+        assert_eq!(
+            p.host.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerReady),
+            "the partner reads the client as ready"
+        );
+        assert!(p.client.choose_own());
+        assert!(!p.client.choose_own(), "once");
+        let (_, c) = p.frame(running(), ataraxia(paused()));
+        assert_eq!(c, vec![Action::PressUnpause]);
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        assert!(!p.client.upgrade_opened(), "asked for: no fade");
+        assert!(p.client.upgrade_choosing());
+        assert!(p.client.take_outs().is_empty(), "no round of its own");
+        // The client picks first and waits on its card. The host's pick ends the round.
+        assert!(p.client.upgrade_leaving(p.t));
+        p.deliver();
+        assert_eq!(
+            p.client.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerChoosing)
+        );
+        assert!(p.host.upgrade_leaving(p.t), "the last choice: the count");
+        p.deliver();
+        let (h, c) = p.count_out(running(), ataraxia(running()));
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+
+        // The host done first: the client's opened screen holds the round until it picks.
+        let mut p = ataraxia_held_pair(cfg());
+        assert!(p.client.choose_own());
+        p.frame(running(), ataraxia(paused()));
+        assert!(
+            p.host.upgrade.is_waiting_on(CLIENT),
+            "the round waits for the client"
+        );
+        assert!(p.client.upgrade.is_waiting_on(CLIENT));
+        p.frame(running(), ataraxia(running()));
+        assert!(!p.client.upgrade_opened());
+        assert!(p.host.upgrade_leaving(p.t), "held for the client");
+        p.deliver();
+        assert!(!p.host.counting() && !p.client.counting());
+        assert_eq!(
+            p.host.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerChoosing)
+        );
+        assert_eq!(
+            p.client.facts(p.t, false).upgrade,
+            Some(UpgradeWait::PartnerReady)
+        );
+        p.later(Duration::from_secs(30));
+        let (h, c) = p.frame(running(), ataraxia(running()));
+        assert!(h.is_empty() && c.is_empty(), "both held: {h:?} {c:?}");
+        assert!(
+            p.client.upgrade_leaving(p.t),
+            "the client's pick: the count"
+        );
+        p.deliver();
+        assert!(p.host.counting() && p.client.counting());
+        let (h, c) = p.count_out(running(), ataraxia(running()));
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
+        // A statement from either side never makes the client done again.
+        assert_eq!(p.host.adopted() + p.client.adopted(), 0);
+
+        // The client's Space crosses the host's pick on the wire: its screen does not open.
+        let mut p = ataraxia_held_pair(cfg());
+        p.later(UPGRADE_COUNT_AFTER);
+        assert!(p.client.choose_own());
+        let space = p.client.take_outs();
+        assert!(
+            p.host.upgrade_leaving(p.t),
+            "the host's last pick: the count"
+        );
+        to_host(&mut p, space);
+        p.deliver();
+        assert!(p.host.counting() && p.host.upgrade.active().is_none());
+        assert!(p.client.upgrade.active().is_none(), "told it ended");
+        assert!(p.client.counting());
+        let (_, c) = p.frame(running(), ataraxia(paused()));
+        assert!(c.is_empty(), "no screen: {c:?}");
+        let (h, c) = p.count_out(running(), ataraxia(paused()));
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::PressUnpause]);
+
+        // Space after the round ended: nothing.
+        let mut p = ataraxia_held_pair(cfg());
+        assert!(p.host.upgrade_leaving(p.t));
+        p.deliver();
+        assert!(!p.client.choose_own());
+    }
+
+    /// The round's end reaches the client with its own screen open: its pick
+    /// resumes its game with no count, and the host is not held again.
+    #[test]
+    fn an_ataraxia_space_crossing_the_rounds_end_keeps_the_open_screen() {
+        let mut p = ataraxia_held_pair(cfg());
+        p.later(UPGRADE_COUNT_AFTER);
+
+        assert!(p.client.choose_own());
+        let space = p.client.take_outs();
+        let (_, c) = p.frame(running(), ataraxia(paused()));
+        assert_eq!(c, vec![Action::PressUnpause]);
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        assert!(!p.client.upgrade_opened(), "asked for: no fade");
+        // The host picks last before the client's Space reaches it.
+        assert!(
+            p.host.upgrade_leaving(p.t),
+            "the host's last pick: the count"
+        );
+        to_host(&mut p, space);
+        p.deliver();
+        assert!(p.host.counting() && p.host.upgrade.active().is_none());
+        assert!(!p.host.upgrade.is_waiting_on(CLIENT), "not held again");
+        assert!(p.client.upgrade.active().is_none(), "told the round ended");
+        assert!(p.client.upgrade_choosing(), "its screen still open");
+        assert!(!p.client.counting(), "no count over its open screen");
+        assert_eq!(p.client.facts(p.t, true).count, None);
+        let (h, c) = p.count_out(running(), ataraxia(running()));
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert!(c.is_empty(), "the client's screen is not closed: {c:?}");
+        // The client's pick: the game's own leave runs, nothing held.
+        assert!(
+            !p.client.upgrade_leaving(p.t),
+            "the client's pick counts, its game resumes"
+        );
+        p.deliver();
+        assert!(!p.host.upgrade.is_waiting_on(CLIENT) && p.host.upgrade.active().is_none());
+        let (h, c) = p.frame(running(), running());
+        assert!(h.is_empty() && c.is_empty(), "{h:?} {c:?}");
+    }
+
+    /// The Ataraxia hold blocks Esc, however long. A downed player and the
+    /// host with Ataraxia wait the same way, and Space opens the screen.
+    #[test]
+    fn ataraxia_waits_however_long_and_works_down_and_as_host() {
+        let mut p = ataraxia_held_pair(cfg());
+        p.later(Duration::from_secs(61));
+        p.frame(running(), ataraxia(paused()));
+        assert_eq!(
+            p.client.facts(p.t, true).upgrade,
+            Some(UpgradeWait::AtaraxiaHeld)
+        );
+        assert_eq!(p.client.unpause_request(false, p.t), UnpauseCall::Block);
+        assert!(p.host.upgrade.is_waiting_on(HOST), "the round waits");
+
+        // Down: the same hold, and Space's screen opens past the guard.
+        let mut p = Pair::new(cfg());
+        run_frames(&mut p, 2);
+        assert_eq!(p.client.death(p.t), Death::Down);
+        p.client.set_control(Some(false));
+        p.deliver();
+        assert!(!p.host.upgrade_opened());
+        p.deliver();
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert!(c.is_empty(), "{c:?}");
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert_eq!(c, vec![Action::PressPause]);
+        p.frame(running(), ataraxia(paused()));
+        assert_eq!(
+            p.client.facts(p.t, true).upgrade,
+            Some(UpgradeWait::AtaraxiaHeld)
+        );
+        assert!(p.client.choose_own());
+        p.frame(running(), ataraxia(paused()));
+        let (_, c) = p.frame(running(), ataraxia(running()));
+        assert_eq!(c, vec![Action::GotoUpgrade]);
+        assert!(p.client.lifts_control(), "around the opening");
+        assert!(!p.client.upgrade_opened());
+
+        // The host with Ataraxia, the client's round.
+        let mut p = Pair::new(cfg());
+        p.frame(running(), running());
+        assert!(!p.client.upgrade_opened());
+        p.deliver();
+        let (h, _) = p.frame(ataraxia(running()), running());
+        assert!(h.is_empty(), "{h:?}");
+        let (h, _) = p.frame(ataraxia(running()), running());
+        assert_eq!(h, vec![Action::PressPause]);
+        p.frame(ataraxia(paused()), running());
+        assert_eq!(
+            p.host.facts(p.t, true).upgrade,
+            Some(UpgradeWait::AtaraxiaHeld)
+        );
+        assert_eq!(
+            p.client.screen,
+            Screen::Choosing,
+            "the client's screen opens"
+        );
+        // The host's Space: the round waits for it. The client's pick holds the client.
+        assert!(p.host.choose_own());
+        p.deliver();
+        assert!(
+            p.client.upgrade.is_waiting_on(HOST),
+            "the relay reached the client"
+        );
+        let (h, _) = p.frame(ataraxia(paused()), running());
+        assert_eq!(h, vec![Action::PressUnpause]);
+        let (h, _) = p.frame(ataraxia(running()), running());
+        assert_eq!(h, vec![Action::GotoUpgrade]);
+        assert!(!p.host.upgrade_opened());
+        assert!(
+            p.client.upgrade_leaving(p.t),
+            "the client waits for the host"
+        );
+        p.deliver();
+        assert!(!p.client.counting() && !p.host.counting());
+        assert!(p.host.upgrade_leaving(p.t), "its pick: the count");
+        p.deliver();
+        let (h, c) = p.count_out(ataraxia(running()), running());
+        assert_eq!(h, vec![Action::ReleaseUpgrade]);
+        assert_eq!(c, vec![Action::ReleaseUpgrade]);
     }
 }

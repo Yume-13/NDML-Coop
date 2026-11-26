@@ -24,10 +24,12 @@
 //!
 //! The game owns the UDP socket, so a connection code exists only while it
 //! runs. Players drive the lobby from the co-op mod's panel
-//! ([`LobbyAgent::request`]). Two files in `<game>/ndml/coop/` let an outside
-//! tool drive the lobby: `status.toml` ([`Status`]), written by the game with
-//! a heartbeat, and `peer.toml` ([`PeerRequest`]), requests for the current
-//! session only. Both are replaced atomically. [`LobbyAgent`] is driven by
+//! ([`LobbyAgent::request`]). With [`LobbyConfig::files`] on, two files in
+//! `<game>/ndml/coop/` let another process on the same machine drive the
+//! lobby: `status.toml` ([`Status`]), written by the game with a heartbeat,
+//! and `peer.toml` ([`PeerRequest`]), written by that process, requests for
+//! the current session only. Both are replaced atomically. The co-op mod
+//! turns the files off. [`LobbyAgent`] is driven by
 //! `poll(now)` on the network thread.
 
 #![forbid(unsafe_code)]

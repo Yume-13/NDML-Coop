@@ -96,6 +96,8 @@ pub mod color {
     pub const GREY: u32 = 0x0080_8080;
     /// The dim backdrop (at 0.5 alpha, as `oDimmer`).
     pub const BLACK: u32 = 0;
+    /// The resume count's edge glow (255, 140, 0), a warning orange.
+    pub const COUNT_EDGE: u32 = 0x0000_8CFF;
 }
 
 /// Alpha factors the game uses.

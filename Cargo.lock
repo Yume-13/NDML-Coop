@@ -13,13 +13,24 @@ dependencies = [
 
 [[package]]
 name = "coop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
+ "cpu-time",
  "log",
  "ndml-net",
  "ndml-sdk",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -57,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -64,7 +81,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "ndml-net"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "log",
  "postcard",
@@ -74,8 +91,8 @@ dependencies = [
 
 [[package]]
 name = "ndml-sdk"
-version = "0.1.2"
-source = "git+https://github.com/Yume-13/NDML?tag=v0.1.2#9f47572110351688adf5045c311e8c408843d7bc"
+version = "0.1.4"
+source = "git+https://github.com/Yume-13/NDML?tag=v0.1.4#6d69ae59aaaaf7a4cafff8e52252a8d775c9cabb"
 dependencies = [
  "log",
  "serde",
@@ -226,6 +243,28 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "winnow"

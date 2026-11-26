@@ -1118,6 +1118,10 @@ fn state_value(in_run: bool) -> &'static str {
 
 fn outcome_line(o: &Outcome) -> String {
     match o {
+        // A room code is a lobby's id: never in the log.
+        Outcome::Error(e @ SteamError::NoLobbyForCode(_)) => {
+            format!("failed ({}): the room code matched no lobby", e.key())
+        }
         Outcome::Refused(r) => format!("refused ({}): {}", r.key(), r.message()),
         Outcome::Error(e) => format!("failed ({}): {}", e.key(), e.message()),
         Outcome::Left => "the partner left the session".into(),
@@ -1566,6 +1570,10 @@ mod tests {
             m.outcome(),
             Some(Outcome::Error(SteamError::NoLobbyForCode(c))) if c == "K7QX2"
         ));
+        // The screen says the code; the log line never does.
+        let line = outcome_line(m.outcome().unwrap());
+        assert!(!line.contains("K7QX2"), "{line}");
+        assert!(line.contains("matched no lobby"), "{line}");
         // A typo is reported without a search.
         let mut m = machine(Visibility::Friends);
         assert!(m.act(SteamAction::JoinCode("K7Q".into()), t0).is_empty());

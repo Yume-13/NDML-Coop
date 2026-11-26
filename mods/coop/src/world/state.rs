@@ -320,6 +320,48 @@ pub struct Stats {
     pub not_replicated: Vec<(usize, u16, Value)>,
 }
 
+/// Receiver, before [`apply`]: a reference the sender sent as the only
+/// instance of its object ([`StateValue::Singleton`]) that would resolve
+/// here to an instance `shared(key)` names becomes [`StateValue::Unresolved`]
+/// (the copy keeps its own, else `noone`). A shared attack or wind-up made
+/// here by the shot path is the host's, and the sender's variable cannot
+/// mean it. Returns how many were changed.
+pub fn singletons_not_shared(
+    call: &Call<'_>,
+    r: &Reflect,
+    vars: &mut [(String, StateValue)],
+    shared: &dyn Fn(usize) -> bool,
+) -> u32 {
+    fn one(
+        call: &Call<'_>,
+        r: &Reflect,
+        v: &mut StateValue,
+        shared: &dyn Fn(usize) -> bool,
+    ) -> u32 {
+        match v {
+            StateValue::Singleton(o) => {
+                let Ok(found) = call.call_builtin(
+                    r.instance_find,
+                    &[Value::object(u32::from(*o)), Value::Real(0.0)],
+                ) else {
+                    return 0;
+                };
+                let mut key = None;
+                let _ = call.with(&found, |inst, _| key = Some(inst.key()));
+                if key.is_some_and(shared) {
+                    *v = StateValue::Unresolved(*o);
+                    1
+                } else {
+                    0
+                }
+            }
+            StateValue::Array(items) => items.iter_mut().map(|it| one(call, r, it, shared)).sum(),
+            _ => 0,
+        }
+    }
+    vars.iter_mut().map(|(_, v)| one(call, r, v, shared)).sum()
+}
+
 fn arg<'a>(v: &Value) -> Arg<'_, 'a> {
     Arg::Value(v)
 }
@@ -884,10 +926,186 @@ fn method_func(func: i64) -> Value {
 /// hull): a repair leaves them alone.
 pub const WORLD_OWNED: &[&str] = &["hull", "hullPrevious"];
 
-/// Variables a copy holds for its own player: a repair leaves them alone.
-/// `corrosiveStacks`: the joining player's corrosion on its copy, ticked and
-/// measured as its own damage.
-pub const COPY_OWNED: &[&str] = &["corrosiveStacks"];
+/// The enemy variables a player's damage and procs read, each with a row:
+/// players proc only from their own effects. Every variable that the
+/// enemy's initialisation sets and a hit, damage-over-time or death path
+/// reads has a row here, in [`STATUS_CARRIED`] or in [`ENEMY_OWN`].
+///
+/// **Owned**: a player's own status on the enemy. Each game keeps its own on
+/// its own enemies or copies; the generic repair never writes the host's
+/// onto a copy. A copy's own status is reported only through what it does to
+/// the hull. No draw reads these.
+pub const STATUS_OWNED: &[(&str, &str)] = &[
+    (
+        "blitzed",
+        "Blitz: `blitzBoost` gives a hit's bonus once per enemy below the player's threshold and \
+         sets it; the host's flag on a copy would take the joining player's bonus away",
+    ),
+    (
+        "corrosiveStacks",
+        "Corrosion: the joining player's stacks, ticked by its `degenerations`, spread at the \
+         death from its copy",
+    ),
+    (
+        "purgeImmunity",
+        "Purge: `playerPurge` (the ship's ram) purges once per cooldown and sets it",
+    ),
+    (
+        "satFireHits",
+        "Saturation Fire: per satellite id, the hit count `applySatFireHit` multiplies the \
+         player's satellites' damage by",
+    ),
+    (
+        "stuckCount",
+        "darts lodged in the enemy (`stick`, `dartBurn`): the player's darts' burn",
+    ),
+    (
+        "vulnerabilityCount",
+        "the vulnerability mark's timer (`applyVulnerability`, `decrementVulnerability`)",
+    ),
+    (
+        "vulnerabilityMult",
+        "the vulnerability mark: `damageTakenModifiers` multiplies every hit on the enemy by it",
+    ),
+];
+
+/// Status variables the repair carries, and why.
+pub const STATUS_CARRIED: &[(&str, &str)] = &[
+    (
+        "burning",
+        "damage over time: carried, since a burn has a look (the game draws it from these: \
+         `degenerations`' slag particles); owned, the host's burn would not show on the joining \
+         player's copies",
+    ),
+    ("dotCelestialSurge", "damage over time: as `burning`"),
+    ("dotDurationList", "damage over time: as `burning`"),
+    ("dotIncendiary", "damage over time: as `burning`"),
+    ("dotTimer", "damage over time: as `burning`"),
+    ("totalDegen", "damage over time: as `burning`"),
+    (
+        "damageAccumulatedBurn",
+        "damage-number bookkeeping (the floating numbers): no effect on damage or procs",
+    ),
+    ("damageAccumulatedContinuous", "as `damageAccumulatedBurn`"),
+    ("damageAccumulatedSelf", "as `damageAccumulatedBurn`"),
+    ("damageFloaterTimer", "as `damageAccumulatedBurn`"),
+    (
+        "canHitPulse",
+        "the hit flash's readiness (`spawnHitPulse`): a look, no effect on damage or procs",
+    ),
+    (
+        "pushed_x",
+        "knockback: the copy's place is the host's (snapshots), so a push on the copy moves \
+         nothing",
+    ),
+    ("pushed_y", "as `pushed_x`"),
+    (
+        "enemySpeed",
+        "the enemy's speed (its AI, slows): the host's motion; no proc reads it",
+    ),
+    ("enemySpeedInverse", "as `enemySpeed`"),
+    (
+        "victemCount",
+        "shatter bookkeeping `projectileHitsSolid` keeps, 0 on enemies: no proc reads it",
+    ),
+];
+
+/// The enemy's own state that hits and deaths read (its place, size, hull,
+/// type properties, AI, rarity, treasure): the same on both games, the host's
+/// word; the repair carries it.
+pub const ENEMY_OWN: &[&str] = &[
+    "alarm",
+    "baseMoveSpeed",
+    "baseRotSpeed",
+    "breakDelay",
+    "canDestroy",
+    "cantShatter",
+    "currentHullOverride",
+    "diff",
+    "direction",
+    "effectRes",
+    "enemyAreaDamageTaken",
+    "enemyBehavior",
+    "enemyDamageModifier",
+    "enemyEntry",
+    "enemyIsChallenger",
+    "enemySingleDamageTaken",
+    "enemySizeModifier",
+    "enemySpeedFactor",
+    "enemyTargetSpeed",
+    "enemyTreasureModifier",
+    "hardShieldable",
+    "hardShielded",
+    "hull",
+    "hullMax",
+    "hullPrevious",
+    "ignoreLeaderTarget",
+    "image_angle",
+    "image_xscale",
+    "image_yscale",
+    "leader",
+    "moveSpeed",
+    "onDestroyEffects",
+    "rarity",
+    "res",
+    "rotSpeed",
+    "scaler",
+    "shotDistribute",
+    "sizeBuffer",
+    "targMoveSpeed",
+    "targRotSpeed",
+    "target",
+    "targetDir",
+    "targetPriority",
+    "targetX",
+    "targetY",
+    "threat",
+    "treasure",
+    "turn",
+    "viewHeight",
+    "viewWidth",
+    "viewX",
+    "viewY",
+    "weaknessBonus",
+    "wrapBuffer",
+    "wrapping",
+    "x",
+    "y",
+];
+
+/// Whether a repair leaves `name` alone on a copy: a player's own status
+/// ([`STATUS_OWNED`]).
+#[must_use]
+pub fn status_owned(name: &str) -> bool {
+    STATUS_OWNED.iter().any(|(v, _)| *v == name)
+}
+
+/// A copy's first state carries an owned status at its neutral value, not
+/// the host's: no status at all (0; `vulnerabilityMult` 1, what `enemyInit`
+/// sets), in the host's value's shape (an array element by element, a flag
+/// false). An object whose create never sets it (an `oEnemyHardShield`'s
+/// `corrosiveStacks`) needs it: `degenerations` stops on an unset variable.
+/// `None`: not an owned status.
+#[must_use]
+pub fn status_neutral(name: &str, host: &StateValue) -> Option<StateValue> {
+    fn shape(v: &StateValue, n: f64) -> StateValue {
+        match v {
+            StateValue::Array(a) => StateValue::Array(a.iter().map(|e| shape(e, n)).collect()),
+            StateValue::Bool(_) => StateValue::Bool(n != 0.0),
+            _ => StateValue::Real(n),
+        }
+    }
+    status_owned(name).then(|| {
+        shape(
+            host,
+            if name == "vulnerabilityMult" {
+                1.0
+            } else {
+                0.0
+            },
+        )
+    })
+}
 
 /// Write `vars`, `builtins` and `alarms` onto instance `id`. Unsupported
 /// values are left as the copy has them.
@@ -1053,6 +1271,51 @@ mod tests {
         assert!(!is_local_handle(0x0100_0002_0000_0010)); // a sound
         assert!(!is_local_handle(0x0100_0005_0001_909b)); // a function
         assert!(!is_local_handle(0x0400_0001_0001_f400)); // an instance
+    }
+
+    #[test]
+    fn an_owned_status_arrives_neutral_in_the_hosts_shape() {
+        let r = StateValue::Real;
+        assert_eq!(status_neutral("vulnerabilityMult", &r(1.6)), Some(r(1.0)));
+        assert_eq!(status_neutral("corrosiveStacks", &r(4.0)), Some(r(0.0)));
+        assert_eq!(
+            status_neutral("blitzed", &StateValue::Bool(true)),
+            Some(StateValue::Bool(false))
+        );
+        assert_eq!(
+            status_neutral("satFireHits", &StateValue::Array(vec![r(3.0), r(1.0)])),
+            Some(StateValue::Array(vec![r(0.0), r(0.0)]))
+        );
+        assert_eq!(status_neutral("totalDegen", &r(9.0)), None, "carried");
+        assert_eq!(status_neutral("hull", &r(9.0)), None);
+    }
+
+    #[test]
+    fn status_table_has_one_row_per_variable() {
+        let mut all: Vec<&str> = STATUS_OWNED
+            .iter()
+            .chain(STATUS_CARRIED)
+            .map(|(v, _)| *v)
+            .chain(ENEMY_OWN.iter().copied())
+            .collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "a variable in two rows");
+        assert!(ENEMY_OWN.windows(2).all(|w| w[0] < w[1]), "sorted");
+        // The marks and Corrosion are each game's own; the burn is carried
+        // (its look); the hull is the world's.
+        for v in [
+            "vulnerabilityMult",
+            "satFireHits",
+            "blitzed",
+            "corrosiveStacks",
+        ] {
+            assert!(status_owned(v), "{v}");
+        }
+        for v in ["dotDurationList", "totalDegen", "hull", "x"] {
+            assert!(!status_owned(v), "{v}");
+        }
     }
 
     #[test]

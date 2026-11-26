@@ -333,6 +333,16 @@ impl UpgradeGate {
         }
     }
 
+    /// `peer` chooses again in the open `round` after it was done (Ataraxia):
+    /// the round waits for it. False for a round not open or a peer not done.
+    pub fn undone(&mut self, peer: PeerId, round: u16) -> bool {
+        if self.active != Some(round) || !self.done.contains(peer) {
+            return false;
+        }
+        self.done.remove(peer);
+        true
+    }
+
     /// After a release, open the next queued round, if any.
     pub fn next_queued(&mut self) -> Option<UpgradeEvent> {
         if self.active.is_some() {
@@ -455,6 +465,15 @@ pub enum DownOutcome {
 
 /// Default respawn delay.
 pub const DEFAULT_RESPAWN: Duration = Duration::from_secs(45);
+
+/// The count before play resumes after a shared hold, three seconds with a
+/// sound each (the co-op mod's `rules::machine::RESUME_COUNT` is this value).
+pub const RESUME_COUNT: Duration = Duration::from_secs(3);
+
+/// After an upgrade round, the resume count runs only when a player has
+/// waited this long after picking, without a break. Else play resumes at once
+/// for both. The host times it from when it learned of each pick.
+pub const UPGRADE_COUNT_AFTER: Duration = Duration::from_secs(8);
 
 /// Downed and respawn rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -847,6 +866,20 @@ mod tests {
         assert_eq!(g.open(1), UpgradeEvent::Nothing, "stale open");
         assert_eq!(g.done(B, 1), UpgradeEvent::Nothing, "stale done");
         assert_eq!(g.last_released(), Some(1));
+    }
+
+    #[test]
+    fn upgrade_a_peer_choosing_again_is_waited_for() {
+        let mut g = UpgradeGate::new(PeerSet::first(2));
+        assert_eq!(g.open(1), UpgradeEvent::Opened(1));
+        assert!(!g.undone(A, 1), "not done yet");
+        assert_eq!(g.done(A, 1), UpgradeEvent::Nothing);
+        assert!(!g.undone(A, 2), "not the open round");
+        assert!(g.undone(A, 1));
+        assert_eq!(g.waiting_on(), PeerSet::first(2));
+        assert_eq!(g.done(B, 1), UpgradeEvent::Nothing, "waits for A again");
+        assert_eq!(g.done(A, 1), UpgradeEvent::Released(1));
+        assert!(!g.undone(A, 1), "stale");
     }
 
     #[test]

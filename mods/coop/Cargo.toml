@@ -18,6 +18,7 @@ ndml-sdk.workspace = true
 ndml-net.workspace = true
 log.workspace = true
 serde.workspace = true
+cpu-time.workspace = true
 
 [dev-dependencies]
 toml.workspace = true

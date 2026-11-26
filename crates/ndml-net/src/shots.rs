@@ -72,8 +72,11 @@ pub mod steer {
     pub const WORLD: u8 = 2;
 }
 
-/// One shot's birth: what [`ShotFire`] carries per shot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One shot's birth: what [`ShotFire`] carries per shot. On the wire as
+/// `FiredShotWire`: `replaces` and `links` share one byte while there are
+/// no links.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "FiredShotWire")]
 pub struct FiredShot {
     /// The host's id for the shot (a per-run counter).
     pub id: u32,
@@ -100,6 +103,114 @@ pub struct FiredShot {
     /// An enemy attack each game made itself, shared from now on: the receiver
     /// replaces its own nearest instance with this one.
     pub replaces: bool,
+    /// References to another shared birth (no net id, not a place): the
+    /// variable's index into this object's names and that birth's shot id.
+    /// The receiver writes its own instance of that birth there once it is
+    /// made (`coop::world::windup`).
+    pub links: Vec<(u16, u32)>,
+}
+
+/// [`FiredShot`] as encoded: the same fields in the same order, with
+/// `replaces` and `links` as one [`ShotTail`]. Without links the tail is one
+/// byte, the variant. Written from borrowed fields ([`FiredShotWireRef`]), so
+/// encoding copies nothing.
+#[derive(Deserialize)]
+struct FiredShotWire {
+    id: u32,
+    object: u16,
+    time_ms: u32,
+    vars: Vec<(u16, StateValue)>,
+    builtins: Vec<(u8, StateValue)>,
+    alarms: Vec<(u8, i32)>,
+    target: Option<PeerId>,
+    steer: u8,
+    places: Vec<(u16, u16, f32, f32)>,
+    place_fills: Vec<(u8, u16, StateValue)>,
+    tail: ShotTail,
+}
+
+/// [`FiredShot::replaces`] and [`FiredShot::links`] on the wire.
+#[derive(Deserialize)]
+enum ShotTail {
+    Plain,
+    Replaces,
+    Links(Vec<(u16, u32)>),
+    ReplacesLinks(Vec<(u16, u32)>),
+}
+
+/// [`FiredShotWire`] over a [`FiredShot`]'s own fields (the same layout).
+#[derive(Serialize)]
+struct FiredShotWireRef<'a> {
+    id: u32,
+    object: u16,
+    time_ms: u32,
+    vars: &'a [(u16, StateValue)],
+    builtins: &'a [(u8, StateValue)],
+    alarms: &'a [(u8, i32)],
+    target: Option<PeerId>,
+    steer: u8,
+    places: &'a [(u16, u16, f32, f32)],
+    place_fills: &'a [(u8, u16, StateValue)],
+    tail: ShotTailRef<'a>,
+}
+
+/// [`ShotTail`] over borrowed links (the same variants in the same order).
+#[derive(Serialize)]
+enum ShotTailRef<'a> {
+    Plain,
+    Replaces,
+    Links(&'a [(u16, u32)]),
+    ReplacesLinks(&'a [(u16, u32)]),
+}
+
+impl Serialize for FiredShot {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let tail = match (self.replaces, self.links.is_empty()) {
+            (false, true) => ShotTailRef::Plain,
+            (true, true) => ShotTailRef::Replaces,
+            (false, false) => ShotTailRef::Links(&self.links),
+            (true, false) => ShotTailRef::ReplacesLinks(&self.links),
+        };
+        FiredShotWireRef {
+            id: self.id,
+            object: self.object,
+            time_ms: self.time_ms,
+            vars: &self.vars,
+            builtins: &self.builtins,
+            alarms: &self.alarms,
+            target: self.target,
+            steer: self.steer,
+            places: &self.places,
+            place_fills: &self.place_fills,
+            tail,
+        }
+        .serialize(s)
+    }
+}
+
+impl From<FiredShotWire> for FiredShot {
+    fn from(w: FiredShotWire) -> Self {
+        let (replaces, links) = match w.tail {
+            ShotTail::Plain => (false, Vec::new()),
+            ShotTail::Replaces => (true, Vec::new()),
+            ShotTail::Links(l) => (false, l),
+            ShotTail::ReplacesLinks(l) => (true, l),
+        };
+        Self {
+            id: w.id,
+            object: w.object,
+            time_ms: w.time_ms,
+            vars: w.vars,
+            builtins: w.builtins,
+            alarms: w.alarms,
+            target: w.target,
+            steer: w.steer,
+            places: w.places,
+            place_fills: w.place_fills,
+            replaces,
+            links,
+        }
+    }
 }
 
 /// Host to clients: shots born in a frame (wire tag 51).
@@ -219,6 +330,15 @@ fn size<T: Serialize>(v: &T) -> usize {
     postcard::to_allocvec(v).map_or(usize::MAX, |b| b.len())
 }
 
+impl FiredShot {
+    /// Bytes this shot may still grow by and go in a part alone
+    /// ([`ShotFire::split`]).
+    #[must_use]
+    pub fn room(&self) -> usize {
+        (MAX_MESSAGE - SLACK).saturating_sub(size(self))
+    }
+}
+
 impl ShotFire {
     /// The shots in parts that fit a datagram each; shots too big alone are
     /// returned second.
@@ -282,6 +402,60 @@ mod tests {
             places: vec![(4, 402, 100.5, -20.0)],
             place_fills: vec![(0, 7, StateValue::Real(55.0))],
             replaces: true,
+            links: vec![(3, u32::MAX)],
+        }
+    }
+
+    /// A shot without links encodes to the length of a layout with `replaces`
+    /// as a bool and nothing after it. Every pairing of `replaces` and links
+    /// round-trips.
+    #[test]
+    fn links_cost_nothing_when_there_are_none() {
+        #[derive(Serialize)]
+        struct PlainLayout<'a> {
+            id: u32,
+            object: u16,
+            time_ms: u32,
+            vars: &'a [(u16, StateValue)],
+            builtins: &'a [(u8, StateValue)],
+            alarms: &'a [(u8, i32)],
+            target: Option<PeerId>,
+            steer: u8,
+            places: &'a [(u16, u16, f32, f32)],
+            place_fills: &'a [(u8, u16, StateValue)],
+            replaces: bool,
+        }
+        for replaces in [false, true] {
+            let mut s = shot(5, 3);
+            s.replaces = replaces;
+            s.links.clear();
+            let before = PlainLayout {
+                id: s.id,
+                object: s.object,
+                time_ms: s.time_ms,
+                vars: &s.vars,
+                builtins: &s.builtins,
+                alarms: &s.alarms,
+                target: s.target,
+                steer: s.steer,
+                places: &s.places,
+                place_fills: &s.place_fills,
+                replaces,
+            };
+            assert_eq!(
+                postcard::to_allocvec(&s).unwrap().len(),
+                postcard::to_allocvec(&before).unwrap().len(),
+                "replaces {replaces}"
+            );
+            for links in [vec![], vec![(3, u32::MAX), (4, 9)]] {
+                let mut s = s.clone();
+                s.links = links;
+                let m = Message::ShotFire(ShotFire {
+                    shots: vec![s.clone()],
+                });
+                let back = Message::decode(&m.encode().unwrap()).unwrap();
+                assert_eq!(back, m);
+            }
         }
     }
 
@@ -333,6 +507,28 @@ mod tests {
             back.extend(p.changes);
         }
         assert_eq!(back, changes);
+    }
+
+    /// A shot grown by exactly its room goes in a part alone; one byte more
+    /// does not.
+    #[test]
+    fn a_shot_grown_by_its_room_still_fits_a_part() {
+        // A string of 200 bytes or more has a two-byte length prefix, so
+        // each byte more grows the shot by one.
+        let with = |n: usize| {
+            let mut s = shot(1, 4);
+            s.builtins.push((252, StateValue::Str("x".repeat(n))));
+            s
+        };
+        let room = with(200).room();
+        assert!(room > 0 && room < MAX_MESSAGE);
+        let full = with(200 + room);
+        assert_eq!(full.room(), 0);
+        let (parts, big) = ShotFire::split(vec![full]);
+        assert!(big.is_empty() && parts.len() == 1);
+        assert!(Message::ShotFire(parts[0].clone()).encode().is_ok());
+        let (_, big) = ShotFire::split(vec![with(201 + room)]);
+        assert_eq!(big.len(), 1);
     }
 
     #[test]

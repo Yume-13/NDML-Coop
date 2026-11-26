@@ -146,6 +146,31 @@ impl TextFeed {
     }
 }
 
+/// The lost link in words, for every place that says it. `ago`: "" or
+/// " 12 s ago".
+#[must_use]
+pub fn lost_link(partner: &str, ago: &str) -> String {
+    format!("Lost the link to {partner}{ago}.")
+}
+
+/// A partner that left the session on purpose (its goodbye).
+#[must_use]
+pub fn partner_left(partner: &str) -> String {
+    format!("{partner} left.")
+}
+
+/// The end of the upgrade round, shown after each wait text of the round.
+/// `counts`: the host's state, set once a player has waited
+/// `UPGRADE_COUNT_AFTER` after picking.
+#[must_use]
+pub fn resume_note(counts: bool) -> &'static str {
+    if counts {
+        "(countdown on resume)"
+    } else {
+        "(no countdown)"
+    }
+}
+
 /// Fixed co-op strings (English).
 pub mod en {
     pub const COOP_ROW: &str = "Co-op";

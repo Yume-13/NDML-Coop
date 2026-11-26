@@ -61,16 +61,13 @@ pub struct Config {
     pub color: String,
     pub show_names: bool,
     pub show_marker: bool,
-    /// Host: how long its game plays on alone after the link is lost before
-    /// it pauses too and waits (the joining game waits at once).
-    #[serde(default = "plays_on_default")]
-    pub host_plays_on_seconds: f64,
     /// The partner's sounds here, a fraction of their normal gain (0 = off:
     /// none played, none asked for): see `sound`.
     #[serde(default = "half")]
     pub partner_sound_volume: f64,
     // The co-op UI: see `ui::settings`.
     pub hud_corner: crate::ui::layout::HudCorner,
+    pub show_traffic: bool,
     pub deck_keyboard: bool,
     pub partner_tint: crate::world::present::PartnerTint,
     // Steam connector: see `steam::settings`.
@@ -81,16 +78,11 @@ pub struct Config {
     // This player's own wild mods in a co-op run: see `wild`.
     #[serde(default)]
     pub wild_mods: crate::wild::WildMods,
-    pub upgrade_wait_seconds: f64,
 }
 
 /// The default when the key is missing.
 fn half() -> f64 {
     0.5
-}
-
-fn plays_on_default() -> f64 {
-    15.0
 }
 
 /// Validated settings.
@@ -122,10 +114,8 @@ pub struct Settings {
     pub rules: crate::rules::RulesSettings,
     /// `partner_sound_volume`, in [0, 1].
     pub partner_sound_volume: f64,
-    /// Host: how long its game plays on alone after the link is lost
-    /// (`host_plays_on_seconds`; in a session the host's value counts).
-    pub host_plays_on: Duration,
-    /// `wild_mods`: none offered to this player in a co-op run (`wild`).
+    /// `wild_mods`: this player's own wild mods in a co-op run, the Co-op page's
+    /// Wild Mods row (`wild`).
     pub wild_mods: crate::wild::WildMods,
 }
 
@@ -196,24 +186,12 @@ impl Config {
             45.0,
             &mut w,
         ));
-        let host_plays_on = Duration::from_secs_f64(clamp_f(
-            "host_plays_on_seconds",
-            self.host_plays_on_seconds,
-            0.0,
-            600.0,
-            15.0,
-            &mut w,
-        ));
         let world = self.world_settings(&mut w);
         let steam = self.steam(&mut w);
-        let rules = crate::rules::settings::validate(
-            &crate::rules::settings::Raw {
-                pause_on_focus_loss: self.pause_on_focus_loss,
-                upgrade_wait_seconds: self.upgrade_wait_seconds,
-                respawn,
-            },
-            &mut w,
-        );
+        let rules = crate::rules::settings::validate(&crate::rules::settings::Raw {
+            pause_on_focus_loss: self.pause_on_focus_loss,
+            respawn,
+        });
         let settings = Settings {
             name,
             name_alt,
@@ -239,7 +217,6 @@ impl Config {
                 0.5,
                 &mut w,
             ),
-            host_plays_on,
             wild_mods: self.wild_mods,
         };
         (settings, w)
@@ -262,6 +239,40 @@ mod tests {
 
     fn defaults() -> Config {
         ndml_sdk::config::parse_defaults(crate::NDML_DEFAULT_CONFIG).unwrap()
+    }
+
+    /// A file that holds `host_plays_on_seconds` loads. The refresh drops the
+    /// key with its notice and no warning.
+    #[test]
+    fn a_file_with_host_plays_on_seconds_loads() {
+        let file = format!(
+            "{}\nhost_plays_on_seconds = 40\n",
+            crate::NDML_DEFAULT_CONFIG
+        );
+        let r = ndml_sdk::config::refresh(&file, crate::NDML_DEFAULT_CONFIG).unwrap();
+        assert_eq!(
+            r.notice().as_deref(),
+            Some("config refreshed: host_plays_on_seconds dropped (was 40)")
+        );
+        let c: Config = ndml_sdk::config::parse_defaults(&r.text).unwrap();
+        assert_eq!(c.pause_on_focus_loss, defaults().pause_on_focus_loss);
+        assert!(!crate::NDML_DEFAULT_CONFIG.contains("host_plays_on"));
+    }
+
+    /// A file that holds `upgrade_wait_seconds` loads. The key is dropped.
+    #[test]
+    fn a_file_with_upgrade_wait_seconds_loads() {
+        let file = format!(
+            "{}\nupgrade_wait_seconds = 60\n",
+            crate::NDML_DEFAULT_CONFIG
+        );
+        let r = ndml_sdk::config::refresh(&file, crate::NDML_DEFAULT_CONFIG).unwrap();
+        assert_eq!(
+            r.notice().as_deref(),
+            Some("config refreshed: upgrade_wait_seconds dropped (was 60)")
+        );
+        let _: Config = ndml_sdk::config::parse_defaults(&r.text).unwrap();
+        assert!(!crate::NDML_DEFAULT_CONFIG.contains("upgrade_wait"));
     }
 
     /// The shipped `config.toml` lists exactly the keys `Config` reads: a

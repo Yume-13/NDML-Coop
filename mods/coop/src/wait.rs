@@ -22,10 +22,12 @@
 
 //! A co-op run's wait for a lost link. Pure.
 //!
-//! Nothing ends the wait by itself. A silence under [`WAIT_AFTER`] plays
-//! through; past it the run waits: the joining game freezes at once, the host
-//! plays on for `host_plays_on_seconds`, then freezes too. The link back ends
-//! the wait; a freeze of [`LONG_FREEZE`] or more becomes the shared pause.
+//! A silence under [`WAIT_AFTER`] plays through. Past it the joining game
+//! freezes at once and the host plays on for [`HOST_PLAYS_ON`], then freezes.
+//! The link back ends the wait. A freeze of [`LONG_FREEZE`] or more becomes
+//! the shared pause, a shorter one resumes after [`MIN_FREEZE`] at the least.
+//! The wait has no timeout. The partner's goodbye, restart (a new nonce),
+//! refusal or `RunLeft` also ends it.
 
 #![forbid(unsafe_code)]
 
@@ -35,8 +37,11 @@ use std::time::{Duration, Instant};
 pub const WAIT_AFTER: Duration = Duration::from_secs(3);
 /// A freeze this long turns into the shared pause at the return.
 pub const LONG_FREEZE: Duration = Duration::from_secs(10);
-/// The host plays on alone this long by default (`host_plays_on_seconds`).
-pub const PLAYS_ON_DEFAULT: Duration = Duration::from_secs(15);
+/// A freeze that was shown lasts at least this long. A return sooner holds
+/// the game until then.
+pub const MIN_FREEZE: Duration = Duration::from_secs(2);
+/// The host plays on alone this long. Carried in `SessionSettings.plays_on_s`.
+pub const HOST_PLAYS_ON: Duration = Duration::from_secs(15);
 /// A frame gap this long is this game's own stall: silence counts from the wake.
 pub const OWN_STALL: Duration = Duration::from_secs(1);
 
@@ -88,6 +93,8 @@ pub struct LinkWait {
     /// The role when the wait began (an unlinked game cannot tell).
     host: bool,
     plays_on: Duration,
+    /// After a return: a short freeze is held until then ([`MIN_FREEZE`]).
+    lift_at: Option<Instant>,
 }
 
 impl LinkWait {
@@ -96,6 +103,9 @@ impl LinkWait {
         if !i.active {
             *self = Self::default();
             return None;
+        }
+        if self.lift_at.is_some_and(|t| i.now >= t) {
+            self.lift_at = None;
         }
         let silence = i.silent_for.filter(|_| i.linked);
         let Some(_) = self.since else {
@@ -122,7 +132,15 @@ impl LinkWait {
             let long = self
                 .frozen_at
                 .is_some_and(|t| i.now.saturating_duration_since(t) >= LONG_FREEZE);
-            *self = Self::default();
+            let lift_at = self
+                .frozen_at
+                .map(|t| t + MIN_FREEZE)
+                .filter(|&t| t > i.now)
+                .max(self.lift_at);
+            *self = Self {
+                lift_at,
+                ..Self::default()
+            };
             return Some(WaitEvent::Back { long });
         }
         self.plays_on = i.plays_on;
@@ -146,16 +164,26 @@ impl LinkWait {
         self.since.is_some()
     }
 
-    /// The game must be held frozen now.
+    /// The game must be held frozen now (also while a short freeze is held
+    /// to [`MIN_FREEZE`] after the return).
     #[must_use]
     pub fn hold(&self) -> bool {
-        self.frozen_at.is_some()
+        self.frozen_at.is_some() || self.lift_at.is_some()
+    }
+
+    /// The return found this game not frozen by the wait (on the upgrade
+    /// screen, or paused by its player): nothing to hold to [`MIN_FREEZE`].
+    pub fn lift_now(&mut self) {
+        self.lift_at = None;
     }
 
     /// What to show.
     #[must_use]
     pub fn view(&self, now: Instant) -> WaitView {
         match (self.since, self.frozen_at) {
+            // The hold after a return: the waiting text stays with the
+            // blocked Resume until it lifts.
+            (None, _) if self.lift_at.is_some_and(|t| now < t) => WaitView::Frozen,
             (None, _) => WaitView::None,
             (Some(_), Some(_)) => WaitView::Frozen,
             (Some(since), None) => WaitView::PlayingOn {
@@ -166,7 +194,7 @@ impl LinkWait {
         }
     }
 
-    /// Forget the wait (the partner gone, a new run).
+    /// Forget the wait and any hold (the partner gone, a new run).
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -203,7 +231,7 @@ mod tests {
                 linked,
                 silent_for: linked.then(|| Duration::from_secs_f64(silent)),
                 is_host: self.host,
-                plays_on: PLAYS_ON_DEFAULT,
+                plays_on: HOST_PLAYS_ON,
                 woke: self.woke.map(|w| self.t0 + Duration::from_secs_f64(w)),
                 now: self.t0 + Duration::from_secs_f64(at),
             })
@@ -308,6 +336,87 @@ mod tests {
         assert_eq!(h.w.view(h.now(18.0)), WaitView::None);
     }
 
+    /// A 3.4 s silence: the joining game has been frozen 0.4 s when the link
+    /// returns. The return comes at once (the rules take the partner back),
+    /// but the freeze holds to 2 s, then lifts.
+    #[test]
+    fn a_short_freeze_holds_two_seconds() {
+        let mut j = Fixture::new(false);
+        let evs = j.cut(3.4);
+        assert_eq!(
+            evs,
+            vec![
+                (13.0, WaitEvent::Lost),
+                (13.4, WaitEvent::Back { long: false })
+            ]
+        );
+        let mut j = Fixture::new(false);
+        j.at(0.0, true, 0.0);
+        j.at(13.0, true, 3.0);
+        assert_eq!(j.at(13.4, true, 0.0), Some(WaitEvent::Back { long: false }));
+        assert!(!j.w.waiting(), "the wait is over");
+        for t in [13.5, 14.0, 14.9] {
+            assert_eq!(j.at(t, true, 0.0), None);
+            assert!(j.w.hold(), "held at {t}");
+            // The waiting text stays with the blocked Resume.
+            assert_eq!(j.w.view(j.now(t)), WaitView::Frozen, "at {t}");
+        }
+        j.at(15.0, true, 0.0);
+        assert!(!j.w.hold(), "lifted 2 s after the freeze began");
+        assert_eq!(j.w.view(j.now(15.0)), WaitView::None);
+        // A freeze of 2 s or more lifts at the return.
+        let mut j = Fixture::new(false);
+        j.at(13.0, true, 3.0);
+        j.at(15.1, true, 0.0);
+        assert!(!j.w.hold());
+        // The host: frozen at 15 s of playing on, back 0.5 s later.
+        let mut h = Fixture::new(true);
+        h.at(13.0, true, 3.0);
+        h.at(25.0, false, 0.0);
+        assert!(h.w.hold());
+        h.at(25.5, true, 0.0);
+        assert!(h.w.hold(), "held after the host's short freeze too");
+        h.at(27.0, true, 0.0);
+        assert!(!h.w.hold());
+        // Never frozen (the host inside its 15 s): nothing to hold.
+        let mut h = Fixture::new(true);
+        h.at(13.0, true, 3.0);
+        h.at(14.0, true, 0.0);
+        assert!(!h.w.hold());
+    }
+
+    #[test]
+    fn a_hold_ends_with_the_run_or_when_nothing_was_frozen() {
+        let mut j = Fixture::new(false);
+        j.at(13.0, true, 3.0);
+        j.at(13.4, true, 0.0);
+        assert!(j.w.hold());
+        j.w.lift_now();
+        assert!(!j.w.hold(), "not frozen by the wait: lifted at once");
+        let mut j = Fixture::new(false);
+        j.at(13.0, true, 3.0);
+        j.at(13.4, true, 0.0);
+        let off = j.w.update(&WaitInput {
+            active: false,
+            linked: true,
+            silent_for: Some(Duration::ZERO),
+            is_host: false,
+            plays_on: HOST_PLAYS_ON,
+            woke: None,
+            now: j.now(13.5),
+        });
+        assert_eq!(off, None);
+        assert!(!j.w.hold(), "no run: no hold");
+        // A second loss inside the hold freezes as usual.
+        let mut j = Fixture::new(false);
+        j.at(13.0, true, 3.0);
+        j.at(13.4, true, 0.0);
+        assert_eq!(j.at(14.0, true, 3.0), Some(WaitEvent::Lost));
+        assert!(j.w.hold());
+        assert_eq!(j.at(18.0, true, 0.0), Some(WaitEvent::Back { long: false }));
+        assert!(!j.w.hold(), "frozen 4 s");
+    }
+
     #[test]
     fn a_twenty_five_second_cut_freezes_the_host_from_fifteen() {
         let mut h = Fixture::new(true);
@@ -397,7 +506,7 @@ mod tests {
             linked: false,
             silent_for: None,
             is_host: false,
-            plays_on: PLAYS_ON_DEFAULT,
+            plays_on: HOST_PLAYS_ON,
             woke: None,
             now: r.now(14.0),
         });

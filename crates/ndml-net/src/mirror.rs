@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(FrameSound::step(f64::NAN), 0);
         assert!((FrameSound::value(32) - 0.5).abs() < 1e-12);
         let f = FrameSound {
-            asset: 0x01bc | FrameSound::STOP_FIRST, // #444
+            asset: 0x01bc | FrameSound::STOP_FIRST, // sound index 444
             gain: 0,
             pitch: 0,
         };

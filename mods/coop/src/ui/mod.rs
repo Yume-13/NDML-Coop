@@ -27,10 +27,14 @@
 //! * [`steam_link`], [`steam_coop`]: the seam to the Steam connector.
 //! * [`style`], [`text`], [`layout`]: fonts, colours, strings, positions.
 //! * [`prefs`], [`settings`]: config switches and saving the page's choices.
-//! * [`glue`]: the hooks. All but `glue` and `steam_coop::CoopSteam` are pure.
+//! * [`cues`]: the sound cues (which of the game's sounds, when).
+//! * [`cue_files`]: the sound folder (a file per cue, read at the start).
+//! * [`glue`]: the hooks. All but `glue`, `cue_files` and `steam_coop::CoopSteam` are pure.
 
 #![forbid(unsafe_code)]
 
+pub mod cue_files;
+pub mod cues;
 pub mod glue;
 pub mod lan;
 pub mod layout;

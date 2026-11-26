@@ -772,7 +772,7 @@ mod tests {
         assert!(s.offer(5, hyper, PeerId::HOST, ME));
         assert_eq!(s.next(true), Some(hyper));
         s.own(6);
-        // Ten minutes frozen (the host's longest play-on), then a little play.
+        // Ten minutes frozen, then a little play.
         for _ in 0..36_000 {
             s.frame(false);
         }

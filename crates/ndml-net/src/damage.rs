@@ -56,6 +56,18 @@ struct Rep {
     claim: u16,
     /// The owner has judged the open claim.
     judged: bool,
+    /// Own damage in flight since all earlier damage was applied.
+    burst: Option<Burst>,
+}
+
+/// The start of own damage in flight (see [`Reporter::view`]).
+#[derive(Debug, Clone, Copy)]
+struct Burst {
+    /// The owner's hull as seen when the damage began. It holds all earlier
+    /// damage and none of this.
+    base: f32,
+    /// The total before it.
+    from: f32,
 }
 
 impl Rep {
@@ -81,9 +93,17 @@ impl Reporter {
     }
 
     /// Local damage to `net_id`'s copy (ignored unless positive and finite).
-    pub fn add(&mut self, net_id: NetId, amount: f32) {
+    /// `seen_hull`: the owner's hull from its newest snapshot at the time.
+    pub fn add(&mut self, net_id: NetId, amount: f32, seen_hull: f32) {
         if amount.is_finite() && amount > 0.0 {
-            self.enemies.entry(net_id).or_default().total += amount;
+            let r = self.enemies.entry(net_id).or_default();
+            if r.unacked() <= EPS {
+                r.burst = Some(Burst {
+                    base: seen_hull,
+                    from: r.total,
+                });
+            }
+            r.total += amount;
         }
     }
 
@@ -99,8 +119,10 @@ impl Reporter {
         self.enemies.get(&net_id).map_or(0.0, Rep::unacked)
     }
 
-    /// The hull to show for `net_id`, given the snapshot's hull: while own
-    /// damage is in flight, the newest ack's hull minus what is unapplied.
+    /// The hull to show for `net_id`, given the owner's hull from its newest
+    /// snapshot. While own damage is in flight the base is a hull that holds
+    /// none of it: the newest ack that applied some of it, else the owner's
+    /// hull when it began. The snapshot may already hold the damage in flight.
     #[must_use]
     pub fn view(&self, net_id: NetId, snapshot_hull: f32) -> f32 {
         let Some(r) = self.enemies.get(&net_id) else {
@@ -110,7 +132,15 @@ impl Reporter {
         if pending <= EPS {
             return snapshot_hull;
         }
-        r.ack_hull.map_or(snapshot_hull, |(h, _)| h) - pending
+        let fresh_ack = r
+            .ack_hull
+            .filter(|_| r.burst.is_none_or(|b| r.acked > b.from + EPS));
+        let base = match (fresh_ack, r.burst) {
+            (Some((h, _)), _) => h,
+            (None, Some(b)) => b.base,
+            (None, None) => snapshot_hull,
+        };
+        base - pending
     }
 
     /// This peer's copy of `net_id` died here; the next reports say so.
@@ -359,9 +389,9 @@ mod tests {
     fn totals_are_sent_on_change_and_repeated_until_acked() {
         let mut r = Reporter::new();
         assert!(r.take_reports(ME, 0).is_empty());
-        r.add(5, 10.0);
-        r.add(5, f32::NAN);
-        r.add(5, -3.0);
+        r.add(5, 10.0, 100.0);
+        r.add(5, f32::NAN, 100.0);
+        r.add(5, -3.0, 100.0);
         let e = entries(&r.take_reports(ME, 1));
         assert_eq!(e.len(), 1);
         assert!((e[0].total - 10.0).abs() < 1e-6 && e[0].claim == 0);
@@ -384,7 +414,7 @@ mod tests {
             },
         );
         assert!(r.take_reports(ME, 100).is_empty());
-        r.add(5, 2.5);
+        r.add(5, 2.5, 90.0);
         let e = entries(&r.take_reports(ME, 101));
         assert!((e[0].total - 12.5).abs() < 1e-6);
     }
@@ -393,7 +423,7 @@ mod tests {
     fn the_view_subtracts_only_unapplied_own_damage() {
         let mut r = Reporter::new();
         assert!((r.view(5, 100.0) - 100.0).abs() < 1e-6);
-        r.add(5, 30.0);
+        r.add(5, 30.0, 100.0);
         // Nothing acked yet: the snapshot's hull lacks this side's 30.
         assert!((r.view(5, 100.0) - 70.0).abs() < 1e-6);
         // The owner applied 20 of it; its hull then was 75 (it took 5 itself).
@@ -460,7 +490,7 @@ mod tests {
     #[test]
     fn kill_claims_ride_on_the_reports() {
         let mut r = Reporter::new();
-        r.add(9, 50.0);
+        r.add(9, 50.0, 50.0);
         let _ = r.take_reports(ME, 1);
         r.claim_kill(9);
         assert!(r.claimed(9));
@@ -590,7 +620,7 @@ mod tests {
         // must reach the owner at once.
         let mut r = Reporter::new();
         let mut l = Ledger::new();
-        r.add(9, 300.0);
+        r.add(9, 300.0, 1000.0);
         for e in entries(&r.take_reports(ME, 0)) {
             assert!((l.report(ME, &e).delta - 300.0).abs() < 1e-3);
         }
@@ -601,7 +631,7 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert!(l.report(ME, &again[0]).delta.abs() < 1e-3, "nothing new");
         assert!(entries(&r.take_reports(ME, 1 + RESEND_FRAMES)).is_empty());
-        r.add(9, 50.0);
+        r.add(9, 50.0, 700.0);
         let e = entries(&r.take_reports(ME, 2 + RESEND_FRAMES));
         assert!(
             (l.report(ME, &e[0]).delta - 50.0).abs() < 1e-3,
@@ -614,7 +644,7 @@ mod tests {
     #[test]
     fn a_resync_keeps_an_open_claim_and_sends_it_again() {
         let mut r = Reporter::new();
-        r.add(4, 80.0);
+        r.add(4, 80.0, 80.0);
         r.claim_kill(4);
         let first = entries(&r.take_reports(ME, 0));
         assert_eq!(first[0].claim, 1);
@@ -638,7 +668,7 @@ mod tests {
         let mut owner_hull = 500.0_f32;
         for f in 0..200u64 {
             if f < 100 {
-                r.add(1, 3.0);
+                r.add(1, 3.0, owner_hull);
             }
             let msgs = r.take_reports(ME, f);
             if rng.chance(0.67) {
@@ -656,5 +686,51 @@ mod tests {
         }
         assert!((owner_hull - 200.0).abs() < 1e-3, "{owner_hull}");
         assert!((r.view(1, owner_hull) - 200.0).abs() < 1e-3);
+    }
+
+    fn ack(frame: u32, net_id: NetId, applied: f32, hull: f32) -> DamageAck {
+        DamageAck {
+            peer: ME,
+            frame,
+            entries: vec![AckEntry {
+                net_id,
+                applied,
+                hull,
+                judged: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_snapshot_holding_the_damage_in_flight_does_not_count_it_twice() {
+        // An enemy at 40 takes a hit of 30. The owner's snapshot (hull 10)
+        // comes before its ack: the view stays 10, not 10 - 30.
+        let mut r = Reporter::new();
+        r.add(5, 30.0, 40.0);
+        assert!((r.view(5, 40.0) - 10.0).abs() < 1e-4);
+        assert!((r.view(5, 10.0) - 10.0).abs() < 1e-4, "not -20");
+        r.on_ack(ME, &ack(40, 5, 30.0, 10.0));
+        assert!((r.view(5, 10.0) - 10.0).abs() < 1e-4);
+        // A second hit is in flight on top of the ack's hull.
+        r.add(5, 30.0, 10.0);
+        assert!(r.view(5, 10.0) < 0.0);
+    }
+
+    #[test]
+    fn an_ack_from_before_the_damage_in_flight_is_not_its_base() {
+        // The last ack (applied 85, hull 5) predates a hit of 25 on an enemy
+        // the owner has repaired to 200: the view is 175, not 5 - 25.
+        let mut r = Reporter::new();
+        r.add(7, 85.0, 90.0);
+        r.on_ack(ME, &ack(100, 7, 85.0, 5.0));
+        assert!((r.view(7, 5.0) - 5.0).abs() < 1e-4);
+        r.add(7, 25.0, 200.0);
+        assert!((r.view(7, 200.0) - 175.0).abs() < 1e-4, "not -20");
+        // The same ack repeated changes nothing. The ack of the new hit is the
+        // base then.
+        r.on_ack(ME, &ack(101, 7, 85.0, 200.0));
+        assert!((r.view(7, 175.0) - 175.0).abs() < 1e-4);
+        r.on_ack(ME, &ack(130, 7, 110.0, 175.0));
+        assert!((r.view(7, 175.0) - 175.0).abs() < 1e-4);
     }
 }

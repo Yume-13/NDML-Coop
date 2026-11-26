@@ -20,9 +20,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The hooks of [`crate::wild`]: `oUpgrade_Create_0` and `setRerolls` see
-//! `gameModWildMetamorphosis` off during the call, then the run's value is
-//! put back. [`restore_pending`] puts it back if an after-hook never ran.
+//! The hooks of [`crate::wild`]: before and after `oUpgrade_Create_0`,
+//! `setRerolls`, `initializeLoadout` and `refreshWild`,
+//! `gameModWildMetamorphosis` reads as this player chose, then the run's
+//! value is put back. [`restore_pending`] puts it back if an after-hook never
+//! ran.
 
 #![forbid(unsafe_code)]
 
@@ -47,7 +49,12 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
     let flag = var(ctx, names::GLOBAL_WILD);
     let _ = FLAG.set(flag);
     let h = Handles { flag };
-    for name in [names::UPGRADE_CREATE, names::SET_REROLLS] {
+    for name in [
+        names::UPGRADE_CREATE,
+        names::SET_REROLLS,
+        names::INITIALIZE_LOADOUT,
+        names::REFRESH_WILD,
+    ] {
         let (s1, s2) = (Arc::clone(shared), Arc::clone(shared));
         let r = ctx.hook(
             name,
@@ -55,13 +62,14 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
             move |call, old| after(call, &s2, h, old),
         );
         if let Err(e) = r {
-            log::warn!("co-op: unable to hook {name} ({e}); wild_mods = \"off\" may not apply");
+            log::warn!("co-op: unable to hook {name} ({e}); the Wild Mods row may not apply");
         }
     }
 }
 
-/// Switch the flag off for this event if the setting applies; returns the
-/// run's value for the after-hook.
+/// The flag reads as this player chose for this event, linked or in a co-op
+/// run. Returns the run's value for the after-hook. A nested event finds the
+/// flag already set and leaves it to the outer one.
 fn before(call: &mut Call<'_>, s: &Shared, h: Handles) -> Option<Value> {
     let var = h.flag?;
     let (setting, coop) = {
@@ -70,9 +78,9 @@ fn before(call: &mut Call<'_>, s: &Shared, h: Handles) -> Option<Value> {
     };
     let g = call.global()?;
     let old = g.get_value(var);
-    let off = wild::off_value(setting, coop, old.as_ref())?;
+    let mine = wild::flag_value(setting, coop, old.as_ref())?;
     let old = old?;
-    match g.set(var, off) {
+    match g.set(var, mine) {
         Ok(()) => {
             s.wild.set(old.clone());
             Some(old)
@@ -80,7 +88,7 @@ fn before(call: &mut Call<'_>, s: &Shared, h: Handles) -> Option<Value> {
         Err(e) => {
             warn_once(
                 "wild-off",
-                &format!("co-op: wild_mods: unable to switch the flag ({e})"),
+                &format!("co-op: Wild Mods: unable to switch the flag ({e})"),
             );
             None
         }
@@ -102,7 +110,7 @@ fn put_back(call: &Call<'_>, flag: Option<Variable>, old: Value) {
     if let Err(e) = g.set(var, old) {
         warn_once(
             "wild-back",
-            &format!("co-op: wild_mods: unable to put the flag back ({e})"),
+            &format!("co-op: Wild Mods: unable to put the flag back ({e})"),
         );
     }
 }
@@ -110,7 +118,9 @@ fn put_back(call: &Call<'_>, flag: Option<Variable>, old: Value) {
 /// Put back a value an after-hook did not (run and menu ticks).
 pub(crate) fn restore_pending(call: &Call<'_>, s: &Shared) {
     if let Some(old) = s.wild.take() {
-        log::warn!("co-op: wild_mods: Wild Metamorphosis put back after an upgrade screen");
+        log::warn!(
+            "co-op: Wild Mods: Wild Metamorphosis put back after an event that did not finish"
+        );
         put_back(call, FLAG.get().copied().flatten(), old);
     }
 }

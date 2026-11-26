@@ -47,10 +47,16 @@ pub const ROLE_CLIENT: u8 = 2;
 
 const CHECK_DESTROY: &str = "gml_Script_checkDestroy";
 const ENEMY_DESTROYED: &str = "gml_Script_enemyDestroyed";
-const ASTEROID_STEPS: [&str; 2] = [
-    "gml_Object_oAsteroid_Step_0",
-    "gml_Object_oAsteroidSmall_Step_0",
-];
+/// The game's record of a heal, with the healed enemy as self and the hull
+/// it gained as argument 0 (a Constructor drone's repair,
+/// `oConstructorDrone_Alarm_1`, and the healing aura, `enemyHealingAura`,
+/// of Cherubs and Myrmidons): the honour rule's repairs.
+const RECORD_HEALING: &str = "gml_Script_recordHealing";
+/// GameMaker's Destroy event kind: every enemy death path ends in
+/// `instance_destroy()`, which runs it (`checkDestroy`,
+/// `checkDestroyNoExplosion`, `checkDestroyReduced`, an asteroid's own
+/// `oAsteroid_Step_0`).
+const EVENT_DESTROY: i32 = 1;
 const SOLID: &str = "oSolid";
 /// How long a destroyed enemy's net id is remembered for the "destroyed a
 /// second time" check (well under the net id wrap).
@@ -246,12 +252,14 @@ struct State {
     gone_logged: u32,
     /// Host: kill credit and the kill-effects counts.
     kills: super::fx::HostKills,
-    /// Host: the death paths running now, innermost last, each with the
-    /// partner its death is credited to.
-    deaths: Vec<Option<PeerId>>,
     /// Host: `enemyDestroyed` running on this instance (its map entry goes
     /// after it, so the paths inside it still find it).
     destroying: Vec<usize>,
+    /// Host: each repaired object's name (the honoured kill's log line).
+    heal_types: HashMap<u32, String>,
+    /// Host: each partner's measured round trip (the link's smoothed RTT),
+    /// for the honour window ([`super::honour_window`]).
+    rtts: HashMap<PeerId, std::time::Duration>,
     /// The status channel (joining side, host side) and its counts.
     status_rep: ndml_net::status::StatusReporter,
     status_led: ndml_net::status::StatusLedger,
@@ -280,21 +288,13 @@ impl std::fmt::Debug for PlayerSide {
     }
 }
 
-/// The kill credit of the host enemy at an instance key: the world's
-/// `last_damager`, as a kill's `Despawn` names it.
-pub type KillCreditFn = dyn Fn(usize) -> Option<PeerId> + Send + Sync;
-
-/// See [`KillCreditFn`].
-pub struct KillCredit(pub Box<KillCreditFn>);
-
-impl std::fmt::Debug for KillCredit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("KillCredit")
-    }
-}
-
 /// Status ticks (burns, corrosion, darts), run in the enemy's own Step.
-const STATUS_SITES: &[&str] = &["gml_Script_degenerations", "gml_Script_dartBurn"];
+///
+/// The whole set: a status tick is a hull writer ([`AUDIT_SITES`]) that the
+/// damaged enemy's own events run on itself between hits. Of the bracketed
+/// scripts called from an object's Step, only `degenerations` (burns and
+/// corrosion) and `dartBurn` (a dart lodged in the enemy) tick a status.
+pub(super) const STATUS_SITES: &[&str] = &["gml_Script_degenerations", "gml_Script_dartBurn"];
 
 /// A bracket's state from its before-hook to its after-hook.
 #[derive(Debug)]
@@ -313,6 +313,9 @@ pub struct DamageHooks {
     role: AtomicU8,
     st: Mutex<State>,
     hull: Option<Variable>,
+    hull_max: Option<Variable>,
+    is_boss: Option<Variable>,
+    object_name: Option<Builtin>,
     check_destroy: Option<Script>,
     exists: Option<Builtin>,
     destroy: Option<Builtin>,
@@ -321,8 +324,6 @@ pub struct DamageHooks {
     solid: AtomicU32,
     /// Whether an instance is player-side (the mirror's rule), set once.
     player_side: OnceLock<PlayerSide>,
-    /// Host: the world's kill credit (kill effects), set once.
-    kill_credit: OnceLock<KillCredit>,
     /// Client: copies' Destroy events running now (the world's
     /// `die_like_host`): every hull change is the host's.
     host_deaths: AtomicU32,
@@ -340,13 +341,15 @@ impl DamageHooks {
             role: AtomicU8::new(ROLE_OFF),
             st: Mutex::new(State::default()),
             hull: v(crate::names::VAR_HULL),
+            hull_max: v(crate::names::VAR_HULL_MAX),
+            is_boss: v(crate::names::VAR_IS_BOSS),
+            object_name: ctx.builtin("object_get_name").ok(),
             check_destroy: ctx.script(CHECK_DESTROY).ok(),
             exists: ctx.builtin("instance_exists").ok(),
             destroy: ctx.builtin("instance_destroy").ok(),
             asset: ctx.builtin("asset_get_index").ok(),
             solid: AtomicU32::new(u32::MAX),
             player_side: OnceLock::new(),
-            kill_credit: OnceLock::new(),
             host_deaths: AtomicU32::new(0),
             fx: effects::FxHandles::new(ctx),
         }
@@ -389,11 +392,6 @@ impl DamageHooks {
 
     fn role(&self) -> u8 {
         self.role.load(Ordering::Relaxed)
-    }
-
-    /// Set the kill credit (host; see [`KillCredit`]).
-    pub fn set_kill_credit(&self, f: KillCredit) {
-        let _ = self.kill_credit.set(f);
     }
 
     /// The player-side rule (the mirror's), set once at start.
@@ -597,11 +595,21 @@ impl DamageHooks {
     /// waiting (`false` while the damage lock is held).
     #[must_use]
     pub fn claimed_now(&self, net_id: NetId) -> bool {
-        self.role() == ROLE_HOST
-            && self
-                .st
-                .try_lock()
-                .is_ok_and(|s| s.host.confirmed_claim(net_id).is_some())
+        self.claimant_now(net_id).is_some()
+    }
+
+    /// Host: the peer whose claim on `net_id` is confirmed and still open
+    /// (its game predicted the death and played it: sounds, Rupture), as
+    /// [`Self::claimed_now`]; `None` while the damage lock is held.
+    #[must_use]
+    pub fn claimant_now(&self, net_id: NetId) -> Option<PeerId> {
+        if self.role() != ROLE_HOST {
+            return None;
+        }
+        self.st
+            .try_lock()
+            .ok()
+            .and_then(|s| s.host.confirmed_claim(net_id))
     }
 
     /// Client: net ids whose kill claim is still open (the copy died here
@@ -653,23 +661,19 @@ impl DamageHooks {
         }
     }
 
-    /// After a `checkDestroy*` or asteroid Step ran on the client: a dying
-    /// copy that is gone now died here.
-    pub fn after_death_path(&self, call: &Call<'_>) {
+    /// After an instance's Destroy event on the client: a copy dying here
+    /// (a kill this game made) has died here, whichever death path ended it
+    /// (`checkDestroy*`, a Step of its own that destroys it on
+    /// `hull <= 0`). The shape, not the path's name: every death path ends
+    /// in the event (`EVENT_DESTROY`).
+    pub fn after_destroy_event(&self, key: usize) {
         if self.role() != ROLE_CLIENT {
             return;
         }
-        let Some(me) = call.instance() else { return };
-        let key = me.key();
         let Some(net_id) = self.lock().client.dying_net_id(key) else {
             return;
         };
-        let Ok(id) = me.builtin_value("id") else {
-            return;
-        };
-        if !self.exists(call, &id) {
-            self.left(key, Some(net_id));
-        }
+        self.left(key, Some(net_id));
     }
 
     /// A copy left the game here (`net_id` when known); closes its audit
@@ -842,6 +846,7 @@ impl DamageHooks {
                 }
                 let hull_max = target.as_ref().map_or(0.0, |t| t.1);
                 let object = target.as_ref().map_or(0, |t| t.2);
+                let honoured = self.write_off(call, &a, target.as_ref(), &mut read);
                 let after = read.map(|r| r.1);
                 {
                     let mut st = self.lock();
@@ -852,7 +857,36 @@ impl DamageHooks {
                     if let Some(h) = after.filter(|h| *h <= 0.0) {
                         killers.push((a.net_id, a.by, h as f32));
                     }
+                    if let Some(h) = honoured {
+                        let name = st
+                            .heal_types
+                            .get(&u32::from(object))
+                            .map_or("?", String::as_str);
+                        log::info!(
+                            "shared damage: claim on {} honoured past a repair: {name} (object {object}, max {hull_max:.1}) hull left {:.4}, repairs within one round trip ({} frames) {} (+{:.1}), written to 0",
+                            a.net_id,
+                            h.rest,
+                            h.window,
+                            h.repairs,
+                            h.repaired
+                        );
+                    }
                     if a.claim > 0 && st.host.judge(&a, after) == Verdict::Refuse {
+                        let window = super::honour_window(st.rtts.get(&a.by).copied());
+                        let seen = st.host.repairs_seen(a.net_id, window);
+                        log_limited!(
+                            log::Level::Info,
+                            "damage-claim-refused-hull",
+                            "shared damage: claim on {} by {:?} refused at hull {:.4} (object {object}, max {hull_max:.1}); repairs within one round trip ({}): counted {} (+{:.1}) not counted {}",
+                            a.net_id,
+                            a.by,
+                            after.unwrap_or(0.0),
+                            window
+                                .map_or_else(|| "no measure".to_owned(), |w| format!("{w} frames")),
+                            seen.counted,
+                            seen.sum,
+                            seen.uncounted
+                        );
                         again.push(a.net_id);
                         out.push(Message::KillRefused {
                             net_id: a.net_id,
@@ -865,6 +899,48 @@ impl DamageHooks {
             }
         }
         (killers, again, out, held)
+    }
+
+    /// A claim short only by what carrying the hull lost, or by no more than
+    /// repairs the claimer could not have seen: the kill stands
+    /// ([`HostDamage::carried_short`], [`HostDamage::honour`]). Writes the
+    /// enemy's hull to 0 and `read` to what the game then holds. Returns the
+    /// honour, for its log line.
+    fn write_off(
+        &self,
+        call: &Call<'_>,
+        a: &super::Apply,
+        target: Option<&(Value, f32, u16)>,
+        read: &mut Option<(f64, f64)>,
+    ) -> Option<super::Honour> {
+        let (Some((before, after)), Some((id, hull_max, _)), Some(hv)) = (*read, target, self.hull)
+        else {
+            return None;
+        };
+        let mut honoured = None;
+        let written = {
+            let mut st = self.lock();
+            st.host.carried_short(a, after, *hull_max) || {
+                let window = super::honour_window(st.rtts.get(&a.by).copied());
+                honoured = st.host.honour(a, after, *hull_max, window);
+                honoured.is_some()
+            }
+        };
+        if written {
+            let _ = call.with(id, |inst, _| {
+                let _ = inst.set_f64(hv, 0.0);
+            });
+            *read = Some((before, 0.0));
+        }
+        honoured
+    }
+
+    /// Host: each partner's measured round trip this frame (the link's
+    /// smoothed RTT; a peer missing or at zero has no measure).
+    pub fn set_rtts(&self, rtts: &[(PeerId, std::time::Duration)]) {
+        let mut st = self.lock();
+        st.rtts.clear();
+        st.rtts.extend(rtts.iter().copied());
     }
 
     /// The host's acks this frame, and its stuck-at-0 watch.
@@ -999,6 +1075,44 @@ impl DamageHooks {
         if let Some(key) = st.destroying.pop() {
             st.copies.remove(&key);
         }
+    }
+
+    /// `recordHealing` (host): a repair on a shared enemy, for the honour
+    /// rule ([`HostDamage::repaired`]).
+    fn on_heal(&self, call: &Call<'_>) {
+        if self.role() != ROLE_HOST {
+            return;
+        }
+        let Some(me) = call.instance() else { return };
+        let Some(amount) = call.arg_value(0).and_then(|v| v.as_f64()) else {
+            return;
+        };
+        let Some(net) = self.lock().copies.get(&me.key()).copied() else {
+            return;
+        };
+        let hull_max = self.hull_max.and_then(|v| me.get_f64(v)).unwrap_or(0.0);
+        let boss = self
+            .is_boss
+            .and_then(|v| me.get_f64(v))
+            .is_some_and(|b| b > 0.5);
+        let object = crate::world::classify::object_index(
+            &me.builtin_value("object_index").unwrap_or(Value::Undefined),
+        );
+        // A boss is never counted, by its own `isBoss`; its parts that do not
+        // carry it count as any enemy. No object: never counted.
+        let Some(o) = object else {
+            self.lock().host.repaired(net, amount, hull_max, true);
+            return;
+        };
+        if !self.lock().heal_types.contains_key(&o) {
+            let name = self
+                .object_name
+                .and_then(|b| call.call_builtin(b, &[f64::from(o).into()]).ok())
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            self.lock().heal_types.insert(o, name);
+        }
+        self.lock().host.repaired(net, amount, hull_max, boss);
     }
 
     /// The context of a bracketed call (see [`super::cause`]).
@@ -1150,8 +1264,9 @@ impl DamageHooks {
     }
 }
 
-/// Register the `enemyDestroyed` hook, the client's asteroid death watch and
-/// the hull-write brackets. Returns how many sites were hooked.
+/// Register the `enemyDestroyed` hook, the client's death watch (Destroy
+/// events), the repair watch and the hull-write brackets. Returns how many
+/// sites were hooked.
 #[allow(clippy::many_single_char_names)] // hook closures: a, b per site
 pub fn register(ctx: &ModContext, d: &Arc<DamageHooks>) -> usize {
     let mut n = 0;
@@ -1159,13 +1274,22 @@ pub fn register(ctx: &ModContext, d: &Arc<DamageHooks>) -> usize {
         Ok(()) => n += 1,
         Err(e) => log::warn!("shared damage: {name}: {e}"),
     };
-    for name in ASTEROID_STEPS {
-        let a = Arc::clone(d);
-        ok(
-            name,
-            ctx.hook_after(name, move |call| a.after_death_path(call)),
-        );
-    }
+    let a = Arc::clone(d);
+    ok(
+        "Destroy events",
+        ctx.observe_event(EVENT_DESTROY, 0, move |e| {
+            if e.after
+                && let Some(i) = e.instance()
+            {
+                a.after_destroy_event(i.key());
+            }
+        }),
+    );
+    let h = Arc::clone(d);
+    ok(
+        RECORD_HEALING,
+        ctx.hook_before(RECORD_HEALING, move |call| h.on_heal(call)),
+    );
     let (a, b) = (Arc::clone(d), Arc::clone(d));
     ok(
         ENEMY_DESTROYED,
@@ -1192,7 +1316,6 @@ pub fn register(ctx: &ModContext, d: &Arc<DamageHooks>) -> usize {
             }
         }
     }
-    n += effects::register(ctx, d);
     log::info!(
         "shared damage: on (audit {}, kill effects {}, status {}; {n} hook sites)",
         d.settings.audit,

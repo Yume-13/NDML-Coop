@@ -22,7 +22,7 @@
 
 //! Pure decisions behind the per-frame pump: when it runs, Steam
 //! availability, the hidden listener's life and cost accounting. One active
-//! tick: listener, `steam_update()` (the game skips it in the loadout room
+//! tick: listener, `steam_update()` (the game skips it on the new game screen
 //! and end screen), send, receive, lobby getters, then the lobby flow.
 
 #![forbid(unsafe_code)]

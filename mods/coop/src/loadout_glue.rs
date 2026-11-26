@@ -28,13 +28,13 @@
 //!   applies the host's start.
 //! * `resetDailyChallenges` (after): the flags again while the host's start is applied.
 //! * `ini_write_bool` (before): skipped while the host's start is applied.
-//! * `resumeRun` (after): host: a resumed run's settings sent.
+//! * `resumeRun` (after): the next run is a resumed one, never a co-op run.
 //! * `resetProgress` (after): while held, what it wrote becomes the player's own picks.
 //! * `oLoadout_Step_0` (before): network pump; host: picks on change; joining game: hold the
 //!   host's picks, make a waiting start, the bar line.
 //! * `leaveLoadout` (before): nothing waits.
-//! * `oLoadout_Draw_64` (before + after): the Start row reads "Ready" for the draw; the bar line
-//!   and link line.
+//! * `oLoadout_Draw_64` (before + after): the Start row reads "Ready" for the draw; a refused
+//!   Resume Run's reason in the screen's warning line; the bar line and link line.
 //!
 //! [`menu_frame`] (from `lib.rs`) gives the player's picks back and sends the
 //! host's.
@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use ndml_net::Message;
 use ndml_net::msg::DailyPick;
@@ -49,7 +50,7 @@ use ndml_sdk::{Call, Error, Instance, ModContext, Script, Value, Variable};
 
 use crate::Shared;
 use crate::game::{num, script, var, warn_once};
-use crate::loadout::{self, Confirm, MODE_FLAGS, Own, Rules};
+use crate::loadout::{self, Confirm, Fades, MODE_FLAGS, Note, Own, Rules, SavedRunGuard};
 use crate::names;
 use crate::net::{self, Out};
 use crate::ui::text;
@@ -59,8 +60,10 @@ use crate::ui::text;
 struct Handles {
     /// `oLoadout.pos` (0: Start).
     pos: Option<Variable>,
-    /// `oLoadout.fade` (1 once a start was taken).
+    /// `oLoadout.fade` (1 once a new run's start was taken) and
+    /// `oLoadout.fadeBlack` (1 once a resumed run's was).
     fade: Option<Variable>,
+    fade_black: Option<Variable>,
     daily_choice: Option<Variable>,
     daily_mod: Option<Variable>,
     daily_mod2: Option<Variable>,
@@ -72,6 +75,21 @@ struct Handles {
     confirm: Option<Script>,
     /// `global.strLoadoutStart`, the Start row's label.
     start_label: Option<Variable>,
+    /// The screen's red warning line in resume mode: its text
+    /// (`global.strLoadoutResumeRunNote`) and its colour (`oLoadout.rgbG`, `rgbB`).
+    resume_note: Option<Variable>,
+    rgb_g: Option<Variable>,
+    rgb_b: Option<Variable>,
+    /// `global.loaded_run_state` and `leaveLoadout`, for `loadout::SavedRunGuard`.
+    loaded_run: Option<Variable>,
+    leave: Option<Script>,
+}
+
+impl Handles {
+    /// The refused Resume Run can be said in the screen's own red line.
+    fn red_line(&self) -> bool {
+        self.resume_note.is_some() && self.rgb_g.is_some() && self.rgb_b.is_some()
+    }
 }
 
 impl Handles {
@@ -79,6 +97,7 @@ impl Handles {
         Self {
             pos: var(ctx, names::VAR_LOADOUT_POS),
             fade: var(ctx, names::VAR_LOADOUT_FADE),
+            fade_black: var(ctx, names::VAR_LOADOUT_FADE_BLACK),
             daily_choice: var(ctx, names::VAR_DAILY_CHOICE),
             daily_mod: var(ctx, names::VAR_DAILY_MOD),
             daily_mod2: var(ctx, names::VAR_DAILY_MOD2),
@@ -90,6 +109,11 @@ impl Handles {
                 .collect(),
             confirm: script(ctx, names::CONFIRM_LOADOUT),
             start_label: var(ctx, names::GLOBAL_LOADOUT_START),
+            resume_note: var(ctx, names::GLOBAL_LOADOUT_RESUME_NOTE),
+            rgb_g: var(ctx, names::VAR_LOADOUT_RGB_G),
+            rgb_b: var(ctx, names::VAR_LOADOUT_RGB_B),
+            loaded_run: var(ctx, names::GLOBAL_LOADED_RUN_STATE),
+            leave: script(ctx, names::LEAVE_LOADOUT),
         }
     }
 }
@@ -118,12 +142,22 @@ pub(crate) fn note_failed(name: &str) {
 /// needs is there. Off, each game plays its own picks.
 pub(crate) fn decide(s: &Shared) {
     let failed = FAILED.lock().map_or_default(|f| f.clone());
+    if let Some(why) = loadout::run_safety(&failed) {
+        log::warn!(
+            "co-op: co-op runs are off in this game ({why}); linking still works in the menus, every run is solo"
+        );
+        s.lock().core.coop_runs_off(why);
+    }
     let missing = loadout::missing_hooks(&loadout::NEEDED_HOOKS, &failed);
-    // The Start label is not needed: without it the rule still works.
+    // The rule works without the Start label and the bar.
     let h = HANDLES.get();
     let mut handles = vec![
         ("oLoadout.pos", h.is_some_and(|h| h.pos.is_some())),
         ("oLoadout.fade", h.is_some_and(|h| h.fade.is_some())),
+        (
+            "oLoadout.fadeBlack",
+            h.is_some_and(|h| h.fade_black.is_some()),
+        ),
         (
             "gml_Script_confirmLoadout (script)",
             h.is_some_and(|h| h.confirm.is_some()),
@@ -213,7 +247,7 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
     let s = Arc::clone(shared);
     hook_or_warn(
         names::RESUME_RUN,
-        ctx.hook_after(names::RESUME_RUN, move |call| resumed_start(call, &s)),
+        ctx.hook_after(names::RESUME_RUN, move |_| resumed_start(&s)),
     );
     let (s, hh) = (Arc::clone(shared), Arc::clone(&h));
     hook_or_warn(
@@ -223,14 +257,7 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
     let s = Arc::clone(shared);
     hook_or_warn(
         names::LEAVE_LOADOUT,
-        ctx.hook_before(names::LEAVE_LOADOUT, move |_| {
-            let mut c = s.lock();
-            if c.loadout.ready() {
-                log::info!("co-op: the waiting start is let go (back from the new game screen)");
-            }
-            c.loadout.cancel();
-            c.loadout_screen = Screen::default();
-        }),
+        ctx.hook_before(names::LEAVE_LOADOUT, move |call| leave_before(call, &s)),
     );
     let (s1, h1, s2) = (Arc::clone(shared), Arc::clone(&h), Arc::clone(shared));
     hook_or_warn(
@@ -239,94 +266,182 @@ pub(crate) fn register(ctx: &ModContext, shared: &Arc<Shared>) {
             names::LOADOUT_DRAW_GUI,
             move |call| label_before(call, &s1, &h1),
             move |call, swapped| {
-                let (note, hud) = {
-                    let c = s2.lock();
-                    (c.loadout_screen.note.clone(), c.loadout_screen.hud.clone())
+                let (note, hud, alert, count) = {
+                    let mut c = s2.lock();
+                    let sc = &c.loadout_screen;
+                    let note = sc.note.clone().map(|t| crate::ui::run::Bar {
+                        pulse: sc.pulse,
+                        ..crate::ui::run::Bar::new(t)
+                    });
+                    let (hud, count) = (sc.hud.clone(), sc.count);
+                    if sc.pulse
+                        && let Some(text) = note.as_ref().map(|b| b.text.clone())
+                    {
+                        crate::ui::glue::ready_shown(
+                            &mut c,
+                            crate::ui::run::ReadyPlace::NewGameScreen,
+                            &text,
+                        );
+                    }
+                    (note, hud, c.ready_notice.step(), count)
                 };
-                crate::ui::glue::paint_note(call, &s2, note.as_deref(), hud);
+                crate::ui::glue::paint_screen_note(call, &s2, note, alert, hud, count);
                 label_after(call, swapped);
             },
         ),
     );
 }
 
-/// What the loadout screen shows this frame (set by its step).
+/// Back from the new game screen (`leaveLoadout`): nothing waits, a start
+/// count is called off. After the count's go the back is skipped.
+fn leave_before(call: &mut Call<'_>, s: &Shared) {
+    let mut c = s.lock();
+    if c.loadout.start_locked() {
+        call.skip_original();
+        log::info!("co-op: back on the new game screen skipped (the start count's go is out)");
+        return;
+    }
+    if c.loadout.ready() {
+        log::info!("co-op: the waiting start is let go (back from the new game screen)");
+    }
+    c.loadout.cancel();
+    c.loadout_screen = Screen::default();
+}
+
+/// What the new game screen shows this frame (set by its step).
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent facts of one visit, each read alone
 pub(crate) struct Screen {
-    /// The bar line.
+    /// The bar line (either player's).
     pub note: Option<String>,
+    /// The bar pulses: the partner is ready, this player not yet.
+    pub pulse: bool,
     /// The run HUD's link line (with `overlay` on).
     pub hud: Option<crate::ui::run::Hud>,
+    /// The start count's number, while it runs.
+    pub count: Option<crate::ui::run::CountView>,
     /// The Start row reads "Ready".
     pub ready: bool,
     /// The swap was logged on this visit.
     logged: bool,
+    /// Steps since a refused Resume Run press. The red line strobes, then
+    /// holds the mod's sentence until the next press or leaving the screen.
+    warn: Option<u32>,
+    /// What the red line says (set by the step while `warn` is on).
+    warn_line: Option<String>,
+    /// The red line's colour could not be written: the bar says it instead.
+    warn_failed: bool,
+    /// This visit came from the Game Start whose saved-run question the mod
+    /// answered (`ui::glue`).
+    preanswered: bool,
+    /// Since when the link has been out on this visit.
+    unlinked_since: Option<std::time::Instant>,
+    /// The guard took the player back to the menu (once).
+    left: bool,
+}
+
+impl Screen {
+    /// The refused Resume Run is said by the screen's red line, else by the bar.
+    fn red_line(&self, h: &Handles) -> bool {
+        h.red_line() && !self.warn_failed
+    }
 }
 
 /// The Start row's label while the joining player's screen is the host's.
 const READY: &str = "Ready";
 
-/// The game's own label, put aside for one draw; the next step or menu frame
-/// puts it back if the after-hook never ran.
-static LABEL_PENDING: std::sync::Mutex<Option<(Variable, Value)>> = std::sync::Mutex::new(None);
+/// The game's own strings, put aside for one draw; the next step or menu
+/// frame puts them back if the after-hook never ran.
+static LABEL_PENDING: std::sync::Mutex<Vec<(Variable, Value)>> = std::sync::Mutex::new(Vec::new());
 
 /// Before `oLoadout_Draw_64`: "Ready" for this draw when the screen is
-/// locked. Without the label, the game's own "Start" stays.
-fn label_before(call: &Call<'_>, s: &Shared, h: &Handles) -> Option<(Variable, Value)> {
+/// locked, and the mod's sentence in the red line after a refused Resume Run.
+/// Where a string cannot be written, the game's own words stay.
+fn label_before(call: &Call<'_>, s: &Shared, h: &Handles) -> Vec<(Variable, Value)> {
     restore_label(call);
-    let log_it = {
+    let (ready, log_it, warn) = {
         let mut c = s.lock();
-        if !c.loadout_screen.ready {
-            return None;
+        let sc = &mut c.loadout_screen;
+        let ready = sc.ready;
+        let log_it = ready && !std::mem::replace(&mut sc.logged, true);
+        let warn = sc.warn_line.clone().filter(|_| sc.red_line(h));
+        (ready, log_it, warn)
+    };
+    let mut out = Vec::new();
+    if ready {
+        if let Some(v) = h.start_label {
+            if swap_text(call, v, READY, "loadout-label", "Start label", &mut out) && log_it {
+                log::info!(
+                    "co-op: the new game screen's Start reads \"{READY}\" (linked: the run starts when both players are ready)"
+                );
+            }
+        } else {
+            warn_once(
+                "loadout-label",
+                "co-op: the new game screen's Start label was not found; it keeps the game's own word",
+            );
         }
-        !std::mem::replace(&mut c.loadout_screen.logged, true)
-    };
-    let Some(v) = h.start_label else {
-        warn_once(
-            "loadout-label",
-            "co-op: the new game screen's Start label was not found; it keeps the game's own word",
-        );
-        return None;
-    };
-    let g = call.global()?;
-    let old = g.get_value(v)?;
-    if let Err(e) = g.set(v, READY) {
-        warn_once(
-            "loadout-label",
-            &format!(
-                "co-op: cannot relabel the new game screen's Start ({e}); it keeps the game's own word"
-            ),
-        );
-        return None;
     }
-    if log_it {
-        log::info!(
-            "co-op: the new game screen's Start reads \"{READY}\" (the host's run settings)"
-        );
+    if let (Some(line), Some(v)) = (warn, h.resume_note) {
+        swap_text(call, v, &line, "loadout-note", "warning line", &mut out);
     }
     if let Ok(mut p) = LABEL_PENDING.lock() {
-        *p = Some((v, old.clone()));
+        p.clone_from(&out);
     }
-    Some((v, old))
+    out
 }
 
-/// After the draw: the game's own label back.
-fn label_after(call: &Call<'_>, swapped: Option<(Variable, Value)>) {
-    if let Some((v, old)) = swapped {
-        if let Ok(mut p) = LABEL_PENDING.lock() {
-            *p = None;
-        }
+/// Write `text` into the global `v` for this draw, the value it replaces into
+/// `out`. `false` (one warning under `key`) when it cannot be.
+fn swap_text(
+    call: &Call<'_>,
+    v: Variable,
+    text: &str,
+    key: &str,
+    what: &str,
+    out: &mut Vec<(Variable, Value)>,
+) -> bool {
+    let Some(g) = call.global() else { return false };
+    let Some(old) = g.get_value(v) else {
+        return false;
+    };
+    if let Err(e) = g.set(v, text) {
+        warn_once(
+            key,
+            &format!(
+                "co-op: cannot write the new game screen's {what} ({e}); it keeps the game's own words"
+            ),
+        );
+        return false;
+    }
+    out.push((v, old));
+    true
+}
+
+/// After the draw: the game's own strings back.
+fn label_after(call: &Call<'_>, swapped: Vec<(Variable, Value)>) {
+    if swapped.is_empty() {
+        return;
+    }
+    if let Ok(mut p) = LABEL_PENDING.lock() {
+        p.clear();
+    }
+    for (v, old) in swapped.into_iter().rev() {
         put_label(call, v, old);
     }
 }
 
-/// A label put aside and not put back yet goes back now.
+/// Strings put aside and not put back go back.
 fn restore_label(call: &Call<'_>) {
-    let pending = LABEL_PENDING.lock().ok().and_then(|mut p| p.take());
-    if let Some((v, old)) = pending {
-        log::warn!(
-            "co-op: the new game screen's Start label put back after a draw that did not finish"
-        );
+    let pending = LABEL_PENDING
+        .lock()
+        .ok()
+        .map_or_default(|mut p| std::mem::take(&mut *p));
+    if pending.is_empty() {
+        return;
+    }
+    log::warn!("co-op: the new game screen's strings put back after a draw that did not finish");
+    for (v, old) in pending.into_iter().rev() {
         put_label(call, v, old);
     }
 }
@@ -337,7 +452,7 @@ fn put_label(call: &Call<'_>, v: Variable, old: Value) {
     {
         warn_once(
             "loadout-label-back",
-            &format!("co-op: cannot put the new game screen's Start label back ({e})"),
+            &format!("co-op: cannot put a new game screen string back ({e})"),
         );
     }
 }
@@ -381,23 +496,29 @@ fn link_line(c: &mut crate::Coop, now: std::time::Instant) -> Option<crate::ui::
 #[derive(Debug, Clone, Copy)]
 enum Before {
     Nothing,
-    /// A Start of the game's own (`fade` before it). `send`: the host's new
-    /// run, whose settings go out once its fade begins.
+    /// A Start of the game's own (the fades before it). `send`: the host's
+    /// new run, whose settings go out once its fade begins.
     OwnStart {
-        fade: Option<f64>,
+        fades: Fades,
         send: bool,
+        /// The Start resumes a saved run (`choseResumeRun`).
+        resumed: bool,
     },
-    /// The host's start is applied (`fade` before it).
+    /// The host's start is applied (the fades before it).
     Applied {
-        fade: Option<f64>,
+        fades: Fades,
     },
 }
 
-/// The game's own Start began its fade in this call (`fade` became 1). The
-/// game's `confirmLoadout` returns at once while `alarm[1]` or `alarm[2]` runs.
-fn fade_began(me: &Instance<'_>, h: &Handles, before: Option<f64>) -> bool {
-    num(me, h.fade).is_some_and(|f| (f - 1.0).abs() < 1e-6)
-        && before.is_none_or(|f| (f - 1.0).abs() >= 1e-6)
+/// The screen's two fades now (`fade`, `fadeBlack`).
+fn fades(me: &Instance<'_>, h: &Handles) -> Fades {
+    (num(me, h.fade), num(me, h.fade_black))
+}
+
+/// The game took a Start in this call (`before`: the fades before it): one
+/// of its fades began (`loadout::start_began`).
+fn fade_began(me: &Instance<'_>, h: &Handles, before: Fades) -> bool {
+    loadout::start_began(before, fades(me, h))
 }
 
 fn pos0(me: &Instance<'_>, h: &Handles) -> bool {
@@ -447,11 +568,22 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
     };
     let start = pos0(&me, h);
     let resumed = resumed(call, h);
+    // The saved run's guard: no solo start over a saved run the game never
+    // asked about (`loadout::SavedRunGuard`).
+    if start && !resumed && saved_run_guard(call, s, h, Instant::now()) != SavedRunGuard::Off {
+        call.skip_original();
+        crate::ui::glue::play_move(call, s);
+        log::info!("co-op: a solo Start over the saved run refused (the link is out)");
+        return Before::Nothing;
+    }
     let mut c = s.lock();
     let linked = c.core.linked();
     let host = linked && c.core.is_host();
     // Already waiting: another press is not another line.
     let was_ready = c.loadout.ready();
+    // Any press ends the mod's red line.
+    c.loadout_screen.warn = None;
+    c.loadout_screen.warn_line = None;
     let (restore, decision) = if host {
         // Anything still held from a link as the joining game comes back first.
         let back = if c.loadout.held() {
@@ -482,8 +614,9 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
     }
     match decision {
         Confirm::Original if start => Before::OwnStart {
-            fade: num(&me, h.fade),
+            fades: fades(&me, h),
             send,
+            resumed,
         },
         Confirm::Original => Before::Nothing,
         Confirm::Starting => {
@@ -498,6 +631,8 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
         Confirm::ResumeBlocked => {
             call.skip_original();
             crate::ui::glue::play_move(call, s);
+            // The screen's red line strobes from this step on.
+            s.lock().loadout_screen.warn = Some(0);
             log::info!("co-op: Resume Run refused (playing together)");
             Before::Nothing
         }
@@ -505,8 +640,17 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
             call.skip_original();
             crate::ui::glue::play_select(call, s);
             if !was_ready {
-                log::info!("co-op: start waits on the new game screen for the host's start");
+                log::info!(
+                    "co-op: Ready on the new game screen ({}); the run starts when both players are",
+                    if host { "host" } else { "joining player" }
+                );
             }
+            Before::Nothing
+        }
+        Confirm::Unready => {
+            call.skip_original();
+            crate::ui::glue::play_move(call, s);
+            log::info!("co-op: Ready taken back on the new game screen");
             Before::Nothing
         }
         Confirm::Apply(r) => {
@@ -516,7 +660,7 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
                 r.describe(&|i| names::MODE_TITLES[i].1.to_owned())
             );
             Before::Applied {
-                fade: num(&me, h.fade),
+                fades: fades(&me, h),
             }
         }
     }
@@ -525,10 +669,10 @@ fn confirm_decide(call: &mut Call<'_>, s: &Shared, h: &Handles) -> Before {
 fn confirm_after(call: &mut Call<'_>, s: &Shared, h: &Handles, before: Before) {
     match before {
         Before::Nothing => {}
-        Before::Applied { fade } => {
+        Before::Applied { fades } => {
             // Not taken when the fade did not begin: the host's start is kept
             // for the next Start. Without an instance, taken.
-            let taken = call.instance().is_none_or(|me| fade_began(&me, h, fade));
+            let taken = call.instance().is_none_or(|me| fade_began(&me, h, fades));
             if !taken {
                 let mut c = s.lock();
                 c.loadout.start_not_taken();
@@ -547,18 +691,35 @@ fn confirm_after(call: &mut Call<'_>, s: &Shared, h: &Handles, before: Before) {
             if let Some(r) = applied {
                 write_modes(call, s, r.mods);
             }
-            s.lock().loadout.confirm_done();
+            let mut c = s.lock();
+            c.loadout.confirm_done();
+            start_taken(s, &mut c);
+            drop(c);
             let n = SKIPPED_WRITES.swap(0, std::sync::atomic::Ordering::Relaxed);
             log::info!(
                 "co-op: the host's start applied; {n} settings writes skipped (this player's saved mode picks untouched)"
             );
         }
-        Before::OwnStart { fade, send } => {
+        Before::OwnStart {
+            fades,
+            send,
+            resumed,
+        } => {
             let Some(me) = call.instance() else { return };
-            if !fade_began(&me, h, fade) {
+            if !fade_began(&me, h, fades) {
                 return;
             }
-            s.lock().loadout.started_own();
+            // A resumed run's Start too (`fadeBlack`).
+            let mut c = s.lock();
+            c.loadout.started_own();
+            if resumed {
+                // Its run is a resumed one from this press on.
+                c.core.resumed_next();
+                log::info!("co-op: a saved run's Resume Start taken: its run is solo");
+            } else {
+                start_taken(s, &mut c);
+            }
+            drop(c);
             if send {
                 let rules = read_rules(call, Some(&me), s, h);
                 send_start(s, &rules);
@@ -567,10 +728,26 @@ fn confirm_after(call: &mut Call<'_>, s: &Shared, h: &Handles, before: Before) {
     }
 }
 
+/// The game took a new run's Start (either role, the rule on or off).
+/// Taken while linked, its run is a co-op run and its resume file is off
+/// (`Core::start_taken`).
+fn start_taken(s: &Shared, c: &mut crate::Coop) {
+    c.core.start_taken();
+    s.flags.set_start_held(c.core.start_held());
+    if c.core.start_held() {
+        log::info!("co-op: a new run's Start taken while linked: its run is a co-op run");
+    }
+}
+
 /// Host: its run started with `rules`; the joining game's start follows.
 fn send_start(s: &Shared, rules: &Rules) {
     let mut c = s.lock();
-    if !(c.core.linked() && c.core.is_host() && c.loadout.enabled()) {
+    if !(c.core.is_host() && c.loadout.enabled()) {
+        return;
+    }
+    // Kept with or without the link, for `start_again`.
+    c.host_sent.started(rules);
+    if !c.core.linked() {
         return;
     }
     log::info!(
@@ -578,21 +755,39 @@ fn send_start(s: &Shared, rules: &Rules) {
         rules.describe(&|i| names::MODE_TITLES[i].1.to_owned())
     );
     net::apply(&c.net, vec![Out::Broadcast(message(true, rules, true))]);
-    c.host_sent.started();
 }
 
-/// Host: a resumed run (a resume pressed unlinked whose link completed before
-/// `resumeRun`). `resumeRun` restores the saved flags, so they are read after
-/// it; the daily's picks are not in the save, so none are sent.
-fn resumed_start(call: &Call<'_>, s: &Shared) {
-    let rules = Rules {
-        mods: read_mods(call, s),
-        daily: None,
-    };
-    send_start(s, &rules);
+/// Host, at a new link: a run that waits for the partner at the start gate
+/// sends its start again.
+pub(crate) fn start_again(c: &crate::Coop) -> Option<Message> {
+    let waiting = c.core.coop_run() && c.core.gate_phase() != crate::gate::GatePhase::Running;
+    let rules = c.host_sent.start_again(waiting && c.loadout.enabled())?;
+    log::info!(
+        "co-op: re-linked while this run waits for the partner at its start gate: its start sent again ({})",
+        rules.describe(&|i| names::MODE_TITLES[i].1.to_owned())
+    );
+    Some(message(true, rules, false))
 }
 
-/// The wire form (`on_loadout`: sent from the host's loadout screen).
+/// Any game: a resumed run is starting (`resumeRun`, from `oLoadout_Alarm_2`).
+/// The run stays solo, and a partner linked by its first frame is turned away
+/// (`Core::resumed_next`).
+fn resumed_start(s: &Shared) {
+    let mut c = s.lock();
+    let linked = c.core.linked();
+    c.core.resumed_next();
+    drop(c);
+    log::info!(
+        "co-op: a saved run is resumed{}: it is played solo",
+        if linked {
+            " while a link came up during its start (the partner is turned away)"
+        } else {
+            ""
+        }
+    );
+}
+
+/// The wire form (`on_loadout`: sent from the host's new game screen).
 fn message(start: bool, r: &Rules, on_loadout: bool) -> Message {
     Message::RunRules {
         start,
@@ -638,7 +833,7 @@ fn read_mods(call: &Call<'_>, s: &Shared) -> u16 {
     loadout::mode_bits(&flags)
 }
 
-/// The loadout screen's daily picks and name, as they are.
+/// The new game screen's daily picks and name, as they are.
 fn read_daily(me: &Instance<'_>, h: &Handles) -> Option<DailyPick> {
     let int = |v| num(me, v).map(|x| x.round() as i16);
     let (choice, modifier, modifier2) =
@@ -708,7 +903,7 @@ fn write_daily(me: &Instance<'_>, h: &Handles, d: &DailyPick) -> bool {
     ok
 }
 
-/// Hold `r`: the flags and (on the loadout screen) the daily's picks.
+/// Hold `r`: the flags and (on the new game screen) the daily's picks.
 fn write_rules(call: &Call<'_>, me: Option<&Instance<'_>>, s: &Shared, h: &Handles, r: &Rules) {
     write_modes(call, s, r.mods);
     if let (Some(me), Some(d)) = (me, &r.daily) {
@@ -753,41 +948,123 @@ fn clear_stuck_skip(c: &mut crate::Coop) {
     }
 }
 
-/// A loadout frame: the network pump; the host's picks out; the joining
-/// game's hold, waiting start and bar line.
+/// A saved run is loaded (`global.loaded_run_state` 1). Unreadable: taken as one.
+fn saved_run(call: &Call<'_>, h: &Handles) -> bool {
+    loadout::saved_run_state(loaded_run_read(call, h))
+}
+
+fn loaded_run_read(call: &Call<'_>, h: &Handles) -> Option<f64> {
+    call.global()
+        .zip(h.loaded_run)
+        .and_then(|(g, v)| g.get_value(v))
+        .and_then(|v| v.as_f64())
+}
+
+/// `global.loaded_run_state` as read now (`None`: it cannot be read).
+pub(crate) fn loaded_run_value(call: &Call<'_>) -> Option<f64> {
+    loaded_run_read(call, HANDLES.get()?)
+}
+
+/// The saved run's guard on this frame (`loadout::SavedRunGuard`), its
+/// clock kept on the screen's state.
+fn saved_run_guard(call: &Call<'_>, s: &Shared, h: &Handles, now: Instant) -> SavedRunGuard {
+    let saved = saved_run(call, h);
+    let mut c = s.lock();
+    let linked = c.core.linked();
+    if c.menu.take_preanswered() {
+        c.loadout_screen.preanswered = true;
+    }
+    let sc = &mut c.loadout_screen;
+    if linked {
+        sc.unlinked_since = None;
+    } else if sc.preanswered {
+        sc.unlinked_since.get_or_insert(now);
+    }
+    loadout::saved_run_guard(
+        sc.preanswered,
+        saved,
+        linked,
+        sc.unlinked_since.map(|t| now.saturating_duration_since(t)),
+    )
+}
+
+/// A new game screen frame of the saved run's guard: with the link gone, back
+/// to the menu once.
+fn guard_step(call: &Call<'_>, me: &Instance<'_>, s: &Shared, h: &Handles, now: Instant) {
+    if saved_run_guard(call, s, h, now) != SavedRunGuard::BackToMenu {
+        return;
+    }
+    let first = {
+        let mut c = s.lock();
+        let first = !std::mem::replace(&mut c.loadout_screen.left, true);
+        if first {
+            let line = loadout::saved_run_kept_line(&partner_or_last(&c));
+            c.link_notice = Some(crate::ui::run::LinkNotice::for_room(
+                line,
+                now,
+                crate::ui::run::NoticeRoom::Menus,
+            ));
+        }
+        first
+    };
+    if first {
+        log::info!(
+            "co-op: the link is gone on the new game screen and a saved run exists: back to the menu, where Game Start asks the game's own question"
+        );
+        let Some(leave) = h.leave else {
+            warn_once(
+                "loadout-leave",
+                "co-op: leaveLoadout not found; a solo Start stays refused on this screen",
+            );
+            return;
+        };
+        if let Err(e) = me.call_script(leave, &[]) {
+            warn_once(
+                "loadout-leave",
+                &format!(
+                    "co-op: leaving the new game screen failed ({e}); a solo Start stays refused"
+                ),
+            );
+        }
+    }
+}
+
+/// The partner's name as the screen shows it, or the one last seen. Never
+/// for a log line.
+pub(crate) fn partner_shown(c: &crate::Coop) -> String {
+    partner_or_last(c)
+}
+
+/// The partner's name, or the one last seen (the link is gone).
+fn partner_or_last(c: &crate::Coop) -> String {
+    if c.core.linked() {
+        partner_name(c)
+    } else if c.last_partner.is_empty() {
+        text::FALLBACK_PARTNER.to_owned()
+    } else {
+        c.last_partner.clone()
+    }
+}
+
+/// A new game screen frame: the network pump; the host's picks out; the
+/// joining game's hold, waiting start and bar line.
 fn step(call: &mut Call<'_>, s: &Shared, h: &Handles) {
     restore_label(call);
     let now = std::time::Instant::now();
     let Some(me) = call.instance() else { return };
+    strobe(&me, s, h);
+    guard_step(call, &me, s, h, now);
     let mut c = s.lock();
     clear_stuck_skip(&mut c);
     c.pump(now);
+    // On the new game screen while linked: the link's move here is spent.
+    let linked = c.core.linked();
+    c.menu.to_new_game.observe(linked);
+    if linked {
+        c.menu.to_new_game.spent();
+    }
     if c.core.linked() && c.core.is_host() {
-        if c.loadout.enabled() {
-            let picks = read_rules(call, Some(&me), s, h);
-            if let Some(r) = c.host_sent.picks(picks, true) {
-                net::apply(&c.net, vec![Out::Broadcast(message(false, &r, true))]);
-            }
-        }
-        // Only after a refused Resume Run.
-        let partner = partner_name(&c);
-        c.loadout_screen.note =
-            loadout::bar_line(&c.loadout.host_note(), true, &partner, "Start", &|_| {
-                String::new()
-            });
-        c.loadout_screen.ready = false;
-        c.loadout_screen.hud = link_line(&mut c, now);
-        let back = if c.loadout.held() {
-            c.loadout.release()
-        } else {
-            None
-        };
-        drop(c);
-        if let Some(own) = back
-            && give_back(call, Some((&me, h)), s, &own)
-        {
-            log::info!("co-op: hosting now; this player's mode picks are back");
-        }
+        host_step(call, &me, s, h, c, now);
         return;
     }
     let linked_joiner = c.core.linked();
@@ -797,13 +1074,15 @@ fn step(call: &mut Call<'_>, s: &Shared, h: &Handles) {
     // Before the host's are written: the resume file is off first.
     sync_held(s, &c);
     let partner = partner_name(&c);
-    let start_word = if h.start_label.is_some() {
-        READY
-    } else {
-        "Start"
+    let start_word = start_word(h, true);
+    // A refused Resume Run is the red line's, where it can be drawn.
+    let note = match &frame.note {
+        Note::NoResume if c.loadout_screen.red_line(h) => c.loadout.note_past_resume(),
+        n => n.clone(),
     };
+    c.loadout_screen.pulse = note == Note::PartnerReady;
     c.loadout_screen.note = loadout::bar_line(
-        &frame.note,
+        &note,
         c.loadout.host_on_loadout(),
         &partner,
         start_word,
@@ -812,7 +1091,11 @@ fn step(call: &mut Call<'_>, s: &Shared, h: &Handles) {
     c.loadout_screen.ready = c.loadout.locked(linked_joiner);
     c.loadout_screen.hud = link_line(&mut c, now);
     let due = c.loadout.start_due();
+    quiet_notice_in_count(&mut c);
+    let cue = c.ready_notice.take_cue();
     drop(c);
+    ready_cue(call, s, cue, now);
+    start_count_frame(call, s, now);
     if let Some(own) = &frame.restore {
         if give_back(call, Some((&me, h)), s, own) {
             log::info!("co-op: unlinked on the new game screen; this player's mode picks are back");
@@ -829,17 +1112,174 @@ fn step(call: &mut Call<'_>, s: &Shared, h: &Handles) {
     if due && let (Some(pos), Some(confirm)) = (h.pos, h.confirm) {
         let _ = me.set_f64(pos, 0.0);
         log::info!("co-op: the host started; this game's waiting start is made");
-        let fade = num(&me, h.fade);
+        let before = fades(&me, h);
         if let Err(e) = me.call_script(confirm, &[]) {
             log::warn!("co-op: the waiting start could not be made ({e}); press Start again");
             let mut c = s.lock();
             c.loadout.cancel();
             // Not begun: the host's start is kept, the latch let go.
-            if !fade_began(&me, h, fade) {
+            if !fade_began(&me, h, before) {
                 c.loadout.start_not_taken();
                 sync_held(s, &c);
             }
         }
+    }
+}
+
+/// A linked host's new game screen frame: its picks out, its bar line, "Ready"
+/// on its Start row, and the run's start once both are ready ([`host_go`]).
+fn host_step(
+    call: &Call<'_>,
+    me: &Instance<'_>,
+    s: &Shared,
+    h: &Handles,
+    mut c: std::sync::MutexGuard<'_, crate::Coop>,
+    now: Instant,
+) {
+    if c.loadout.enabled() {
+        let picks = read_rules(call, Some(me), s, h);
+        if let Some(r) = c.host_sent.picks(picks, true) {
+            net::apply(&c.net, vec![Out::Broadcast(message(false, &r, true))]);
+        }
+    }
+    // A refused Resume Run is the red line's, where it can be drawn.
+    let partner = partner_name(&c);
+    let note = match c.loadout.host_note() {
+        Note::NoResume if c.loadout_screen.red_line(h) => Note::None,
+        n => n,
+    };
+    let word = start_word(h, c.loadout.enabled());
+    c.loadout_screen.pulse = note == Note::PartnerReady;
+    c.loadout_screen.note = loadout::bar_line(&note, true, &partner, word, &|_| String::new());
+    // Start is Ready while linked, with the rule on.
+    c.loadout_screen.ready = c.loadout.enabled();
+    c.loadout_screen.hud = link_line(&mut c, now);
+    // Hosting: anything held from a link as the joining game comes back.
+    let back = if c.loadout.held() {
+        c.loadout.release()
+    } else {
+        None
+    };
+    drop(c);
+    if let Some(own) = back
+        && give_back(call, Some((me, h)), s, &own)
+    {
+        log::info!("co-op: hosting now; this player's mode picks are back");
+    }
+    // The start count's numbers, then its next move (`Joiner::host_frame`).
+    start_count_frame(call, s, now);
+    let mut c = s.lock();
+    c.loadout.host_frame(now);
+    c.send_start_count();
+    let go = c.loadout.press_due();
+    quiet_notice_in_count(&mut c);
+    let cue = c.ready_notice.take_cue();
+    drop(c);
+    ready_cue(call, s, cue, now);
+    if go {
+        host_go(me, s, h);
+    }
+}
+
+/// While the start count runs, the partner's Ready has no alert or cue.
+fn quiet_notice_in_count(c: &mut crate::Coop) {
+    if c.loadout.start_count().is_some() {
+        c.ready_notice.clear();
+    }
+}
+
+/// The start count on this new game screen (either role): its tick at each
+/// number and the number for the draw.
+fn start_count_frame(call: &Call<'_>, s: &Shared, now: Instant) {
+    let shown = s.lock().loadout.start_count();
+    let view = shown.and_then(|(round, mut count)| {
+        let (view, _go) = crate::ui::glue::count_frame(
+            call,
+            s,
+            &mut count,
+            crate::ui::run::CountKind::Start,
+            now,
+        );
+        s.lock().loadout.set_start_count(round, count);
+        view
+    });
+    s.lock().loadout_screen.count = view;
+}
+
+/// What the Start row reads: "Ready" while linked (`ready_mode`) where the
+/// label can be swapped, else the game's own word.
+fn start_word(h: &Handles, ready_mode: bool) -> &'static str {
+    if ready_mode && h.start_label.is_some() {
+        READY
+    } else {
+        "Start"
+    }
+}
+
+/// The partner's new Ready: its cue (`cue`), else the cue's next notes.
+fn ready_cue(call: &Call<'_>, s: &Shared, cue: bool, now: Instant) {
+    if cue {
+        crate::ui::glue::play_cue(call, s, crate::ui::cues::Cue::PartnerReady, now);
+    } else {
+        crate::ui::glue::cue_tick(call, s, now);
+    }
+}
+
+/// Host, at the start count's go ([`loadout::Joiner::press_due`]): the game's
+/// Start press through `confirmLoadout` (`pos` 0). A press the game does not
+/// take is made again each frame until `loadout::GO_WAIT` calls the count off.
+fn host_go(me: &Instance<'_>, s: &Shared, h: &Handles) {
+    let (Some(pos), Some(confirm)) = (h.pos, h.confirm) else {
+        // Not reached: the rule is off without these (`decide`).
+        return;
+    };
+    s.lock().loadout.begin_go();
+    let _ = me.set_f64(pos, 0.0);
+    let before = fades(me, h);
+    let r = me.call_script(confirm, &[]);
+    let taken = r.is_ok() && fade_began(me, h, before);
+    s.lock().loadout.go_done(taken);
+    if taken {
+        log::info!("co-op: both players are ready: the run starts");
+    } else {
+        warn_once(
+            "loadout-go",
+            &format!(
+                "co-op: both players are ready but the game did not take the start ({r:?}); tried again each frame"
+            ),
+        );
+    }
+}
+
+/// A new game screen step after a refused Resume Run: the red line flashes
+/// (`loadout::warn_strobe`, before the game's step) and holds the mod's
+/// sentence. A failed write hands the sentence to the bar.
+fn strobe(me: &Instance<'_>, s: &Shared, h: &Handles) {
+    let level = {
+        let mut c = s.lock();
+        let Some(n) = c.loadout_screen.warn else {
+            return;
+        };
+        let line = loadout::no_resume_line(&partner_name(&c));
+        let sc = &mut c.loadout_screen;
+        sc.warn = Some(n.saturating_add(1));
+        sc.warn_line = Some(line);
+        if !sc.red_line(h) {
+            return;
+        }
+        loadout::warn_strobe(n)
+    };
+    let Some(level) = level else { return };
+    let ok = [h.rgb_g, h.rgb_b]
+        .into_iter()
+        .flatten()
+        .all(|v| me.set_f64(v, level));
+    if !ok {
+        warn_once(
+            "loadout-red-line",
+            "co-op: the new game screen's warning colour cannot be written; the refused Resume Run is said in a bar",
+        );
+        s.lock().loadout_screen.warn_failed = true;
     }
 }
 

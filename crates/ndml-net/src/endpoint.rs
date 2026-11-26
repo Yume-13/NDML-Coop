@@ -265,6 +265,8 @@ pub struct Stats {
     pub loss: f64,
     /// Bytes sent (UDP payload).
     pub bytes_sent: u64,
+    /// Bytes received (UDP payload) from this connection's peer.
+    pub bytes_recv: u64,
     /// Datagrams sent.
     pub packets_sent: u64,
     /// Datagrams received and accepted.
@@ -280,6 +282,9 @@ pub struct Stats {
     /// Of those, whole packets: [`crate::reliability::RECV_HISTORY`] or
     /// more behind the newest (every message in them lost).
     pub stale_packets: u64,
+    /// Packets dropped whole for a damaged chunk ([`Endpoint::stray_datagrams`] too).
+    /// They keep the link from timing out but are not in `packets_recv`.
+    pub damaged_packets: u64,
     /// Packets taken from behind the ack field (not acked, not stale).
     pub late_packets: u64,
     /// Of `resends`, the ones sent at once because the packet that carried
@@ -919,6 +924,7 @@ impl<T: crate::transport::Transport> Endpoint<T> {
         };
         c.remote_nonce = Some(h.nonce);
         c.last_recv = now;
+        c.stats.bytes_recv += dg.len() as u64;
 
         match h.kind {
             PacketKind::Punch | PacketKind::PunchAck => {
@@ -1091,6 +1097,7 @@ impl<T: crate::transport::Transport> Endpoint<T> {
         // A late packet is taken but not acked and gives no RTT or clock
         // sample. A damaged packet is dropped unrecorded, so it is resent.
         if packet::chunks(payload).any(|ch| ch.is_err()) {
+            c.stats.damaged_packets += 1;
             self.stray += 1;
             return;
         }
@@ -3129,6 +3136,8 @@ mod tests {
         host.transport_mut().send_to(ms(30), addr(2), &dg).unwrap();
         run_eps(&mut [&mut host, &mut c1], 30, 31);
         assert_eq!(c1.stray_datagrams(), stray + 1, "dropped");
+        let s = c1.stats(PeerId::HOST).unwrap();
+        assert_eq!(s.damaged_packets, 1, "counted on the connection");
         assert!(events_of(&mut c1).is_empty(), "nothing delivered");
         let (ack, _) = c1.conns[&PeerId::HOST].recv_window.ack();
         assert_ne!(ack, seq, "not recorded, so never acked");

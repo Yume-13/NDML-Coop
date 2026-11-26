@@ -29,8 +29,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,10 @@ mod decoy_glue;
 /// Dependencies: what replicated enemies refer to that is not an enemy.
 #[path = "deps_glue.rs"]
 mod deps;
+/// Enemies that emerge from the background: ticked after their Step, the
+/// joining copy's emerge held behind the host's.
+#[path = "emerge_glue.rs"]
+mod emerge_glue;
 /// Client: references the copies' own code rewrites, kept at the host's value.
 #[path = "follow_glue.rs"]
 mod follow;
@@ -81,12 +85,20 @@ mod followers;
 /// The Star Eater's lit segments from the host.
 #[path = "lit_glue.rs"]
 mod lit_glue;
+/// The on-death mods (the on-death table): one world effect per death if
+/// either player has it; own-build effects for each player who has them.
+#[path = "ondeath_glue.rs"]
+mod ondeath_glue;
 /// Shared pickups: the host's orbs and power-ups on the joining game.
 #[path = "orbs_glue.rs"]
 mod orbs_glue;
 /// Shared enemy shots.
 #[path = "shots_glue.rs"]
 mod shot_glue;
+/// The stand-in bracket (`standin`): on the host, what goes after the
+/// joining player finds that player wherever its code names the player.
+#[path = "standin_glue.rs"]
+mod standin_glue;
 pub use shot_glue::ThingLinks;
 /// The client's render clock; a child module so it can reach the hooks' state.
 #[path = "clock_glue.rs"]
@@ -164,6 +176,9 @@ struct Handles {
     /// The reflection builtins of the generic state transfer.
     reflect: Option<super::state::Reflect>,
     leader: Option<Variable>,
+    /// The effect pool's flag (`oEffectPooled`: in its pool, deactivated
+    /// for reuse; `followers_glue.rs`'s "this copy's, live and drawn").
+    in_pool: Option<Variable>,
     hull: Option<Variable>,
     hull_max: Option<Variable>,
     hull_previous: Option<Variable>,
@@ -173,14 +188,25 @@ struct Handles {
     target_y: Option<Variable>,
     target_hs: Option<Variable>,
     target_vs: Option<Variable>,
+    /// The type an enemy prefers to aim at (`chooseTarget`'s first step:
+    /// the Tracer's own ball, the Dreadnought's ball), else -4.
+    preferred: Option<Variable>,
     wave: Option<Variable>,
     spawn_pos_x: Option<Variable>,
     spawn_pos_y: Option<Variable>,
     scaler: Option<Variable>,
     buffer: Option<Variable>,
     enemy_type: Option<Variable>,
+    /// An enemy beam's or charge-up's `shooter` (what a wind-up follows,
+    /// `windup.rs`).
+    shooter: Option<Variable>,
     /// Shared enemy shots: a shot's turn rate (homing above 0).
     rot_speed: Option<Variable>,
+    /// The emerging family's gate (`emerge_glue`).
+    emerged: Option<Variable>,
+    /// The field's size, `viewWidth` and `viewHeight` (a turn's birth
+    /// matched across its wrap, `emerge_glue`).
+    field: [Option<Variable>; 2],
 }
 
 fn opt<T>(r: Result<T, Error>) -> Option<T> {
@@ -213,6 +239,7 @@ impl Handles {
             instance_number: b(bf::INSTANCE_NUMBER),
             reflect: super::state::Reflect::resolve(ctx),
             leader: v(var::LEADER),
+            in_pool: v("inPool"),
             hull: v(crate::names::VAR_HULL),
             hull_max: v(crate::names::VAR_HULL_MAX),
             hull_previous: v(crate::names::VAR_HULL_PREVIOUS),
@@ -222,13 +249,20 @@ impl Handles {
             target_y: v(var::TARGET_Y),
             target_hs: v(var::TARGET_HSPEED),
             target_vs: v(var::TARGET_VSPEED),
+            preferred: v("preferredTargetType"),
             wave: v(var::WAVE),
             spawn_pos_x: v(var::SPAWN_POS_X),
             spawn_pos_y: v(var::SPAWN_POS_Y),
             scaler: v(var::SCALER),
             buffer: v(var::BUFFER),
             enemy_type: v(var::ENEMY_TYPE),
+            shooter: v(var::SHOOTER),
             rot_speed: v(super::shots::TURN_RATE),
+            emerged: v(emerge_glue::EMERGED),
+            field: [
+                v(crate::names::GLOBAL_VIEW[2]),
+                v(crate::names::GLOBAL_VIEW[3]),
+            ],
         }
     }
 
@@ -254,6 +288,8 @@ struct Objects {
     standard: Option<u32>,
     segment: Option<u32>,
     target: Option<u32>,
+    /// `oEnemyEmerging` ([`classify::parent::EMERGING`]).
+    emerging: Option<u32>,
     waves: Option<u32>,
     player_attack: Option<u32>,
     /// `oPlayer` (no instance active = the game is frozen).
@@ -261,10 +297,10 @@ struct Objects {
     warning: Option<u32>,
     portal: Option<u32>,
     spawner: Option<u32>,
+    /// `oSpawner`, the spawn machinery's parent ([`Class::Spawner`]).
+    spawner_root: Option<u32>,
     /// `oAsteroid` (asteroid copies die through their own Step).
     asteroid: Option<u32>,
-    parts: HashSet<u32>,
-    local: HashSet<u32>,
     /// Enemy shot parents.
     shots: Vec<u32>,
     /// Beam charge-ups ([`classify::parent::ENEMY_CHARGES`]).
@@ -274,6 +310,9 @@ struct Objects {
     /// Roots of what stays each game's own by ancestry
     /// ([`classify::parent::LOCAL_ROOTS`]): never a dependency.
     local_roots: Vec<u32>,
+    /// `oEffect` and `oEffectPooled` (the wind-up rule, `windup.rs`).
+    effect: Option<u32>,
+    pooled: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -307,6 +346,8 @@ struct WorldState {
     cover: cover_glue::CoverGlue,
     /// The joining player's decoys for the host's enemies.
     decoy: decoy_glue::DecoyGlue,
+    /// On-death mods: the players' parts, the host's lends, parts handed over.
+    ondeath: ondeath_glue::OnDeathGlue,
     /// The Star Eater's lit segments from the host.
     lit: lit_glue::LitGlue,
     /// Client: copies whose own Step runs on the host's hull now: (key) ->
@@ -324,6 +365,9 @@ struct WorldState {
     gate_running: bool,
     /// The last run step found the game frozen ([`WorldHooks::frozen`]).
     frozen: bool,
+    /// Client: emerging copies whose emerge is held in the Step running now
+    /// (`emerge_glue`).
+    emerge_held: Vec<usize>,
     /// Host: damage reports that arrived while frozen (a deactivated enemy
     /// cannot take a hull write); they wait for the first running frame.
     held_reports: Vec<ndml_net::msg::DamageReport>,
@@ -350,7 +394,7 @@ struct WorldState {
     repl: clock::ReplState,
     /// Client: copies dying the host's death (key -> frame): asteroids
     /// through their own Step, the others through their Destroy event. Left
-    /// alone by the death hold; their vetoed debris and drops not counted.
+    /// alone by the Step hold; their vetoed debris and drops not logged.
     dying: HashMap<usize, u64>,
     /// Client: how many copies' Destroy events are running now (nested when
     /// one destroys another): [`HOST_DEATH_ONLY`](names::HOST_DEATH_ONLY)
@@ -384,7 +428,9 @@ struct WorldState {
 /// Counters the hot hooks keep without the world lock.
 #[derive(Debug, Default)]
 struct Meter {
-    /// Copies held above 0 before their Step (the first ones are logged).
+    /// Client: copies whose hull was at or under 0 before their own Step or
+    /// Begin Step while the host's lived as shown here, run on the host's
+    /// (the first ones are logged).
     held_step: AtomicU64,
     /// Client: copies' Steps run on the host's hull whose event has not
     /// ended yet (see `step_swap_before`).
@@ -412,12 +458,67 @@ pub struct WorldHooks {
     pub(crate) dmg: Arc<crate::damage::glue::DamageHooks>,
     /// Shared enemy shots' own flags.
     shot: shot_glue::ShotHooks,
+    /// Joining game: the host's snapshots taken and the newest stamp, as of
+    /// the last run step (`ClientWorld::host_snapshots`), read without the
+    /// world's lock for the slow-frames line.
+    host_snaps: (AtomicU64, AtomicU32),
+    /// The objects that emerge from the background, from the object tree
+    /// once the objects are resolved (`emerge_glue`); read by the Step
+    /// observer without the world's lock.
+    emerging: std::sync::OnceLock<Vec<u32>>,
 }
 
 fn read(inst: &Instance<'_>, name: &str) -> Option<f32> {
     inst.builtin_f64(name)
         .filter(|v| v.is_finite())
         .map(|v| v as f32)
+}
+
+/// The game's own pick for an enemy, as the `chooseTarget` after-hook sees
+/// it ([`WorldHooks::own_pick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OwnPick {
+    /// An instance of the type the enemy prefers (`preferredTargetType`,
+    /// or a descendant).
+    pub preferred: bool,
+    /// A player's thing here: an avatar, or player-side by the mirror's
+    /// rule (a ship, a construct, a decoy, a proxy).
+    pub player: bool,
+}
+
+/// What the `chooseTarget` after-hook does for an enemy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AfterHook {
+    /// Assigned to this game's player: the game's own choice (cloak,
+    /// decoys, constructs as in solo play).
+    GamesOwn,
+    /// Assigned to a remote player, the game's pick its own thing: kept.
+    KeepOwnThing,
+    /// Assigned to a remote player: pointed at that player's avatar.
+    Avatar,
+}
+
+/// The pick is the enemy's own thing: the type it prefers, not a player's
+/// (the Tracer aiming at its own ball for its combo, the Dreadnought at its
+/// ball). A ship, a construct, a decoy, an egg or a proxy never is.
+#[must_use]
+pub(super) fn keeps_own_pick(pick: Option<OwnPick>) -> bool {
+    pick.is_some_and(|p| p.preferred && !p.player)
+}
+
+/// The after-hook's rule: an enemy assigned to a remote player keeps the
+/// game's pick when it is the enemy's own thing (as the shots' rule keeps
+/// an orb feeder steering at its ball), and is pointed at that player's
+/// avatar otherwise; one assigned to this game's player is left alone.
+#[must_use]
+pub(super) fn after_hook(remote: bool, pick: Option<OwnPick>) -> AfterHook {
+    if !remote {
+        AfterHook::GamesOwn
+    } else if keeps_own_pick(pick) {
+        AfterHook::KeepOwnThing
+    } else {
+        AfterHook::Avatar
+    }
 }
 
 fn object_of(inst: &Instance<'_>) -> Option<u32> {
@@ -480,6 +581,8 @@ impl WorldHooks {
             h,
             meter: Meter::default(),
             destroyed_seen: Mutex::new(Vec::new()),
+            host_snaps: (AtomicU64::new(0), AtomicU32::new(0)),
+            emerging: std::sync::OnceLock::new(),
             dmg: Arc::new(crate::damage::glue::DamageHooks::new(ctx, damage_settings)),
             shot: shot_glue::ShotHooks::default(),
         }
@@ -558,6 +661,15 @@ impl WorldHooks {
                 self.set_asleep(call, id, false);
             }
         }
+        // Copies held born incomplete, and the effects that follow them, stay
+        // deactivated if the region brought them back: the next run step
+        // decides on them again.
+        let held = self.gen_held_now();
+        for id in &held {
+            if self.exists(call, id) {
+                self.set_asleep(call, id, true);
+            }
+        }
         // A despawn that came during the freeze is carried out now, before
         // anything steps or draws.
         let due = self.lock().client.despawn_waiting();
@@ -615,16 +727,40 @@ impl WorldHooks {
             && waves.is_none_or(|w| self.instances(call, w) == 0)
     }
 
-    /// Host: the kill credit of the enemy at instance `key` (kill effects:
-    /// the same `last_damager` its `Despawn` names).
-    #[must_use]
-    pub fn kill_credit(&self, key: usize) -> Option<PeerId> {
-        self.lock().host.damager_at(key)
-    }
-
     /// The frozen state the last run step saw.
     pub fn was_frozen(&self) -> bool {
         self.lock().frozen
+    }
+
+    /// The slow-frames line (`crate::slow_log`): the host's snapshots taken
+    /// and the newest stamp, on a joining game that has had one (no lock).
+    #[must_use]
+    pub fn host_snapshots(&self) -> Option<(u64, u32)> {
+        let n = self.host_snaps.0.load(Ordering::Relaxed);
+        (self.role() == ROLE_CLIENT && n > 0)
+            .then(|| (n, self.host_snaps.1.load(Ordering::Relaxed)))
+    }
+
+    /// The slow-frames line: the wave (`global.wave`), the enemies this
+    /// game's table holds (the host's tracked ones, a joining game's
+    /// copies) and the shared enemy shots live here. One lock, no walk.
+    #[must_use]
+    pub fn slow_scene(&self, call: &Call<'_>) -> (Option<u32>, usize, usize) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a wave number
+        let wave = self
+            .h
+            .wave
+            .and_then(|v| call.global()?.get_f64(v))
+            .filter(|w| w.is_finite() && *w >= 0.0)
+            .map(|w| w as u32);
+        let role = self.role();
+        let st = self.lock();
+        let (enemies, shots) = match role {
+            ROLE_HOST => (st.host.len(), st.shots.host.live.len()),
+            ROLE_CLIENT => (st.client.live_count(), st.shots.client.live()),
+            _ => (0, 0),
+        };
+        (wave, enemies, shots)
     }
 
     /// Sounds: this game's part in the shared world this frame.
@@ -711,29 +847,21 @@ impl WorldHooks {
         let solid = self.asset(call, classify::parent::SOLID);
         let collectable = self.asset(call, classify::parent::COLLECTABLE);
         let objects = if let (Some(solid), Some(collectable)) = (solid, collectable) {
-            let parts = classify::PARTS
-                .iter()
-                .filter_map(|n| self.asset(call, n))
-                .collect();
-            let local = classify::LOCAL
-                .iter()
-                .filter_map(|n| self.asset(call, n))
-                .collect();
             let o = Objects {
                 solid,
                 collectable,
                 standard: self.asset(call, classify::parent::ENEMY_STANDARD),
                 segment: self.asset(call, classify::parent::SEGMENT),
                 target: self.asset(call, classify::parent::TARGET),
+                emerging: self.asset(call, classify::parent::EMERGING),
                 waves: self.asset(call, names::object::WAVES),
                 player_attack: self.asset(call, names::object::PLAYER_ATTACK),
                 player: self.asset(call, names::object::PLAYER),
                 warning: self.asset(call, names::object::SPAWN_WARNING),
                 portal: self.asset(call, names::object::ENEMY_PORTAL),
                 spawner: self.asset(call, names::object::ENEMY_SPAWNER),
+                spawner_root: self.asset(call, classify::parent::SPAWNER),
                 asteroid: self.asset(call, names::object::ASTEROID),
-                parts,
-                local,
                 shots: classify::parent::ENEMY_SHOTS
                     .iter()
                     .filter_map(|n| self.asset(call, n))
@@ -747,6 +875,8 @@ impl WorldHooks {
                     .iter()
                     .filter_map(|n| self.asset(call, n))
                     .collect(),
+                effect: self.asset(call, classify::parent::EFFECT),
+                pooled: self.asset(call, classify::parent::EFFECT_POOLED),
             };
             log::info!(
                 "co-op world: objects resolved (oSolid {}, oCollectable {}, oPlayerAttack {:?})",
@@ -811,15 +941,21 @@ impl WorldHooks {
             Class::Marker { portal: false }
         } else if Some(obj) == objs.portal {
             Class::Marker { portal: true }
-        } else if self.ancestor(call, obj, Some(objs.solid)) {
-            let segment = self.ancestor(call, obj, objs.segment);
-            Class::Enemy {
-                standard: self.ancestor(call, obj, objs.standard),
-                segment,
-                target: self.ancestor(call, obj, objs.target),
-                part: segment || objs.parts.contains(&obj),
-                local: objs.local.contains(&obj),
-            }
+        } else if let Some(enemy) = {
+            let solid = self.ancestor(call, obj, Some(objs.solid));
+            let of = if solid {
+                classify::EnemyAncestry {
+                    standard: self.ancestor(call, obj, objs.standard),
+                    segment: self.ancestor(call, obj, objs.segment),
+                    target: self.ancestor(call, obj, objs.target),
+                }
+            } else {
+                classify::EnemyAncestry::default()
+            };
+            let emerging = !solid && self.ancestor(call, obj, objs.emerging);
+            Class::enemy_by_ancestry(solid, emerging, of)
+        } {
+            enemy
         } else if self.ancestor(call, obj, Some(objs.collectable)) {
             Class::Collectable
         } else if objs
@@ -828,6 +964,12 @@ impl WorldHooks {
             .any(|&p| self.ancestor(call, obj, Some(p)))
         {
             Class::EnemyShot
+        } else if objs
+            .spawner_root
+            .is_some_and(|s| s == obj || self.ancestor(call, obj, Some(s)))
+        {
+            // By the parent, not the name: every child of `oSpawner`.
+            Class::Spawner
         } else {
             Class::Other
         };
@@ -989,6 +1131,8 @@ impl WorldHooks {
         if running {
             self.entities_frame(call, shifted.as_deref().unwrap_or(partners));
         }
+        // The stand-in plan, from the avatars just moved.
+        self.standin_run_step(call, running);
     }
 
     fn on_transition(&self, call: &Call<'_>, t: Transition, is_host: bool) {
@@ -1006,6 +1150,7 @@ impl WorldHooks {
                     st.area.clear();
                     st.cover.clear();
                     st.decoy.clear();
+                    st.ondeath.clear();
                     st.lit.clear();
                     st.follow = follow::FollowState::default();
                     st.followers = followers::FollowersState::default();
@@ -1052,6 +1197,7 @@ impl WorldHooks {
                     }
                     self.gen_resync(call);
                     self.shots_resync();
+                    self.director_resync();
                 }
             }
             Transition::PartnerLeft => {
@@ -1061,6 +1207,7 @@ impl WorldHooks {
                     st.area.clear();
                     st.cover.clear();
                     st.decoy.clear();
+                    st.ondeath.clear();
                     st.lit.clear();
                     st.orbs.clear();
                     st.shots.clear();
@@ -1080,6 +1227,7 @@ impl WorldHooks {
                     st.ents.clear();
                     st.gate_running = false;
                     st.shots.clear();
+                    st.ondeath.clear();
                 }
                 log::info!("co-op world: run over");
             }
@@ -1104,6 +1252,7 @@ impl WorldHooks {
 
     /// A run step with no role: the freeze flag is kept current.
     fn off_step(&self, call: &Call<'_>) {
+        standin_glue::off(call);
         let frozen = self.frozen(call);
         let mut st = self.lock();
         st.frozen = frozen;
@@ -1159,10 +1308,7 @@ impl WorldHooks {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         if !seen.is_empty() {
-            let mut st = self.lock();
-            for key in seen {
-                st.host.destroying(key);
-            }
+            self.host_destroyed_seen(seen);
         }
         // What makers gained in their members' birth frame, read now and
         // sent ahead of those members' spawns (below).
@@ -1221,6 +1367,16 @@ impl WorldHooks {
         out.extend(self.orbs_host(call, &input.inbox, input.own_down));
         out.extend(self.view_host(call, input.now_ms));
         out
+    }
+
+    /// Host: these ran their Destroy event since the last run step (each a
+    /// `Destroyed` despawn unless it dies).
+    fn host_destroyed_seen(&self, seen: Vec<usize>) {
+        let mut st = self.lock();
+        for key in seen {
+            st.host.destroying(key);
+        }
+        drop(st);
     }
 
     /// The status channel on the host (see [`Self::host_damage`]).
@@ -1577,6 +1733,9 @@ impl WorldHooks {
     ) -> Vec<Message> {
         self.orbs_client_inbox(&mut inbox);
         self.view_inbox(&mut inbox);
+        // The wave director's values before this frame's copies are made
+        // (their set-up reads them).
+        self.view_director_client(call);
         self.gen_client_inbox(&mut inbox);
         self.dmg.client_messages(&inbox);
         // Kills claimed here before a resync that sent the enemy again: no
@@ -1597,6 +1756,9 @@ impl WorldHooks {
                 st.client.on_message(m);
             }
             let f = st.client.begin_frame(render_time);
+            let (n, stamp) = st.client.host_snapshots();
+            self.host_snaps.0.store(n, Ordering::Relaxed);
+            self.host_snaps.1.store(stamp, Ordering::Relaxed);
             // Never while frozen: a copy made then would be active behind
             // the pause screen (its own Step running) while everything else
             // is deactivated. `running` alone lags the freeze by a frame.
@@ -1637,6 +1799,10 @@ impl WorldHooks {
         self.tick_deps_client(call);
         self.view_client(call);
         self.pose_at_step(call);
+        // The host's phase changes the shown time reached, after the poses
+        // (a phase's entry acts from the copy's shown place) and before the
+        // copies' own Steps.
+        self.phase_client(call);
         crate::guard::client_frame(call, &mut self.lock().client);
         let mut out = self.damage_frame();
         out.extend(self.view_inputs_client(call));
@@ -2262,7 +2428,7 @@ impl WorldHooks {
                         st.removed.insert(key, (p.net_id, frame));
                     }
                     self.dmg.copy_removed(key);
-                    self.remove_puppet(call, me, r, p.pos);
+                    self.remove_puppet(call, me, r, p.pos, p.net_id);
                     return;
                 }
                 if let Some(i) = p.image_index {
@@ -2439,7 +2605,14 @@ impl WorldHooks {
     /// effect (`createExplosion` as the enemy), then the copy's own Destroy
     /// event ([`Self::die_like_host`]); a removal (or a dependency):
     /// `instance_destroy(id, false)`, nothing runs.
-    fn remove_puppet(&self, call: &Call<'_>, me: &Instance<'_>, r: Removal, at: Vec2) {
+    fn remove_puppet(
+        &self,
+        call: &Call<'_>,
+        me: &Instance<'_>,
+        r: Removal,
+        at: Vec2,
+        net_id: NetId,
+    ) {
         for part in &r.parts {
             self.destroy_silently(call, part);
         }
@@ -2475,6 +2648,11 @@ impl WorldHooks {
         // own): before the death plays, while it still has its stacks.
         if killed && !dep {
             self.spread_at_death(me);
+            // The world effects the host's word gave this game (Rupture's
+            // blast, Spontaneous Generation's swarm: either player's, one
+            // per death), as the game's own death path plays them before
+            // the Destroy event.
+            self.ondeath_at_death(call, me, net_id);
         }
         // Destroyed (a missile or mine that went off on the host, its Destroy
         // event run there without a death): the same, at its own hull. Each
@@ -2568,9 +2746,15 @@ impl WorldHooks {
         if keys.is_empty() {
             return;
         }
-        let mut st = self.lock();
+        {
+            let mut st = self.lock();
+            for k in &keys {
+                st.host.destroying(*k);
+            }
+        }
+        // Its Destroy event runs on the joining game too: with this state.
         for k in keys {
-            st.host.destroying(k);
+            self.gen_host_last_now(call, k);
         }
     }
 
@@ -2593,67 +2777,14 @@ impl WorldHooks {
         a
     }
 
-    /// Before an asteroid's Step (`oAsteroid_Step_0`, `oAsteroidSmall_Step_0`)
-    /// on a client: a copy the local player shot to `hull <= 0` would destroy
-    /// itself here while the host's lives on. Hold its hull just above 0 (the
-    /// End Step tick writes the host's again); the host decides its death.
-    fn hold_asteroid(&self, call: &Call<'_>) {
-        if let Some(me) = call.instance() {
-            self.hold_copy_hull(&me, false);
-        }
-    }
-
-    /// Client, before a copy's own code reads its hull: a hull at or under 0
-    /// is held just above it (the End Step tick writes the host's again), so
-    /// no copy starts a death of its own in its Step while the host's instance
-    /// lives (the Star Eater's controller starts its defeat on `hull <= 0`).
-    /// `any_copy`: every copy (the Step observer), held at the host's last
-    /// hull while that is above 0; otherwise the asteroid rule (held at 0.01).
-    fn hold_copy_hull(&self, me: &Instance<'_>, any_copy: bool) {
-        if self.role() != ROLE_CLIENT {
-            return;
-        }
-        let Some(h) = self.h.hull else { return };
-        let Some(old) = me.get_f64(h).filter(|v| *v <= 0.0) else {
-            return;
-        };
-        let key = me.key();
-        let to = {
-            let st = self.lock();
-            if !st.client.owns(key) || st.dying.contains_key(&key) {
-                return;
-            }
-            if any_copy {
-                match st.client.host_hull_alive(key) {
-                    Some(host) => f64::from(host).max(0.01),
-                    None => return,
-                }
-            } else {
-                0.01
-            }
-        };
-        if self.dmg.is_dying(key) {
-            return;
-        }
-        let _ = me.set_f64(h, to);
-        self.dmg.own_write(key, Some(old), to);
-        if any_copy {
-            // The first ones by name: which copies' own code took them there.
-            if self.meter.held_step.fetch_add(1, Ordering::Relaxed) < 20 {
-                log::info!(
-                    "co-op world: held copy (object {:?}, key {key}) at hull {old:.1} before its Step; the host's lives",
-                    object_of(me)
-                );
-            }
-        }
-    }
-
     /// Client, before a copy's own Step or Begin Step: a hull below the host's
     /// last (what this game's own code took off since the End Step tick) is
-    /// set to the host's for the event, so what the copy's code decides from
-    /// its hull is the host's; after the event the local drop is put back on
-    /// top of whatever the event changed. A copy whose host's hull reached 0,
-    /// or dying here by the host's word, is left alone.
+    /// set to the host's for the event; after the event the local drop is
+    /// put back on top of whatever the event changed. Until the host's death
+    /// is reached on the timeline the copy runs on the host's last hull above
+    /// 0 ([`ClientWorld::host_hull_alive`]), so a Step that ends it on
+    /// `hull <= 0` (an asteroid's) never ends it first. A copy dying here by
+    /// the host's word is left alone.
     fn step_swap_before(&self, me: &Instance<'_>) {
         let Some(h) = self.h.hull else { return };
         let Some(cur) = me.get_f64(h).filter(|v| v.is_finite()) else {
@@ -2749,9 +2880,20 @@ impl WorldHooks {
         // construct when the game's rule picks one (`decoy_glue`).
         let mut pick = None;
         if let Some(p) = enemy {
-            self.force_at(&me, p);
-            if role == ROLE_HOST {
-                pick = self.decoy_pick(call, &me, p);
+            let remote = Some(p) != self.lock().me;
+            let own = if remote {
+                self.own_pick(call, &me)
+            } else {
+                None
+            };
+            match after_hook(remote, own) {
+                AfterHook::KeepOwnThing => Self::standin_target_kept(key),
+                AfterHook::GamesOwn | AfterHook::Avatar => {
+                    self.force_at(&me, p);
+                    if role == ROLE_HOST {
+                        pick = self.decoy_pick(call, &me, p);
+                    }
+                }
             }
         } else if let Some(p) = shot {
             // A shot only when it is after a player (an orb feeder steering at
@@ -2776,6 +2918,24 @@ impl WorldHooks {
         }
     }
 
+    /// The game's own pick for the enemy `me`, as `chooseTarget` just wrote
+    /// it ([`OwnPick`]): `None` when its `target` names no instance or it
+    /// prefers no type. A player's thing by the shots' rule (an avatar, or
+    /// player-side by the mirror's: a ship, a construct, a decoy, a proxy).
+    fn own_pick(&self, call: &Call<'_>, me: &Instance<'_>) -> Option<OwnPick> {
+        let (tv, pv) = (self.h.target?, self.h.preferred?);
+        let preferred = me.get_value(pv).as_ref().and_then(object_index)?;
+        let t = me.get_value(tv).filter(is_instance)?;
+        let mut obj = None;
+        let _ = call.with(&t, |inst, _| obj = object_of(&inst));
+        let obj = obj?;
+        let id = me.builtin_value("id").ok()?;
+        Some(OwnPick {
+            preferred: self.ancestor(call, obj, Some(preferred)),
+            player: self.shot_after_player(call, &id),
+        })
+    }
+
     /// Point `me` (an enemy or a shared shot) at player `p`'s avatar when `p`
     /// is not this game's player. This game's own player's: the game's own
     /// choice (cloak, decoys, constructs act as in solo play).
@@ -2788,7 +2948,14 @@ impl WorldHooks {
                 st.sps,
             )
         };
-        let Some((id, d)) = forced else { return };
+        let Some((id, d)) = forced else {
+            // The game's own choice (the host's now) stands, past a bracket's end.
+            Self::standin_target_kept(me.key());
+            return;
+        };
+        // Inside an identity bracket for it: the ship, standing at the
+        // joining player's place.
+        let id = Self::standin_target(me.key(), id);
         let h = &self.h;
         if let Some(v) = h.target
             && me.set(v, id).is_ok()
@@ -2867,6 +3034,12 @@ impl WorldHooks {
         // A beam's charge-up (an effect): the host's with the beams.
         if class == Class::Other
             && let Some(note) = self.shot_create(call, role, obj)
+        {
+            return Some(note);
+        }
+        // An enemy's wind-up (`windup.rs`): the host's, a copy's own scratch.
+        if class == Class::Other
+            && let Some(note) = self.windup_create(call, role, obj)
         {
             return Some(note);
         }
@@ -3005,6 +3178,8 @@ impl WorldHooks {
             }
         } else if let PartNote::SharedShot { scratch } = note {
             self.shot_created(call, scratch);
+        } else if let PartNote::Windup { scratch, free } = note {
+            self.windup_created(call, scratch, free);
         } else if let PartNote::Made = note {
             self.dep_maker_made(call);
             self.gen_member_made(call);
@@ -3046,6 +3221,7 @@ impl WorldHooks {
             }
             PartNote::Marker(_)
             | PartNote::SharedShot { .. }
+            | PartNote::Windup { .. }
             | PartNote::Made
             | PartNote::Member
             | PartNote::World
@@ -3054,8 +3230,10 @@ impl WorldHooks {
     }
 
     /// Before `checkDestroy*`: the host sends a dying instance's queued first
-    /// state now; a client skips it for puppets and their parts.
-    fn before_destroy_check(&self, call: &mut Call<'_>) -> bool {
+    /// state now (and its last, ahead of the kill); a client skips it for
+    /// puppets and their parts. Returns (skipped, the on-death flags lent
+    /// for the path: host).
+    fn before_destroy_check(&self, call: &mut Call<'_>) -> (bool, u8) {
         if self.role() == ROLE_HOST {
             // About to die with its first state still queued: sent now.
             if let Some(me) = call.instance()
@@ -3066,11 +3244,14 @@ impl WorldHooks {
                     .is_some_and(|h| h <= 0.0)
             {
                 self.gen_host_first_now(call, me.key());
+                // Its copy's Destroy event reads what this one's does.
+                self.gen_host_last_now(call, me.key());
+                return (false, self.ondeath_lend(call));
             }
-            return false;
+            return (false, 0);
         }
         if self.role() != ROLE_CLIENT {
-            return false;
+            return (false, 0);
         }
         // A copy dying the host's death (its Destroy event, the Dweller's
         // calls `checkDestroy`): the host ran its death path.
@@ -3083,14 +3264,15 @@ impl WorldHooks {
             call.skip_original();
             let _ = call.set_return(0.0);
         }
-        owned
+        (owned, 0)
     }
 
-    /// After `checkDestroy*`: the host sends a kill at once; a client that ran
-    /// the death path removes the enemies it made.
-    fn after_destroy_check(&self, call: &Call<'_>, skipped: bool) {
+    /// After `checkDestroy*`: the host gives back what it lent the path and
+    /// sends a kill at once; a client that ran the death path removes the
+    /// enemies it made.
+    fn after_destroy_check(&self, call: &Call<'_>, (skipped, lent): (bool, u8)) {
+        self.ondeath_unlend(call, lent);
         if !skipped && self.role() == ROLE_CLIENT {
-            self.dmg.after_death_path(call);
             // A copy dying here (a kill this game predicted) runs its death
             // path, which can make enemies (a Serpent link's death splits the
             // chain): they go before anyone's Step reads their unset state.
@@ -3124,16 +3306,19 @@ impl WorldHooks {
         }
     }
 
-    /// The players' facts the world reads of each other (cover, decoys).
+    /// The players' facts the world reads of each other (cover, decoys,
+    /// on-death mods).
     fn facts_inbox(&self, inbox: &mut Vec<Message>) {
         self.cover_inbox(inbox);
         self.decoy_inbox(inbox);
+        self.ondeath_inbox(inbox);
     }
 
-    /// This game's facts to the partners (cover, decoys).
+    /// This game's facts to the partners (cover, decoys, on-death mods).
     fn facts_run_step(&self, call: &Call<'_>, me: PeerId) -> Vec<Message> {
         let mut out = self.cover_run_step(call, Some(me));
         out.extend(self.decoy_run_step(call, Some(me)));
+        out.extend(self.ondeath_run_step(call, me));
         out
     }
 
@@ -3143,24 +3328,33 @@ impl WorldHooks {
         }
     }
 
-    /// Client, before a script in [`COPY_VIEW_DEATHS`]: not on a copy (the
-    /// host's ends it, by the host's view).
-    fn skip_view_death(&self, call: &mut Call<'_>) {
+    /// Client, before a script in [`COPY_VIEW_DEATHS`] or `destroyOutside`
+    /// (the shots' bracket calls it first): not on a replicated copy (the
+    /// host's ends it, by the host's view, and its end comes as a despawn).
+    /// Keyed on the instance being a copy, whatever its object. Returns
+    /// whether it was skipped.
+    pub(super) fn skip_view_death(&self, call: &mut Call<'_>) -> bool {
         if self.role() != ROLE_CLIENT {
-            return;
+            return false;
         }
-        let Some(me) = call.instance() else { return };
-        if self.lock().client.owns(me.key()) {
-            call.skip_original();
+        let Some(me) = call.instance() else {
+            return false;
+        };
+        if !self.lock().client.owns(me.key()) {
+            return false;
         }
+        call.skip_original();
+        true
     }
 }
 
 /// Scripts by which an enemy ends itself for being outside this game's view
-/// (`viewX`, `viewY`, `viewWidth`, `viewHeight`). The joining game's view is
-/// not the host's, so on a copy they would end it early or late; the host's
-/// end comes as a despawn. The shots' own `destroyOutside` is the shots
-/// module's (`shots.rs`, `DESTROY_OUTSIDE`).
+/// (`viewX`, `viewY`, `viewWidth`, `viewHeight`), besides the game's general
+/// one, `destroyOutside`, which no replicated copy runs either (the shots'
+/// bracket, `shots_glue.rs`, calls [`WorldHooks::skip_view_death`] first):
+/// the two that test the view inline. The joining game's view is not the
+/// host's, so on a copy they would end it early or late; the host's end comes
+/// as a despawn. A list by name: nothing else in the game marks these two.
 pub(super) const COPY_VIEW_DEATHS: [&str; 2] = [
     "gml_Script_starEaterDestroyOutside",
     // The cargo engine's and cars' Step: past the view and moving away, the
@@ -3190,6 +3384,11 @@ enum PartNote {
     /// Shared enemy shots: the host's shot to read at the End Step, or a
     /// joining game's scratch (`scratch`; `false` there: the mod's own).
     SharedShot { scratch: bool },
+    /// An enemy's wind-up (`windup.rs`): the host's birth to check at the
+    /// frame's end, or a joining game's copy's own (`scratch`); `free`: what
+    /// a shared shot's ending made, or its lineage (`windup::free`): the
+    /// host's with no follow test.
+    Windup { scratch: bool, free: bool },
     /// Client: an enemy a copy's set-up step made (generic transfer).
     Scratch,
     /// Client: an enemy no table takes (its maker's object, if any).
@@ -3353,9 +3552,9 @@ fn register_dep_destroy_observer(ctx: &ModContext, w: &Arc<WorldHooks>) {
     }
 }
 
-/// Client: before every Step and Begin Step that runs code, a copy's hull at
-/// or under 0 is held above it while the host's lives
-/// ([`WorldHooks::hold_copy_hull`]). One hook for all objects, so one whose
+/// Client: before every Step and Begin Step that runs code, a copy's hull
+/// below the host's is set to the host's while the host's lives as shown here
+/// ([`WorldHooks::step_swap_before`]). One hook for all objects, so one whose
 /// Step starts its own death (the Star Eater's controller, a boss's phases)
 /// is covered unnamed. Not inside a call made under the world lock (a Step
 /// the mod runs itself). A copy also never ends itself by this game's view
@@ -3373,10 +3572,19 @@ fn register_copy_step_hold(ctx: &ModContext, w: &Arc<WorldHooks>) {
             return;
         }
         if let Some(i) = e.instance() {
+            // The emerging family's own Step: its emerge held behind the
+            // host's when the rules say so (`emerge_glue`).
+            let emerging = e.number == 0 && c.emerging_instance(e.instance_object);
             if e.after {
                 c.step_swap_after(&i);
+                if emerging {
+                    c.emerge_hold_after(&i);
+                }
             } else {
                 c.step_swap_before(&i);
+                if emerging {
+                    c.emerge_hold_before(&i);
+                }
             }
         }
     }) {
@@ -3391,7 +3599,9 @@ fn register_copy_step_hold(ctx: &ModContext, w: &Arc<WorldHooks>) {
         let c = Arc::clone(w);
         hook_or_warn(
             name,
-            ctx.hook_before(name, move |call| c.skip_view_death(call)),
+            ctx.hook_before(name, move |call| {
+                c.skip_view_death(call);
+            }),
         );
     }
 }
@@ -3407,7 +3617,7 @@ fn register_deaths(ctx: &ModContext, w: &Arc<WorldHooks>) {
             ctx.hook(
                 name,
                 move |call| c1.before_destroy_check(call),
-                move |call, skipped| c2.after_destroy_check(call, skipped),
+                move |call, before| c2.after_destroy_check(call, before),
             ),
         );
     }
@@ -3454,6 +3664,7 @@ pub fn register(ctx: &ModContext, w: &Arc<WorldHooks>) {
     hook_or_warn(
         names::CONTROLLER_END_STEP,
         ctx.hook_after(names::CONTROLLER_END_STEP, move |call| {
+            c.emerging_end_step(call);
             c.shots_end_step(call);
             c.lit_end_step(call);
             c.step_swaps_end();
@@ -3481,9 +3692,11 @@ pub fn register(ctx: &ModContext, w: &Arc<WorldHooks>) {
     area_glue::register(ctx, w);
     cover_glue::register(ctx, w);
     decoy_glue::register(ctx);
+    standin_glue::register(ctx, w);
     lit_glue::register(ctx, w);
     orbs_glue::register(ctx, w);
     corrosion_glue::register(ctx, w);
+    ondeath_glue::register(ctx, w);
     register_deaths(ctx, w);
     // Who runs a Serpent's user event 1 on the joining side (it builds the
     // chain with `instance_copy`, which the create hook does not see).
@@ -3503,13 +3716,6 @@ pub fn register(ctx: &ModContext, w: &Arc<WorldHooks>) {
         hook_or_warn(
             name,
             ctx.hook_before(name, move |call| c.skip_on_client(call)),
-        );
-    }
-    for name in names::ASTEROID_STEPS {
-        let c = Arc::clone(w);
-        hook_or_warn(
-            name,
-            ctx.hook_before(name, move |call| c.hold_asteroid(call)),
         );
     }
     register_copy_step_hold(ctx, w);
@@ -3536,14 +3742,63 @@ fn register_view(ctx: &ModContext, w: &Arc<WorldHooks>) {
     register_draw_begin(ctx, w);
     for name in view::CALLS {
         let c = Arc::clone(w);
+        let d = Arc::clone(w);
         hook_or_warn(
             name,
-            ctx.hook_before(name, move |call| c.view_call(call, name)),
+            ctx.hook(
+                name,
+                move |call| c.view_call(call, name),
+                move |call, ()| d.view_call_after(call, name),
+            ),
+        );
+    }
+    // What a recorded world call makes (`view::MADE_MARK`).
+    for (name, _) in CREATE_BUILTINS {
+        let c = Arc::clone(w);
+        hook_or_warn(
+            name,
+            ctx.hook_builtin(name, |_| {}, move |call, ()| c.view_create_after(call)),
         );
     }
     for name in view::EASERS {
         let c = Arc::clone(w);
         hook_or_warn(name, ctx.hook_before(name, move |call| c.view_write(call)));
+    }
+    // The host-only functions whose part on this player's objects a joining
+    // game repeats on its own (`view::director::OWN_RUNS`): counted here.
+    for name in view::director::OWN_RUNS {
+        hook_or_warn(
+            name,
+            ctx.hook_after(name, move |_| view::director::ran(name)),
+        );
+    }
+    // An enemy's phase machine: the host's advance is sent, a copy's own
+    // vetoed (`view::phase`).
+    {
+        let name = view::phase::ADVANCE;
+        let (c1, c2) = (Arc::clone(w), Arc::clone(w));
+        hook_or_warn(
+            name,
+            ctx.hook(
+                name,
+                move |call| c1.phase_before(call),
+                move |call, ()| c2.phase_after(call),
+            ),
+        );
+    }
+    // An enemy's own phase clock (`view::phase::PHASE_CLOCKS`): the host's
+    // run is sent, a copy's own skipped.
+    for &(object, alarm, _) in view::phase::PHASE_CLOCKS {
+        let name = view::phase::clock_event(object, alarm);
+        let (c1, c2) = (Arc::clone(w), Arc::clone(w));
+        hook_or_warn(
+            &name,
+            ctx.hook(
+                &name,
+                move |call| c1.clock_before(call),
+                move |call, ()| c2.clock_after(call),
+            ),
+        );
     }
     {
         let name = view::ENDING_STEP;
@@ -3579,5 +3834,54 @@ fn register_view(ctx: &ModContext, w: &Arc<WorldHooks>) {
                 move |call, swapped| c2.zoom_writer_after(call, swapped),
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod after_hook_tests {
+    use super::{AfterHook, OwnPick, after_hook, keeps_own_pick};
+
+    const OWN_BALL: OwnPick = OwnPick {
+        preferred: true,
+        player: false,
+    };
+
+    #[test]
+    fn an_enemy_after_the_joining_player_keeps_its_own_ball() {
+        assert_eq!(after_hook(true, Some(OWN_BALL)), AfterHook::KeepOwnThing);
+        assert!(keeps_own_pick(Some(OWN_BALL)));
+    }
+
+    #[test]
+    fn the_hosts_ship_construct_or_decoy_is_pointed_at_the_joining_players_avatar() {
+        // The host's ship, construct or decoy (Guardian): player-side, not
+        // the type the enemy prefers.
+        let host_thing = OwnPick {
+            preferred: false,
+            player: true,
+        };
+        assert_eq!(after_hook(true, Some(host_thing)), AfterHook::Avatar);
+        // Even an enemy whose preferred type a player's thing is: a
+        // player's thing is never its own.
+        let preferred_player = OwnPick {
+            preferred: true,
+            player: true,
+        };
+        assert_eq!(after_hook(true, Some(preferred_player)), AfterHook::Avatar);
+        // A world instance it does not prefer (another enemy), no pick, no
+        // preferred type: the remote player's avatar.
+        let other = OwnPick {
+            preferred: false,
+            player: false,
+        };
+        assert_eq!(after_hook(true, Some(other)), AfterHook::Avatar);
+        assert_eq!(after_hook(true, None), AfterHook::Avatar);
+    }
+
+    #[test]
+    fn an_enemy_after_this_games_player_is_left_alone() {
+        for pick in [None, Some(OWN_BALL)] {
+            assert_eq!(after_hook(false, pick), AfterHook::GamesOwn);
+        }
     }
 }

@@ -376,20 +376,16 @@ fn world_object(call: &Call<'_>, a: &Api, st: &mut State, w: &WorldHooks, o: u32
     world_by_names(call, a, o)
 }
 
-/// The world's rule by names alone: an `oSolid` child not in
-/// [`crate::world::classify::LOCAL`], or an enemy shot or charge-up child.
+/// The world's rule by names alone: an `oSolid` child, or an enemy shot or charge-up child.
 fn world_by_names(call: &Call<'_>, a: &Api, object: u32) -> bool {
-    use crate::world::classify::{LOCAL, parent};
+    use crate::world::classify::parent;
     let mut cur = object;
-    for depth in 0..16 {
+    for _ in 0..16 {
         let name = call
             .call_builtin(a.name, &[Value::object(cur)])
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_default();
-        if depth == 0 && LOCAL.contains(&name.as_str()) {
-            return false;
-        }
         if name == parent::SOLID
             || parent::ENEMY_SHOTS.contains(&name.as_str())
             || parent::ENEMY_CHARGES.contains(&name.as_str())

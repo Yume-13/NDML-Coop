@@ -209,6 +209,8 @@ pub struct SteamCoop {
     linger_until: AtomicU64,
     creating: AtomicBool,
     listener_key: AtomicUsize,
+    /// Sends Steam refused this session (the link line, `crate::link_log`).
+    refused: AtomicU64,
     inbox: Mutex<Vec<SteamEvent>>,
     st: Mutex<State>,
 }
@@ -356,6 +358,7 @@ impl SteamCoop {
             active: AtomicBool::new(false),
             linger_until: AtomicU64::new(0),
             creating: AtomicBool::new(false),
+            refused: AtomicU64::new(0),
             inbox: Mutex::new(Vec::new()),
         }
     }
@@ -378,6 +381,22 @@ impl SteamCoop {
         }
     }
 
+    /// The link line's Steam counts (`crate::link_log`): sends Steam refused
+    /// this session and datagrams the bridge dropped. `None` while Steam is
+    /// not up. Takes the connector's lock briefly: call it with no other lock
+    /// held.
+    #[must_use]
+    pub fn link_counts(&self) -> Option<crate::link_log::SteamCounts> {
+        if self.availability() != Availability::Yes {
+            return None;
+        }
+        let b = self.lock().bridge.stats();
+        Some(crate::link_log::SteamCounts {
+            refused: self.refused.load(Ordering::Relaxed),
+            bridge_drops: b.dropped_out + b.dropped_in,
+        })
+    }
+
     /// Whether Steam is up (known after the first pump ticks).
     #[must_use]
     pub fn available(&self) -> bool {
@@ -386,7 +405,12 @@ impl SteamCoop {
 
     /// Queue a UI action for the next pump tick (never calls the game).
     pub fn act(&self, action: SteamAction) {
-        log::debug!("co-op steam: action {action:?}");
+        // A typed room code (a lobby's id) never goes to the log.
+        if matches!(action, SteamAction::JoinCode(_)) {
+            log::debug!("co-op steam: action JoinCode");
+        } else {
+            log::debug!("co-op steam: action {action:?}");
+        }
         let mut st = self.lock();
         if st.actions.len() < 16 {
             st.actions.push_back(action);
@@ -582,6 +606,9 @@ impl SteamCoop {
     }
 
     fn account(&self, t0: Instant, sent: usize, received: usize, failed: usize) {
+        if failed > 0 {
+            self.refused.fetch_add(failed as u64, Ordering::Relaxed);
+        }
         let mut st = self.lock();
         st.stats.tick(t0.elapsed(), sent, received, failed);
         let since = *st.stats_since.get_or_insert(t0);
@@ -594,9 +621,12 @@ impl SteamCoop {
             );
             log::debug!("{line}");
             if st.stats.send_failed > 0 {
-                warn_once(
-                    "steam-send-failed",
-                    "co-op steam: unable to send some packets (Steam refused them)",
+                // At most one line per window, only in a window with refusals.
+                log::warn!(
+                    "co-op steam: unable to send some packets (Steam refused {} in the last {:.0} s, {} this session)",
+                    st.stats.send_failed,
+                    over.as_secs_f64(),
+                    self.refused.load(Ordering::Relaxed)
                 );
             }
             st.stats = PumpStats::default();

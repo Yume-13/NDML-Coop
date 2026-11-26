@@ -29,8 +29,9 @@
 //!   game's copies run out of step and are held at gain 0 ([`Route::Mute`]), except a death it
 //!   predicted, a hit by its own player-side thing, and while no host frame came for [`BLIP`]
 //!   ([`Route::Open`]).
-//! * Everything else (local missiles, menus, music, pickups, effects, a sound inside one
-//!   player's view) is each game's own.
+//! * Enemy missiles are world sounds like every other enemy copy.
+//! * Everything else (menus, music, pickups, effects, a sound inside one player's view) is each
+//!   game's own.
 //!
 //! [`Sender`] numbers one-shots per list and sends each for [`RIDE_FRAMES`] frames; live loops
 //! go as sets. [`Receiver`] plays a one-shot once, when the mirror presents the frame that first

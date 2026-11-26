@@ -31,8 +31,6 @@ use std::time::Duration;
 pub struct RulesSettings {
     /// The game's pause on focus loss counts as that player pausing.
     pub pause_on_focus_loss: bool,
-    /// After this long a player who has chosen may stop waiting (`None`: never).
-    pub upgrade_wait: Option<Duration>,
     /// How long a downed ship waits (game time).
     pub respawn: Duration,
 }
@@ -41,7 +39,6 @@ impl Default for RulesSettings {
     fn default() -> Self {
         Self {
             pause_on_focus_loss: true,
-            upgrade_wait: Some(Duration::from_secs(60)),
             respawn: Duration::from_secs(45),
         }
     }
@@ -51,36 +48,15 @@ impl Default for RulesSettings {
 #[derive(Debug, Clone, Copy)]
 pub struct Raw {
     pub pause_on_focus_loss: bool,
-    pub upgrade_wait_seconds: f64,
+    /// `respawn_seconds`, already validated.
     pub respawn: Duration,
 }
 
-/// A wait in seconds: 0 = never, otherwise clamped to 10..3600 with a warning.
-fn wait(name: &str, v: f64, default: f64, w: &mut Vec<String>) -> Option<Duration> {
-    if !v.is_finite() || v < 0.0 {
-        w.push(format!(
-            "{name} = {v} is not a number of seconds; using {default}"
-        ));
-        return Some(Duration::from_secs_f64(default));
-    }
-    if v == 0.0 {
-        return None;
-    }
-    let c = v.clamp(10.0, 3600.0);
-    if (c - v).abs() > f64::EPSILON {
-        w.push(format!(
-            "{name} = {v} is outside [10, 3600] (0 = never); using {c}"
-        ));
-    }
-    Some(Duration::from_secs_f64(c))
-}
-
-/// Validate the raw keys; one warning per value changed.
+/// The settings from the raw keys.
 #[must_use]
-pub fn validate(r: &Raw, w: &mut Vec<String>) -> RulesSettings {
+pub fn validate(r: &Raw) -> RulesSettings {
     RulesSettings {
         pause_on_focus_loss: r.pause_on_focus_loss,
-        upgrade_wait: wait("upgrade_wait_seconds", r.upgrade_wait_seconds, 60.0, w),
         respawn: r.respawn,
     }
 }
@@ -92,47 +68,12 @@ mod tests {
     fn raw() -> Raw {
         Raw {
             pause_on_focus_loss: true,
-            upgrade_wait_seconds: 60.0,
             respawn: Duration::from_secs(45),
         }
     }
 
     #[test]
-    fn defaults_validate_quietly() {
-        let mut w = Vec::new();
-        assert_eq!(validate(&raw(), &mut w), RulesSettings::default());
-        assert!(w.is_empty());
-    }
-
-    #[test]
-    fn waits_zero_means_never_and_clamp() {
-        let mut w = Vec::new();
-        let s = validate(
-            &Raw {
-                upgrade_wait_seconds: 0.0,
-                ..raw()
-            },
-            &mut w,
-        );
-        assert_eq!(s.upgrade_wait, None);
-        assert!(w.is_empty());
-        let s = validate(
-            &Raw {
-                upgrade_wait_seconds: 2.0,
-                ..raw()
-            },
-            &mut w,
-        );
-        assert_eq!(s.upgrade_wait, Some(Duration::from_secs(10)));
-        assert_eq!(w.len(), 1);
-        let s = validate(
-            &Raw {
-                upgrade_wait_seconds: f64::NAN,
-                ..raw()
-            },
-            &mut w,
-        );
-        assert_eq!(s.upgrade_wait, Some(Duration::from_secs(60)));
-        assert_eq!(w.len(), 2);
+    fn defaults_validate() {
+        assert_eq!(validate(&raw()), RulesSettings::default());
     }
 }

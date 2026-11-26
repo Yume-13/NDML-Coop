@@ -61,7 +61,7 @@ pub fn run_lines(v: &RunView<'_>) -> Vec<Line> {
         )),
         (false, true) => out.push((
             format!(
-                "CO-OP  {}. Playing on alone; saves stay off for this run.",
+                "CO-OP  {}. Saves stay off for this run.",
                 v.left.unwrap_or("Your partner left")
             ),
             color::AMBER,
@@ -172,7 +172,7 @@ mod tests {
         assert!(
             run_lines(&v)[0]
                 .0
-                .contains("Wing left (timed out). Playing on alone")
+                .contains("Wing left (timed out). Saves stay off")
         );
         v.coop_run = false;
         v.linked = true;

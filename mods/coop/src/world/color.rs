@@ -54,7 +54,7 @@ pub const EXTRA_COLORS: &[(&str, (u8, u8, u8))] = &[
     ("white", (255, 255, 255)),
 ];
 
-/// `"auto"` / `"none"` (no explicit colour: the partner uses your ship's own
+/// `"auto"` / `"none"` (no explicit colour: the partner sees this ship's own
 /// colours), one of the game's palettes (its `colJet`), an extra name, or
 /// `#RRGGBB` / `RRGGBB` / `0xRRGGBB` (red first, as people write hex).
 pub fn parse_color(text: &str) -> Result<Option<u32>, String> {

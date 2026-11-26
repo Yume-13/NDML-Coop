@@ -40,6 +40,7 @@ pub mod classify;
 pub mod client;
 pub mod color;
 pub mod config;
+pub mod emerge;
 pub mod entities;
 pub mod glue;
 pub mod host;
@@ -49,8 +50,10 @@ pub mod present;
 pub mod put_back;
 pub mod repl;
 pub mod shots;
+pub mod standin;
 pub mod state;
 pub mod target;
+pub mod windup;
 
 use std::time::{Duration, Instant};
 
@@ -116,6 +119,7 @@ pub fn route(ev: Event) -> Routed {
                     | Message::CoverState(_)
                     | Message::LitStates(_)
                     | Message::LureState(_)
+                    | Message::OnDeath(_)
             ) =>
         {
             Routed::World(msg)
@@ -158,15 +162,17 @@ pub fn partner_views(
             look.alpha = f64::from(l.alpha);
             look.blend = l.blend;
         }
-        if latest.downed {
-            // Down: hidden at once, before the next `PlayerLook`.
+        // Down at the pose's render time: hidden at once, before the next
+        // `PlayerLook`, and shown again from the first state that is up.
+        let downed = p.ship.downed_at(t);
+        if downed {
             look.visible = false;
         }
         out.push(PartnerView {
             peer,
             name: p.name.clone(),
             fresh,
-            downed: latest.downed,
+            downed,
             pose: at,
             sprite,
             frame: latest.frame,

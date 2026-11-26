@@ -25,9 +25,11 @@
 //! 1. **Link interrupted**: nothing is torn down; the host keeps tracking
 //!    enemies, the client keeps its puppets at their last pose. If the
 //!    partner comes back in the same run the host resyncs the full world.
-//! 2. **Partner left for good** (the host only): the host stops replicating
-//!    and plays on solo. A joining game never owns the world: the host gone
-//!    ends its run, so its world stays as for outcome 1 until outcome 3.
+//! 2. **Partner left for good** (the host only): the host stops replicating.
+//!    Past the start gate its run is over too (`state::Core::run_over`) and
+//!    the game leaves for the menu. A joining game never owns the world: the
+//!    host gone ends its run, so its world stays as for outcome 1 until
+//!    outcome 3.
 //! 3. **Run ended** (menu, a new run): everything is forgotten.
 
 #![forbid(unsafe_code)]

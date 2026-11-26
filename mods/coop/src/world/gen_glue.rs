@@ -36,12 +36,17 @@ use std::sync::Arc;
 use ndml_net::msg::{InstanceState, InstanceStateIx, Message, NetId, StateNames, StateValue};
 use ndml_sdk::{Call, Value};
 
-use super::super::state::{self, Captured, Stats};
+use super::super::state::{self, Captured, Reflect, Stats};
 use super::WorldHooks;
 
 /// A reference to a copy that does not exist yet is given up after this
 /// many running frames (`GenState::run_frames`).
 const WAIT_FRAMES: u64 = 600;
+
+/// Frames a state part waits for the names of its variables
+/// ([`GenState::names_known`]) before it is taken with what is named (the
+/// rest left out): 2 s, past a name table resent after a loss.
+const NAMES_WAIT_FRAMES: u64 = 120;
 /// Host: periodic repairs captured per frame at most (each is a full
 /// capture). The safety net: what changes in a variable the copy has.
 const REPAIRS_PER_FRAME: usize = 3;
@@ -97,6 +102,80 @@ struct Made {
     first_done: bool,
 }
 
+/// The copy a first state names as its `leader`, if any.
+fn leader_in(c: &Captured) -> Option<NetId> {
+    c.vars.iter().find_map(|(name, v)| match v {
+        StateValue::Instance(n) if name == super::super::names::var::LEADER => Some(*n),
+        _ => None,
+    })
+}
+
+/// A copy whose `leader` (`leaders`: copy, its leader) is held is held with
+/// it, and so on down the chain: a member takes a deactivated leader for
+/// gone (`oEnemySegment_Step_2` sets its hull to 0 and ends it).
+/// ([`super::client::ClientWorld::update_held`] holds only copies that have
+/// not run.)
+fn held_with_leaders(incomplete: &mut HashSet<NetId>, leaders: &HashMap<NetId, NetId>) {
+    loop {
+        let more: Vec<NetId> = leaders
+            .iter()
+            .filter(|(n, l)| incomplete.contains(*l) && !incomplete.contains(*n))
+            .map(|(&n, _)| n)
+            .collect();
+        if more.is_empty() {
+            return;
+        }
+        incomplete.extend(more);
+    }
+}
+
+/// The followers held with held copies, after a run step: those of a copy
+/// still held (`still`, id numbers) are kept, with the ones `found` now
+/// added once; those of a copy let go are dropped. A follower is kept by id
+/// from the frame it was first found: the next frame's pass does not see it.
+fn keep_held_followers(held: &mut Vec<(i64, Value)>, still: &[i64], found: Vec<(i64, Value)>) {
+    held.retain(|(l, _)| still.contains(l));
+    for (l, f) in found {
+        let n = super::followers::id_number(&f);
+        if !held
+            .iter()
+            .any(|(_, g)| super::followers::id_number(g) == n)
+        {
+            held.push((l, f));
+        }
+    }
+}
+
+/// The states due now for the first states due with them: each state of a
+/// copy that a first state (`seq` 0) refers to and that came before that
+/// first state (`ready` in arrival order). The host's instance had it
+/// before the member was born, so it is due no later than the member's
+/// birth, whatever age its copy is held for. The member itself is not held
+/// for it.
+fn due_with_members(ready: &[(NetId, u16, Captured)]) -> HashSet<(NetId, u16)> {
+    let mut out = HashSet::new();
+    for (i, (net, seq, c)) in ready.iter().enumerate() {
+        if *seq != 0 {
+            continue;
+        }
+        let refs: HashSet<NetId> = c
+            .vars
+            .iter()
+            .filter_map(|(_, v)| match v {
+                StateValue::Instance(n) if n != net => Some(*n),
+                _ => None,
+            })
+            .collect();
+        out.extend(
+            ready[..i]
+                .iter()
+                .filter(|r| r.1 > 0 && refs.contains(&r.0))
+                .map(|r| (r.0, r.1)),
+        );
+    }
+    out
+}
+
 /// A reference change to send this frame: (net, id, object, born, the
 /// watched references).
 type RefDue = (NetId, Value, u16, u64, Arc<Vec<String>>);
@@ -123,6 +202,9 @@ pub(super) struct GenState {
     /// Host: members born since the last run step, by a tracked maker (maker
     /// key, member key): the maker's gains go ahead of them.
     pub(super) members_born: Vec<(usize, usize)>,
+    /// Host: instances whose last state went out as they ended
+    /// ([`WorldHooks::gen_host_last_now`]): taken ahead of their despawns.
+    ends_ahead: HashSet<NetId>,
     /// Host: instances `instance_copy` made (key, frame): their first state
     /// says so ([`state::ORIGIN_BUILTIN`]).
     pub(super) copy_born: HashMap<usize, u64>,
@@ -161,6 +243,17 @@ pub(super) struct GenState {
     /// Client: references to copies not made yet: (referrer, variable,
     /// target, since frame).
     waiting: Vec<(NetId, String, NetId, u64)>,
+    /// Client: the local effects following copies held born incomplete
+    /// (leader's id number, follower), kept from the frame each was found
+    /// until its leader is let go, and deactivated with it at every run
+    /// step's end ([`WorldHooks::gen_hold_incomplete`],
+    /// [`keep_held_followers`]).
+    held_followers: Vec<(i64, Value)>,
+    /// Client: the followers a copy that runs its own set-up was sent with
+    /// (net, the run frame its first state was applied, those pseudo
+    /// built-ins), made at the next running frame for what its own code has
+    /// not made by then ([`WorldHooks::gen_followers_due`]).
+    followers_due: Vec<FollowersDue>,
     /// Client: enemies that copies made (key, id, frame): let through so the code
     /// that made them goes on as in the game, and removed silently after the
     /// set-up step or at their first tick (the host's arrive).
@@ -169,6 +262,11 @@ pub(super) struct GenState {
     host_names: HashMap<u16, HashMap<String, u16>>,
     /// Client, compact: each object's variable names by index.
     client_names: HashMap<u16, Vec<String>>,
+    /// Client: state parts that came before the names of some of their
+    /// variables (`StateNames`), kept until those are here
+    /// ([`NAMES_WAIT_FRAMES`]), and the frame each was first kept.
+    unnamed: Vec<InstanceStateIx>,
+    unnamed_since: HashMap<(NetId, u16, u8), u64>,
     /// Host, paced: messages waiting to go (message, encoded bytes).
     outq: VecDeque<(Message, usize)>,
 }
@@ -186,6 +284,62 @@ impl GenState {
             (n, g.id.clone(), g.object, g.first.clone())
         })
         .collect()
+    }
+
+    /// Client: the copies made here that lack what they were born with:
+    /// their first state not applied yet, or a reference waiting for a copy
+    /// still to be made here (pending). A target not known here (gone on
+    /// the host, or never a copy) holds nothing.
+    pub(super) fn born_incomplete(
+        &self,
+        client: &crate::world::client::ClientWorld,
+    ) -> HashSet<NetId> {
+        let mut out: HashSet<NetId> = self
+            .made
+            .iter()
+            .filter(|(_, m)| !m.first_done)
+            .map(|(&n, _)| n)
+            .collect();
+        out.extend(
+            self.waiting
+                .iter()
+                .filter(|w| client.is_pending(w.2))
+                .map(|w| w.0),
+        );
+        let leaders: HashMap<NetId, NetId> = self
+            .made
+            .keys()
+            .filter_map(|&n| Some((n, leader_in(self.kept.get(&n)?)?)))
+            .collect();
+        held_with_leaders(&mut out, &leaders);
+        out
+    }
+
+    /// Client: the host's follower objects of these copies (their first
+    /// states', [`super::followers::followers_in`]).
+    pub(super) fn follower_objects(&self, nets: &HashSet<NetId>) -> Vec<u16> {
+        let mut out: Vec<u16> = nets
+            .iter()
+            .filter_map(|n| self.kept.get(n))
+            .flat_map(|c| {
+                super::followers::followers_in(c)
+                    .into_iter()
+                    .map(|f| f.object)
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Client: every variable index in `vars` has its name here.
+    pub(super) fn names_known(&self, object: u16, vars: &[(u16, StateValue)]) -> bool {
+        let names = self.client_names.get(&object);
+        vars.iter().all(|(ix, _)| {
+            names
+                .and_then(|l| l.get(usize::from(*ix)))
+                .is_some_and(|n| !n.is_empty())
+        })
     }
 
     /// Client, each run step: copies the table no longer knows lose their
@@ -476,8 +630,10 @@ impl WorldHooks {
             first
                 .builtins
                 .push((state::ORIGIN_BUILTIN, StateValue::Whole(state::ORIGIN_COPY)));
-            self.followers_attach(call, &id, &mut first);
         }
+        // What follows it now goes with it, whoever made it: a copy that
+        // runs its own set-up is given only what it lacks.
+        self.followers_attach(call, &id, &mut first);
         // Its maker ran its user event 1 (a car's trails): the copy
         // runs it after its set-up.
         if !no_setup && self.lock().transfer.event1_by_maker.remove(&key).is_some() {
@@ -543,6 +699,66 @@ impl WorldHooks {
         if let Some(e) = entry {
             self.gen_host_first(call, frame, e);
         }
+    }
+
+    /// Host, as a tracked instance ends (`checkDestroy` with its hull out,
+    /// `instance_destroy` with its event): the variables changed since its
+    /// last state go now, ahead of its despawn (taken ahead with the maker
+    /// repairs, [`Self::gen_maker_repairs`]). The copy's Destroy event, run
+    /// at the host's word, reads them (a Dweller drone blasts only past
+    /// `explodability`). Variables only: its place is the despawn's.
+    pub(super) fn gen_host_last_now(&self, call: &Call<'_>, key: usize) {
+        if !self.gen_wanted() {
+            return;
+        }
+        let found = {
+            let st = self.lock();
+            if st.frozen {
+                return;
+            }
+            st.host.net_id(key).and_then(|net| {
+                st.transfer
+                    .host_live
+                    .get(&net)
+                    .filter(|g| g.key == key)
+                    .map(|g| (net, g.id.clone(), g.object))
+            })
+        };
+        // Its first state not out yet: that carries everything.
+        let Some((net, id, object)) = found else {
+            return;
+        };
+        if !self.exists(call, &id) {
+            return;
+        }
+        let mut stats = Stats::default();
+        let Some(c) = self.host_capture(call, &id, &mut stats) else {
+            return;
+        };
+        let (last, seq) = {
+            let mut st = self.lock();
+            let st = &mut *st;
+            let Some(g) = st.transfer.host_live.get_mut(&net) else {
+                return;
+            };
+            let d = Captured {
+                vars: state::changed(&g.last, &c).vars,
+                ..Captured::default()
+            };
+            if d.vars.is_empty() {
+                return;
+            }
+            merge_vars(&mut g.last, &d);
+            g.seq = g.seq.wrapping_add(1).max(1);
+            let seq = g.seq;
+            st.transfer.ends_ahead.insert(net);
+            (d, seq)
+        };
+        // No age stamp: the joining game applies it on arrival, with every
+        // state of the copy still waiting for its age
+        // ([`Self::gen_take_ready`]). Stamped, it would wait for the copy to
+        // reach the host's age at the end, which its despawn reaches as soon.
+        self.send(net, object, seq, &last);
     }
 
     /// Host, at the run step: capture the instances first seen last frame and
@@ -749,6 +965,22 @@ impl WorldHooks {
             .get(&net)
             .map_or_default(|g| Arc::clone(&g.refs));
         let (refs, ref_sig) = self.gen_ref_watch(call, id, &had, &c);
+        // A machine user's phase, and what a phase clock's event writes, go
+        // with the host's phase word (its entry or its event runs on the
+        // copy), never with a repair.
+        let leaves = {
+            let has_phases = c.vars.iter().any(|(k, _)| k == "phases");
+            let phase = c
+                .vars
+                .iter()
+                .find(|(k, _)| k == "phase")
+                .and_then(|(_, v)| match v.clone().expanded() {
+                    StateValue::Real(x) => Some(x),
+                    StateValue::Int(i) => i32::try_from(i).ok().map(f64::from),
+                    _ => None,
+                });
+            self.phase_repair_leaves(call, net, u32::from(object), has_phases, phase)
+        };
         let (mut diff, seq) = {
             let mut st = self.lock();
             let Some(g) = st.transfer.host_live.get_mut(&net) else {
@@ -762,6 +994,9 @@ impl WorldHooks {
                 narrow_repair(&mut d, &mut g.moved, &g.last);
                 g.last = c.clone();
                 g.sent_at = frame;
+            }
+            if !leaves.is_empty() {
+                d.vars.retain(|(k, _)| !leaves.contains(&k.as_str()));
             }
             g.count = count;
             g.change_since = None;
@@ -884,17 +1119,30 @@ impl WorldHooks {
     /// gained since its last state (read singly), ahead of its members'
     /// spawns and outside the change budget, once per frame (a Seraph sets
     /// `orbitSpeed` and `dronePhase` on itself in the frame it makes its
-    /// drones). Returns the messages, the maker's queued repairs first.
+    /// drones). The last states of the instances that ended since
+    /// ([`Self::gen_host_last_now`]) go ahead the same way, before their
+    /// despawns. Returns the messages, the maker's queued repairs first.
     pub(super) fn gen_maker_repairs(&self, call: &Call<'_>) -> Vec<Message> {
-        let born = std::mem::take(&mut self.lock().transfer.members_born);
-        if born.is_empty() || self.lock().frozen {
+        let (born, ends, frozen) = {
+            let mut st = self.lock();
+            let frozen = st.frozen;
+            let t = &mut st.transfer;
+            (
+                std::mem::take(&mut t.members_born),
+                std::mem::take(&mut t.ends_ahead),
+                frozen,
+            )
+        };
+        if (born.is_empty() && ends.is_empty()) || frozen {
             return Vec::new();
         }
+        // The last states of instances that ended go ahead of their
+        // despawns, as these repairs do of their members' spawns.
+        let mut ahead: HashSet<NetId> = ends;
         let Some(r) = self.h.reflect.as_ref() else {
-            return Vec::new();
+            return take_ahead(&mut self.lock().transfer.outq, &ahead);
         };
         let frame = self.lock().frame;
-        let mut ahead: HashSet<NetId> = HashSet::new();
         for (maker, _) in makers_once(&born) {
             // By address alone until the next tick: the repair goes out only
             // while the tracked instance, checked by its id below, exists.
@@ -1053,6 +1301,14 @@ impl WorldHooks {
     /// [`InstanceState`]) and name tables out of the world's inbox.
     pub(super) fn gen_client_inbox(&self, inbox: &mut Vec<Message>) {
         let mut st = self.lock();
+        // The parts kept for their names go again first (names in this
+        // inbox come before them only when they came earlier).
+        let back: Vec<Message> = std::mem::take(&mut st.transfer.unnamed)
+            .into_iter()
+            .map(Message::InstanceStateIx)
+            .collect();
+        inbox.splice(0..0, back);
+        let frame = st.frame;
         inbox.retain(|m| {
             let expanded;
             let p = match m {
@@ -1072,6 +1328,18 @@ impl WorldHooks {
                     return false;
                 }
                 Message::InstanceStateIx(p) => {
+                    // A state is never taken without what it carries: a part
+                    // whose names have not come yet waits for them (else a
+                    // first state could lose its `leader`).
+                    let key = (p.net_id, p.seq, p.part);
+                    if !st.transfer.names_known(p.object, &p.vars) {
+                        let since = *st.transfer.unnamed_since.entry(key).or_insert(frame);
+                        if frame.saturating_sub(since) < NAMES_WAIT_FRAMES {
+                            st.transfer.unnamed.push(p.clone());
+                            return false;
+                        }
+                    }
+                    st.transfer.unnamed_since.remove(&key);
                     let names = st.transfer.client_names.get(&p.object);
                     let vars = p
                         .vars
@@ -1151,8 +1419,9 @@ impl WorldHooks {
     }
 
     /// Client: a repair as it is applied, and the kept first state brought
-    /// up to date with it.
-    fn gen_repair_prepare(&self, net: NetId, c: &mut Captured) {
+    /// up to date with it. `copy_has`: the owned statuses the copy holds now
+    /// ([`copy_owned_statuses`]; none when it is not there).
+    fn gen_repair_prepare(&self, net: NetId, c: &mut Captured, copy_has: &[String]) {
         // A repair never rebuilds a method: its method values are dropped
         // (see `narrow_repair`).
         c.vars
@@ -1160,26 +1429,30 @@ impl WorldHooks {
         // Nor the hull: the world writes it every tick from the snapshot.
         c.vars
             .retain(|v| !state::WORLD_OWNED.contains(&v.0.as_str()));
-        // Nor what the copy holds for its own player (its corrosion).
-        c.vars
-            .retain(|v| !state::COPY_OWNED.contains(&v.0.as_str()));
-        // The kept state follows every repair (a narrow repair only carries
-        // what changed).
-        if let Some(k) = self.lock().transfer.kept.get_mut(&net) {
-            merge_vars(k, c);
-        }
+        // Nor what the copy holds for its own player ([`repair_statuses`]).
+        let mut st = self.lock();
+        let kept = st.transfer.kept.get_mut(&net);
+        repair_statuses(c, kept, |name| copy_has.iter().any(|h| h == name));
     }
 
     /// Client: the states ready to apply now (first states and repairs of
     /// copies made here), in order; the rest wait. A repair waits until its
     /// copy is as old as the host's instance was when read
     /// ([`state::AGE_BUILTIN`]), later ones of the same copy behind it; a
-    /// copy made again (a refused kill) takes them at once.
+    /// copy made again (a refused kill) takes them at once, and so does a
+    /// copy whose last state came (a repair with no stamp,
+    /// [`Self::gen_host_last_now`]: its despawn is next).
     fn gen_take_ready(&self) -> Vec<(NetId, u16, Captured, Value)> {
         let mut st = self.lock();
         let st = &mut *st;
         let frame = st.frame;
         let mut ready = std::mem::take(&mut st.transfer.ready);
+        let members = due_with_members(&ready);
+        let ending: HashSet<NetId> = ready
+            .iter()
+            .filter(|(_, seq, c)| at_once(*seq, c))
+            .map(|r| r.0)
+            .collect();
         // Each copy's states in their order; arrival order otherwise.
         ready.sort_by_key(|r| (r.0, r.1));
         let mut keep = Vec::new();
@@ -1192,10 +1465,18 @@ impl WorldHooks {
                     let stamp = (seq > 0 && !m.again)
                         .then(|| state::stamped_age(&c))
                         .flatten();
-                    if held.contains(&net) || stamp.is_some_and(|a| copy_age < a) {
+                    if !ending.contains(&net)
+                        && !members.contains(&(net, seq))
+                        && (held.contains(&net) || stamp.is_some_and(|a| copy_age < a))
+                    {
                         held.insert(net);
                         keep.push((net, seq, c));
                         continue;
+                    }
+                    // An emerging copy's emerge stands at the repair's age
+                    // once it is written (`emerge`).
+                    if let Some(a) = stamp {
+                        st.client.emerge_repaired(net, a);
                     }
                     todo.push((net, seq, c, m.id.clone()));
                 }
@@ -1226,9 +1507,10 @@ impl WorldHooks {
                     self.lock().transfer.ready.push((net, seq, c));
                     blocked.insert(net);
                 } else if seq > 0 && open.contains(&net) {
+                    // Not there: only the kept first state takes it.
                     // Died here on a kill claim not settled yet: folded into
                     // its kept first state, which a copy made again gets.
-                    self.gen_repair_prepare(net, &mut c);
+                    self.gen_repair_prepare(net, &mut c, &[]);
                 }
                 continue;
             }
@@ -1249,6 +1531,16 @@ impl WorldHooks {
                 if done == Some(true) {
                     continue;
                 }
+                // A first state captured while the host's enemy carried a
+                // status of the host's (a mark from its first hit, the
+                // budget holding the capture a frame or more): not the
+                // copy's, which starts with none. Written at its neutral
+                // value, never left out (`state::status_neutral`).
+                for v in &mut c.vars {
+                    if let Some(n) = state::status_neutral(&v.0, &v.1) {
+                        v.1 = n;
+                    }
+                }
                 st.transfer.kept.insert(net, c.clone());
                 drop(st);
                 // Made again (a refused kill claim, a resync): placed where
@@ -1258,8 +1550,13 @@ impl WorldHooks {
                 }
             }
             if seq > 0 {
-                self.gen_repair_prepare(net, &mut c);
+                let has = copy_owned_statuses(call, &r, &id, &c);
+                self.gen_repair_prepare(net, &mut c, &has);
             }
+            let not_shared = state::singletons_not_shared(call, &r, &mut c.vars, &|k| {
+                self.lock().shots.client.shared(k).is_some()
+            });
+            let _ = not_shared;
             let mut stats = Stats::default();
             let id_of = |n: NetId| self.lock().client.id_of(n);
             let setup = seq == 0 && !state::born_by_copy(&c);
@@ -1304,8 +1601,17 @@ impl WorldHooks {
             );
             if let Some(p) = made_pose {
                 set_copy_pose(call, &id, p);
+                // Not an emerging copy: its emerge ends at the host's turn,
+                // never by its own (`emerge`).
+                if !self.lock().client.is_emerging(net) {
+                    made_again_solid(call, &r, &id);
+                }
             }
-            self.followers_make(call, &id, seq, &c);
+            if setup {
+                self.gen_followers_later(net, &c);
+            } else {
+                self.followers_make(call, &id, seq, &c);
+            }
             if !stats.readback_bad.is_empty() {
                 let obj = self.lock().transfer.made.get(&net).map_or(0, |m| m.object);
                 crate::game::info_once(
@@ -1411,8 +1717,30 @@ impl WorldHooks {
         if !frozen {
             self.gen_scratch_clear(call, 2);
         }
+        // Copies held born incomplete are active for this step, so their
+        // first state and references can be written; the ones still
+        // incomplete are deactivated again at its end, before their events.
+        if !frozen {
+            let (held, followers) = {
+                let st = self.lock();
+                (
+                    st.client.held_ids(),
+                    st.transfer
+                        .held_followers
+                        .iter()
+                        .map(|(_, f)| f.clone())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for id in held.iter().chain(&followers) {
+                self.set_asleep(call, id, false);
+            }
+        }
         let open = self.gen_forget_gone();
         self.gen_apply_ready(call, &open);
+        if !frozen {
+            self.gen_followers_due(call);
+        }
         // References whose target is here now; not in a freeze (the copies
         // are deactivated: a write to one is lost), the first running frame
         // after it sets them.
@@ -1446,6 +1774,121 @@ impl WorldHooks {
                 let _ = state::set_var(call, &r, &a, &w.1, &b);
             }
             self.follow_frame(call);
+        }
+        if !frozen {
+            self.gen_hold_incomplete(call);
+        }
+    }
+
+    /// Client: the followers a first state with a set-up carries, kept for
+    /// [`Self::gen_followers_due`].
+    fn gen_followers_later(&self, net: NetId, c: &Captured) {
+        let f: Vec<(u8, StateValue)> = c
+            .builtins
+            .iter()
+            .filter(|(i, _)| *i == super::followers::FOLLOWER_BUILTIN)
+            .cloned()
+            .collect();
+        if f.is_empty() {
+            return;
+        }
+        let mut st = self.lock();
+        let run = st.transfer.run_frames;
+        st.transfer.followers_due.push((net, run, f));
+    }
+
+    /// Client, at the run step: a copy that ran its own set-up gets the
+    /// followers the host's had that it lacks, once it has run a frame (its
+    /// own Create, set-up and first Step made theirs; counted by object, only
+    /// the rest are made). Not while it is deactivated (asleep, held): up to
+    /// [`FOLLOWERS_DUE_FRAMES`], then dropped.
+    fn gen_followers_due(&self, call: &Call<'_>) {
+        let due = {
+            let mut st = self.lock();
+            let st = &mut *st;
+            let run = st.transfer.run_frames;
+            let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut st.transfer.followers_due)
+                .into_iter()
+                .filter(|(n, at, _)| {
+                    st.client.is_known(*n) && run.saturating_sub(*at) <= FOLLOWERS_DUE_FRAMES
+                })
+                .partition(|(_, at, _)| run > *at);
+            st.transfer.followers_due = keep;
+            due.into_iter()
+                .filter_map(|(n, at, f)| Some((st.client.id_of(n)?, n, at, f)))
+                .collect::<Vec<_>>()
+        };
+        for (id, net, at, f) in due {
+            if !self.exists(call, &id) {
+                self.lock().transfer.followers_due.push((net, at, f));
+                continue;
+            }
+            let c = Captured {
+                builtins: f,
+                ..Captured::default()
+            };
+            self.followers_make(call, &id, 0, &c);
+        }
+    }
+
+    /// Client: the copies held born incomplete and the effects held with
+    /// them (kept deactivated at a resume, [`WorldHooks::wake_copies`]).
+    pub(super) fn gen_held_now(&self) -> Vec<Value> {
+        let st = self.lock();
+        let mut out = st.client.held_ids();
+        out.extend(st.transfer.held_followers.iter().map(|(_, f)| f.clone()));
+        out
+    }
+
+    /// Client, at the run step's end: copies born out of order are held
+    /// ([`super::client::ClientWorld::update_held`]). Incomplete: made
+    /// without its first state applied yet, or with a reference waiting
+    /// for a copy that is still to be made here (a target not known here,
+    /// gone on the host or never a copy, holds nothing).
+    fn gen_hold_incomplete(&self, call: &Call<'_>) {
+        let (change, objects) = {
+            let mut st = self.lock();
+            let st = &mut *st;
+            let incomplete = st.transfer.born_incomplete(&st.client);
+            let objects = st.transfer.follower_objects(&incomplete);
+            (st.client.update_held(&incomplete), objects)
+        };
+        // The local effects that follow them are held with them (an effect
+        // whose leader is deactivated takes it for gone), by id until their
+        // leader is let go.
+        let found = if change.hold.is_empty() {
+            Vec::new()
+        } else {
+            self.followers_of(call, &change.hold, &objects)
+        };
+        let still: Vec<i64> = change
+            .hold
+            .iter()
+            .filter_map(super::followers::id_number)
+            .collect();
+        let followers: Vec<Value> = {
+            let mut st = self.lock();
+            keep_held_followers(&mut st.transfer.held_followers, &still, found);
+            st.transfer
+                .held_followers
+                .iter()
+                .map(|(_, f)| f.clone())
+                .collect()
+        };
+        for id in change.hold.iter().chain(&followers) {
+            if self.exists(call, id) {
+                self.set_asleep(call, id, true);
+            }
+        }
+        for id in &change.released {
+            self.set_asleep(call, id, false);
+        }
+        if !change.spent.is_empty() {
+            log::info!(
+                "co-op world: copies born incomplete let run at the hold's bound ({} frames): nets {:?}",
+                super::client::HOLD_FRAMES,
+                change.spent
+            );
         }
     }
 }
@@ -1517,6 +1960,71 @@ fn set_copy_pose(call: &Call<'_>, id: &Value, (x, y, angle): (f64, f64, f64)) {
     });
 }
 
+/// `enemyEmerging`: with `enemyEntry == 2` and `emerged` false it eases
+/// `distanceScaler` toward 1.05 by 0.005 a step, writing
+/// `image_xscale`/`image_yscale` (`targetXScale` times it), `image_alpha`
+/// (`targetAlpha` times it) and the glow's scale, and sets `emerged` once it
+/// is 1 or more. Written just under 1, the emerge ends within a few steps at
+/// the full look.
+const EMERGE_ENTRY: f64 = 2.0;
+const EMERGE_DONE: f64 = 0.999;
+
+/// A copy made again (a refused kill claim, a resync) shows the enemy as it
+/// is now, solid, not as its kept first state (its birth) has it. An emerge
+/// still under way finishes at once; otherwise an alpha under 1 is written
+/// 1 until the copy's own code writes its alpha.
+fn made_again_solid(call: &Call<'_>, r: &state::Reflect, id: &Value) {
+    let num = |n: &str| state::get_var(call, r, id, n).and_then(|v| v.as_f64());
+    let mut alpha = None;
+    let _ = call.with(id, |inst, _| alpha = inst.builtin_f64("image_alpha"));
+    match again_look(
+        num("enemyEntry"),
+        num("emerged"),
+        num("distanceScaler"),
+        alpha,
+    ) {
+        AgainLook::FinishEmerge => {
+            let _ = state::set_var(call, r, id, "distanceScaler", &Value::Real(EMERGE_DONE));
+        }
+        AgainLook::Solid => {
+            let _ = call.with(id, |inst, _| {
+                let _ = inst.set_builtin_f64("image_alpha", 1.0);
+            });
+        }
+        AgainLook::Keep => {}
+    }
+}
+
+/// What [`made_again_solid`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgainLook {
+    /// An emerge under way: `distanceScaler` just under 1.
+    FinishEmerge,
+    /// `image_alpha` 1.
+    Solid,
+    Keep,
+}
+
+/// From the made-again copy's `enemyEntry`, `emerged`, `distanceScaler`
+/// and `image_alpha`.
+fn again_look(
+    entry: Option<f64>,
+    emerged: Option<f64>,
+    scaler: Option<f64>,
+    alpha: Option<f64>,
+) -> AgainLook {
+    if entry == Some(EMERGE_ENTRY)
+        && emerged == Some(0.0)
+        && scaler.is_some_and(|d| d < EMERGE_DONE)
+    {
+        AgainLook::FinishEmerge
+    } else if alpha.is_some_and(|a| a < 1.0) {
+        AgainLook::Solid
+    } else {
+        AgainLook::Keep
+    }
+}
+
 /// Host: each maker once, with its members, in the order first made.
 fn makers_once(born: &[(usize, usize)]) -> Vec<(usize, Vec<usize>)> {
     let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1538,10 +2046,17 @@ fn gained_names(last: &Captured, now: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Client: a repair with no age stamp (a resync's, an instance's last
+/// state): applied at once, with every state of its copy still waiting.
+fn at_once(seq: u16, c: &Captured) -> bool {
+    seq > 0 && state::stamped_age(c).is_none()
+}
+
 /// Host: out of the paced queue, in queue order, every message that must go
-/// with a forced maker repair: those makers' states (their earlier repairs
-/// first, so no copy sees its states out of order) and every name table (a
-/// state may use names an earlier queued table brings). The rest stay.
+/// with a forced maker repair (or an instance's last state): those makers'
+/// states (their earlier repairs first, so no copy sees its states out of
+/// order) and every name table (a state may use names an earlier queued
+/// table brings). The rest stay.
 fn take_ahead(q: &mut VecDeque<(Message, usize)>, nets: &HashSet<NetId>) -> Vec<Message> {
     let mut out = Vec::new();
     let mut keep = VecDeque::with_capacity(q.len());
@@ -1567,6 +2082,38 @@ pub(super) fn order_ahead(ahead: Vec<Message>, msgs: Vec<Message>) -> Vec<Messag
     let mut out = ahead;
     out.extend(msgs);
     out
+}
+
+/// The owned statuses ([`state::STATUS_OWNED`]) a repair carries that copy
+/// `id` holds now (read from the game before the state's lock is taken).
+fn copy_owned_statuses(call: &Call<'_>, r: &Reflect, id: &Value, c: &Captured) -> Vec<String> {
+    c.vars
+        .iter()
+        .filter(|(name, _)| state::status_owned(name))
+        .filter(|(name, _)| {
+            state::get_var(call, r, id, name).is_some_and(|v| !matches!(v, Value::Undefined))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// A repair's owned statuses (corrosion, the marks; [`state::STATUS_OWNED`])
+/// on the joining game: what a copy holds is its own player's, so nobody's
+/// damage or procs read the partner's. Each comes at its neutral value
+/// ([`state::status_neutral`]): the kept first state takes it where it
+/// lacked it, and the copy is written only where it lacks the variable,
+/// never over one it holds. The kept state follows every repair.
+fn repair_statuses(c: &mut Captured, kept: Option<&mut Captured>, copy_has: impl Fn(&str) -> bool) {
+    for v in &mut c.vars {
+        if let Some(n) = state::status_neutral(&v.0, &v.1) {
+            v.1 = n;
+        }
+    }
+    if let Some(k) = kept {
+        merge_vars(k, c);
+    }
+    c.vars
+        .retain(|(name, _)| !(state::status_owned(name) && copy_has(name)));
 }
 
 /// Client: fold a repair's variables into a kept state (the latest value of
@@ -1615,8 +2162,21 @@ fn sort_makers_first(todo: &mut [(NetId, u16, Captured, Value)]) {
     todo.sort_by_key(|t| (t.1 != 0, depth(t.0)));
 }
 
+/// A copy's followers waiting to be made: net, run frame, pseudo built-ins.
+type FollowersDue = (NetId, u64, Vec<(u8, StateValue)>);
+
+/// Running frames a copy with a set-up waits to be given its followers while
+/// it is deactivated ([`WorldHooks::gen_followers_due`]); then they are not
+/// made.
+const FOLLOWERS_DUE_FRAMES: u64 = 150;
+
 /// Frames a copy's first state waits for its maker's (then it goes anyway).
 const MAKER_WAIT_FRAMES: u64 = 120;
+// A copy born incomplete is held past the waits that complete it.
+const _: () = assert!(
+    super::client::HOLD_FRAMES > MAKER_WAIT_FRAMES
+        && super::client::HOLD_FRAMES > super::client::BIRTH_WAIT_FRAMES + COPY_MAKER_WAIT_FRAMES
+);
 
 /// Host: the first states to capture this frame out of `queue` (in birth
 /// order): those born before `frame`, at most `budget`, oldest first; and
@@ -1718,6 +2278,233 @@ impl WorldHooks {
 mod tests {
     use super::*;
 
+    /// Copies born out of order, in both orders: a referrer made before the
+    /// copy its reference names (a hard shield two frames before its
+    /// leader) is held until the reference is set, and runs at once when
+    /// the target came first; a copy without its first state is held; a
+    /// target gone on the host holds nothing.
+    #[test]
+    fn a_copy_born_before_what_it_names_is_held_until_it_is_there() {
+        use crate::world::client::ClientWorld;
+        let spawn = |n: NetId| {
+            Message::EnemySpawn(ndml_net::msg::EnemySpawn {
+                net_id: n,
+                object: 853,
+                x: 0.0,
+                y: 0.0,
+                angle: 0.0,
+                hull: 1.0,
+                hull_max: 1.0,
+                flags: 0,
+            })
+        };
+        let made = |first_done| Made {
+            id: Value::Bool(false),
+            object: 853,
+            born: 0,
+            again: false,
+            first_done,
+        };
+        let iid = |n: u32| Value::Real(f64::from(100_000 + n));
+        // The shield (1) made, its leader (2) known and still to be made.
+        let mut c = ClientWorld::default();
+        c.on_message(spawn(1));
+        c.on_message(spawn(2));
+        c.player_stepped();
+        let _ = c.begin_frame(None);
+        c.spawned(1, 11, iid(1));
+        let mut g = GenState::default();
+        g.made.insert(1, made(true));
+        g.waiting.push((1, "leader".into(), 2, 0));
+        let inc = g.born_incomplete(&c);
+        assert_eq!(
+            inc,
+            [1].into_iter().collect(),
+            "the shield waits for its leader"
+        );
+        assert_eq!(c.update_held(&inc).hold, vec![iid(1)]);
+        // The leader made (the same step sets the reference, before the
+        // hold is decided): let go.
+        c.spawned(2, 12, iid(2));
+        g.made.insert(2, made(true));
+        let inc = g.born_incomplete(&c);
+        assert!(inc.is_empty());
+        assert_eq!(c.update_held(&inc).released, vec![iid(1)]);
+        // The other order: the leader there first, the reference resolved
+        // when the shield's first state is applied: never held.
+        let mut c = ClientWorld::default();
+        c.on_message(spawn(2));
+        c.on_message(spawn(1));
+        c.player_stepped();
+        let _ = c.begin_frame(None);
+        c.spawned(2, 12, iid(2));
+        c.spawned(1, 11, iid(1));
+        let mut g = GenState::default();
+        g.made.insert(2, made(true));
+        g.made.insert(1, made(true));
+        assert!(g.born_incomplete(&c).is_empty());
+        assert!(c.update_held(&HashSet::new()).hold.is_empty());
+        // Made without its first state (held for it), and a reference to a
+        // copy gone on the host (not known here): only the first holds.
+        g.made.insert(1, made(false));
+        g.waiting.push((2, "leader".into(), 9, 0));
+        assert_eq!(g.born_incomplete(&c), [1].into_iter().collect());
+    }
+
+    /// A maker's state that came before its member's first state is due
+    /// with it, whatever age it is held for, and the member is not held: a
+    /// maker (net 10) with repair seq 3 before its members' (11, 12) first
+    /// states; another (20) with repairs 2 and 3 before its member's (21). A
+    /// state that came after the member's, or of a copy it does not refer
+    /// to, keeps its time.
+    #[test]
+    fn a_makers_state_sent_before_its_member_is_due_with_it() {
+        let refers = |n: NetId| Captured {
+            vars: vec![("leader".to_owned(), StateValue::Instance(n))],
+            ..Captured::default()
+        };
+        let ready = vec![
+            (10, 3, Captured::default()),
+            (9, 1, Captured::default()),
+            (11, 0, refers(10)),
+            (12, 0, refers(10)),
+            (10, 4, Captured::default()),
+            (20, 2, Captured::default()),
+            (20, 3, Captured::default()),
+            (
+                21,
+                0,
+                Captured {
+                    vars: vec![("shooter".to_owned(), StateValue::Instance(20))],
+                    ..Captured::default()
+                },
+            ),
+        ];
+        assert_eq!(
+            due_with_members(&ready),
+            [(10, 3), (20, 2), (20, 3)].into_iter().collect()
+        );
+        let mut g = GenState::default();
+        g.made.insert(
+            11,
+            Made {
+                id: Value::Bool(false),
+                object: 691,
+                born: 0,
+                again: false,
+                first_done: true,
+            },
+        );
+        let c = crate::world::client::ClientWorld::default();
+        assert!(g.born_incomplete(&c).is_empty(), "the member is not held");
+    }
+
+    /// A leader's copy (net 30) held while copies it refers to are still
+    /// to come; its member (31, `leader` 30) made two frames later is held
+    /// with it, and a copy led by that member with it. Once the leader is
+    /// complete, all are let go together.
+    #[test]
+    fn a_held_copys_members_are_held_with_it() {
+        let made = |object| Made {
+            id: Value::Bool(false),
+            object,
+            born: 0,
+            again: false,
+            first_done: true,
+        };
+        let led_by = |n: NetId| Captured {
+            vars: vec![
+                ("hull".to_owned(), StateValue::Real(5000.0)),
+                ("leader".to_owned(), StateValue::Instance(n)),
+            ],
+            ..Captured::default()
+        };
+        let c = crate::world::client::ClientWorld::default();
+        let mut g = GenState::default();
+        g.made.insert(30, made(506));
+        g.kept.insert(30, Captured::default());
+        g.made.insert(31, made(507));
+        g.kept.insert(31, led_by(30));
+        g.made.insert(32, made(510));
+        g.kept.insert(32, led_by(31));
+        // Another enemy's member, its leader not held.
+        g.made.insert(200, made(510));
+        g.kept.insert(200, led_by(199));
+        assert_eq!(leader_in(&led_by(30)), Some(30));
+        assert_eq!(leader_in(&Captured::default()), None);
+        let mut held = [30].into_iter().collect::<HashSet<NetId>>();
+        let leaders: HashMap<NetId, NetId> = [(31, 30), (32, 31), (200, 199)].into();
+        held_with_leaders(&mut held, &leaders);
+        assert_eq!(held, [30, 31, 32].into_iter().collect());
+        // From the kept first states: the leader incomplete (here its first
+        // state not applied yet), its members with it.
+        g.made.get_mut(&30).unwrap().first_done = false;
+        assert_eq!(g.born_incomplete(&c), [30, 31, 32].into_iter().collect());
+        g.made.get_mut(&30).unwrap().first_done = true;
+        assert!(g.born_incomplete(&c).is_empty(), "complete: all let go");
+    }
+
+    /// A held copy's follower found at its first held frame is kept by id
+    /// while the copy is held, though the next frame's pass does not see it
+    /// (woken at the step's start), and dropped when the copy is let go; one
+    /// found again is kept once.
+    #[test]
+    fn a_held_copys_follower_is_kept_until_it_is_let_go() {
+        let glow = Value::Ref(0x0400_0000_0003_23CF);
+        let other = Value::Ref(0x0400_0000_0003_23D0);
+        let mut held = Vec::new();
+        keep_held_followers(&mut held, &[30], vec![(30, glow.clone())]);
+        assert_eq!(held.len(), 1);
+        keep_held_followers(&mut held, &[30], Vec::new());
+        assert_eq!(held, vec![(30, glow.clone())], "not seen again: kept");
+        keep_held_followers(
+            &mut held,
+            &[30, 40],
+            vec![(30, Value::Real(205_775.0)), (40, other.clone())],
+        );
+        assert_eq!(held, vec![(30, glow.clone()), (40, other.clone())], "once");
+        keep_held_followers(&mut held, &[40], Vec::new());
+        assert_eq!(held, vec![(40, other)], "its leader let go: dropped");
+    }
+
+    /// A state part is taken only once every variable's name is here.
+    #[test]
+    fn a_state_waits_for_the_names_of_its_variables() {
+        let mut g = GenState::default();
+        let vars = [(0u16, StateValue::Real(1.0)), (2, StateValue::Real(2.0))];
+        assert!(!g.names_known(693, &vars), "no list yet");
+        g.client_names
+            .insert(693, vec!["leader".into(), String::new()]);
+        assert!(!g.names_known(693, &vars), "index 2 not named");
+        g.client_names.get_mut(&693).unwrap().push("dir".into());
+        assert!(g.names_known(693, &vars), "0 and 2 named");
+        assert!(!g.names_known(693, &[(1, StateValue::Real(0.0))]), "a gap");
+        assert!(g.names_known(694, &[]), "nothing to name");
+    }
+
+    #[test]
+    fn a_copy_made_again_is_solid_at_once() {
+        // Made again from its birth's state while it was emerging: the
+        // emerge finishes at once.
+        let e = Some(EMERGE_ENTRY);
+        assert_eq!(
+            again_look(e, Some(0.0), Some(0.05), Some(0.05)),
+            AgainLook::FinishEmerge
+        );
+        // Emerged already, or no emerge: an alpha under 1 is written 1.
+        assert_eq!(
+            again_look(e, Some(1.0), Some(1.05), Some(0.3)),
+            AgainLook::Solid
+        );
+        assert_eq!(again_look(None, None, None, Some(0.05)), AgainLook::Solid);
+        // Solid already: nothing written; an emerge at its end is left to end.
+        assert_eq!(again_look(None, None, None, Some(1.0)), AgainLook::Keep);
+        assert_eq!(
+            again_look(e, Some(0.0), Some(1.0), Some(1.0)),
+            AgainLook::Keep
+        );
+    }
+
     #[test]
     fn first_states_oldest_first_within_the_budget() {
         // (key, born): a maker (1) born before its members (2, 3), a later
@@ -1757,6 +2544,37 @@ mod tests {
             .collect();
         assert_eq!(gained_names(&last, &now), vec!["orbitSpeed", "dronePhase"]);
         assert!(gained_names(&last, &now[..2]).is_empty());
+    }
+
+    /// An instance's last state (no age stamp) is applied on arrival with
+    /// what its copy still holds for its age; the periodic repairs wait.
+    #[test]
+    fn a_last_state_is_applied_at_once() {
+        let aged = Captured {
+            builtins: vec![(state::AGE_BUILTIN, StateValue::Whole(240).compact())],
+            ..Captured::default()
+        };
+        assert!(!at_once(3, &aged), "a repair waits for its age");
+        assert!(at_once(4, &Captured::default()), "the last state does not");
+        assert!(
+            !at_once(0, &Captured::default()),
+            "a first state is no repair"
+        );
+        // Its despawn goes after it, as a maker repair goes before a
+        // member's spawn (below).
+        let mut q: VecDeque<(Message, usize)> = VecDeque::new();
+        for s in InstanceStateIx::split(9, 418, 2, vec![(0, StateValue::Real(6.1))], vec![], vec![])
+        {
+            q.push_back((Message::InstanceStateIx(s), 10));
+        }
+        let despawn = Message::Despawn {
+            net_id: 9,
+            cause: ndml_net::msg::DespawnCause::Killed { by: None },
+        };
+        let out = order_ahead(take_ahead(&mut q, &HashSet::from([9])), vec![despawn]);
+        assert!(matches!(out.first(), Some(Message::InstanceStateIx(s)) if s.net_id == 9));
+        assert!(matches!(out.last(), Some(Message::Despawn { .. })));
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -1872,6 +2690,60 @@ mod tests {
         // Its claim settled (confirmed): forgotten too.
         g.forget_gone(&c, &[]);
         assert_eq!(keys(&g), (vec![5], vec![5]));
+    }
+
+    /// Every owned status, in every shape the host's value comes in: a
+    /// repair never writes it over what the copy holds, and fills it at its
+    /// neutral value where the copy lacks it; the kept first state takes the
+    /// neutral value.
+    #[test]
+    fn a_repair_never_writes_an_owned_status_the_copy_holds() {
+        let shapes = [
+            StateValue::Real(3.0),
+            StateValue::Bool(true),
+            StateValue::Array(vec![StateValue::Real(2.0), StateValue::Real(5.0)]),
+        ];
+        let find = |c: &Captured, name: &str| {
+            c.vars
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        };
+        for (name, _) in state::STATUS_OWNED {
+            for host in &shapes {
+                let neutral = state::status_neutral(name, host).expect("owned");
+                for kept_had in [false, true] {
+                    for copy_has in [false, true] {
+                        let mut kept = if kept_had {
+                            cap(&[("x", StateValue::Real(1.0)), (name, neutral.clone())])
+                        } else {
+                            cap(&[("x", StateValue::Real(1.0))])
+                        };
+                        let mut c = cap(&[(name, host.clone()), ("x", StateValue::Real(4.0))]);
+                        repair_statuses(&mut c, Some(&mut kept), |n| copy_has && n == *name);
+                        let case =
+                            format!("{name} {host:?}, kept had {kept_had}, copy has {copy_has}");
+                        let written = find(&c, name);
+                        if copy_has {
+                            assert_eq!(written, None, "{case}: written over the copy's");
+                        } else {
+                            assert_eq!(written, Some(neutral.clone()), "{case}: filled at neutral");
+                        }
+                        assert_eq!(find(&kept, name), Some(neutral.clone()), "{case}: kept");
+                        assert_eq!(
+                            find(&c, "x"),
+                            Some(StateValue::Real(4.0)),
+                            "{case}: the rest"
+                        );
+                        assert_eq!(find(&kept, "x"), Some(StateValue::Real(4.0)), "{case}");
+                    }
+                }
+            }
+        }
+        // A copy not there (died on an open claim): the kept state only.
+        let mut c = cap(&[("corrosiveStacks", StateValue::Real(3.0))]);
+        repair_statuses(&mut c, None, |_| false);
+        assert_eq!(find(&c, "corrosiveStacks"), Some(StateValue::Real(0.0)));
     }
 
     fn cap(vars: &[(&str, StateValue)]) -> Captured {

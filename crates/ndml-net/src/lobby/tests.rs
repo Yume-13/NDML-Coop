@@ -125,7 +125,7 @@ fn events(a: &mut Agent) -> Vec<Event> {
     std::iter::from_fn(|| a.next_event()).collect()
 }
 
-/// Write `peer.toml` as an outside tool does.
+/// Write `peer.toml` as another process on the same machine would.
 fn request(dir: &Path, n: u64, f: impl FnOnce(&mut PeerRequest)) {
     let mut r = PeerRequest::new(n, &status_of(dir).session);
     r.name = "Tester".into();

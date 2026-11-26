@@ -144,13 +144,18 @@ fn client_takes_an_open_round_and_its_done_set() {
     assert_eq!(n.client().adopted(), 1);
     // The client chooses and the host releases; the relay of the choice is
     // stalled too, so the release follows from state after its press.
-    n.until(30 + ADOPT + 70);
-    assert!(n.g.iter().all(|g| g.screen.is_none()));
+    // Nobody waited `UPGRADE_COUNT_AFTER`: the host's screen goes at the
+    // release, with no count; the client's is held for the round's end,
+    // told by state.
+    n.until(30 + ADOPT + 70 + 20);
+    assert!(n.g[0].screen.is_none() && n.g[1].screen.is_some());
     assert_eq!(n.host().upgrade.last_released(), Some(1));
-    n.until(30 + ADOPT + 70 + PRESS_GRACE + ADOPT);
+    n.until(30 + ADOPT + 70 + COUNT_FRAMES + PRESS_GRACE + ADOPT);
     assert!(n.flying(1) > 0);
     assert_eq!(n.client().upgrade.last_released(), Some(1));
     assert_eq!(n.client().adopted(), 2);
+    n.until(30 + ADOPT + 70 + 2 * COUNT_FRAMES + PRESS_GRACE + ADOPT);
+    assert!(n.g[1].screen.is_none(), "the client's after its count");
     n.after_stall(1);
 }
 
@@ -194,7 +199,7 @@ fn client_takes_the_holders_but_never_drops_its_own_hold() {
     n.after_stall(1);
     // The client's resume then ends the round on both.
     n.g[1].menu_for = 0;
-    let f = n.f + 30;
+    let f = n.f + 30 + COUNT_FRAMES;
     n.until(f);
     assert!(n.g.iter().all(|g| !g.paused));
     assert!(!n.host().pause.is_paused() && !n.client().pause.is_paused());
@@ -347,7 +352,7 @@ fn host_takes_the_clients_choice() {
     n.open(0);
     n.until(100);
     assert!(n.g[1].chose);
-    n.until(100 + ADOPT);
+    n.until(100 + ADOPT + COUNT_FRAMES);
     assert!(n.flying(0) > 0);
     assert_eq!(n.host().upgrade.last_released(), Some(1));
     assert!(n.g.iter().all(|g| g.screen.is_none()));

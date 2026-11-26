@@ -55,6 +55,7 @@ use super::super::classify::is_instance;
 use super::super::names::builtin_var as bv;
 use super::super::shots::{self as sh, Action, EndClass, Kind, Rect};
 use super::super::state::{self, Stats};
+use super::super::windup::{self, Lead};
 use super::{ROLE_CLIENT, ROLE_HOST, ROLE_OFF, WorldHooks, hook_or_warn, object_of, read};
 use crate::damage::glue::PlayerSide;
 
@@ -79,6 +80,18 @@ pub(super) struct ShotsState {
     host_beam: HashMap<u32, bool>,
     /// Object -> an area (`oEnemyAoE`), cached.
     area_of: HashMap<u32, bool>,
+    /// Object -> its instances can be wind-ups ([`windup::eligible`]),
+    /// cached.
+    windup_of: HashMap<u32, bool>,
+    /// Wind-ups come one at a time ([`windup::Overlaps`]): what each maker
+    /// made last, and the objects found continuous by enemy type.
+    overlaps: windup::Overlaps,
+    /// This frame's makes of wind-up objects by candidate makers (maker,
+    /// its object, the object), and the instances that made an enemy shot
+    /// this frame: what comes with its maker's attacks
+    /// ([`windup::Overlaps::note_attack`]), learned at the End Step.
+    attack_notes: Vec<(usize, u32, u32)>,
+    shot_makers: HashSet<usize>,
     /// Inside a site that runs: host, a world site of a shared shot (what
     /// it makes is shared); joining game, a player site (what it makes
     /// there is this game's own).
@@ -105,6 +118,9 @@ impl ShotsState {
         self.avatars = None;
         self.world_site = 0;
         self.player_site = 0;
+        self.overlaps.clear();
+        self.attack_notes.clear();
+        self.shot_makers.clear();
         self.aims_host.clear();
         self.aims_client.clear();
     }
@@ -126,6 +142,9 @@ pub(super) struct SiteNote {
 pub(super) struct ShotHooks {
     /// Client: the mod is making a shot now (its create is let through).
     pub(super) making: std::sync::atomic::AtomicBool,
+    /// The instances whose Destroy event runs now, innermost last (both
+    /// roles): a shared shot among them is ending (`windup::Maker::ending`).
+    pub(super) ending: std::sync::Mutex<Vec<usize>>,
     /// The mirror's player-side rule (black holes).
     pub(super) side: OnceLock<PlayerSide>,
     /// The mirror's lookups for a player's thing (what enemies chase).
@@ -215,19 +234,18 @@ impl WorldHooks {
     }
 
     /// Sounds (`crate::sound`, read-only): whether instances of `obj` are
-    /// the host's world on a joining game: an `oSolid` child that is not a
-    /// [`classify::LOCAL`] missile, or an enemy shot, beam, charge-up or area
-    /// while shared shots are on. `None` while this thread holds the world
-    /// lock (the caller keeps the answers it had).
-    ///
-    /// [`classify::LOCAL`]: super::super::classify::LOCAL
+    /// the host's world on a joining game: an `oSolid` child (enemy, part,
+    /// segment, asteroid, mine, missile: each a replicated copy there), or
+    /// an enemy shot, beam, charge-up or area while shared shots are on.
+    /// `None` while this thread holds the world lock (the caller keeps the
+    /// answers it had).
     #[must_use]
     pub fn sound_world_object(&self, call: &Call<'_>, obj: u32) -> Option<bool> {
         if crate::game::held_at("world").is_some() {
             return None;
         }
         Some(match self.class_of(call, obj, false) {
-            Some(super::Class::Enemy { local, .. }) => !local,
+            Some(super::Class::Enemy { .. }) => true,
             Some(_) => match self.shot_kind(call, obj) {
                 Some(BEAM_KIND) => self.host_beam(obj, BEAM_KIND),
                 Some(_) => self.shots_on(),
@@ -235,6 +253,33 @@ impl WorldHooks {
             },
             None => false,
         })
+    }
+
+    /// Whether instances of `obj` can be wind-ups ([`windup::eligible`]).
+    /// Cached.
+    pub(super) fn windup_object(&self, call: &Call<'_>, obj: u32) -> bool {
+        if let Some(&b) = self.lock().shots.windup_of.get(&obj) {
+            return b;
+        }
+        let (roots, effect, pooled) = {
+            let st = self.lock();
+            let Some(o) = st.objects.as_ref() else {
+                return false;
+            };
+            (o.local_roots.clone(), o.effect, o.pooled)
+        };
+        let facts = windup::ObjectFacts {
+            other: matches!(self.class_of(call, obj, false), Some(super::Class::Other)),
+            player_family: self.player_family(call, obj),
+            local_root: roots
+                .iter()
+                .any(|&r| Some(r) != effect && self.ancestor(call, obj, Some(r))),
+            pooled: self.ancestor(call, obj, pooled),
+            dependency: self.is_dep_kind(obj),
+        };
+        let b = windup::eligible(facts);
+        self.lock().shots.windup_of.insert(obj, b);
+        b
     }
 
     /// Whether `obj` is an area (`oEnemyAoE`). Cached.
@@ -263,9 +308,17 @@ impl WorldHooks {
             return None;
         }
         let kind = self.shot_kind(call, obj)?;
+        // Its maker fires this frame (what comes with its attacks).
+        if let Some(me) = call.instance() {
+            self.lock().shots.shot_makers.insert(me.key());
+        }
         let host_beam = self.host_beam(obj, kind);
-        if kind != 0 && !host_beam && !self.attack_shared(call, role) {
-            // A blast or beam an enemy makes: each game's own (its copy
+        // An enemy's blast in its life: the host's, as the wind-ups that
+        // announce it are (`windup.rs`).
+        let host_blast =
+            kind == windup::BLAST_KIND && windup::blast_shared(kind, self.windup_maker(call, role));
+        if kind != 0 && !host_beam && !host_blast && !self.attack_shared(call, role) {
+            // A blast in an enemy's death: each game's own (its copy
             // makes it too).
             return None;
         }
@@ -288,6 +341,396 @@ impl WorldHooks {
             self.shot.making.load(Ordering::Relaxed)
                 || (st.shots.player_site == 0
                     && maker.is_some_and(|k| st.shots.client.shared(k).is_some()))
+        }
+    }
+
+    /// The wind-up rule's facts about a create's maker (`self`)
+    /// ([`windup::Maker`]).
+    pub(super) fn windup_maker(&self, call: &Call<'_>, role: u8) -> windup::Maker {
+        let Some(me) = call.instance() else {
+            return windup::Maker::default();
+        };
+        let key = me.key();
+        let hull_out = self
+            .h
+            .hull
+            .and_then(|v| me.get_f64(v))
+            .is_some_and(|h| h <= 0.0);
+        let obj = object_of(&me);
+        let in_destroy = self
+            .shot
+            .ending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key);
+        let (enemy, set_up, dying, shared, candidate, own_site, partner_kill) = {
+            let st = self.lock();
+            if role == ROLE_HOST {
+                (
+                    st.host.net_id(key).is_some(),
+                    false,
+                    false,
+                    st.shots.host.shared(key),
+                    false,
+                    false,
+                    // The joining player's report took its hull out: that
+                    // player's kill.
+                    st.host.damager_at(key).is_some(),
+                )
+            } else {
+                (
+                    st.client.net_id(key).is_some(),
+                    st.client.is_fresh(key) || st.building == Some(key),
+                    st.copy_deaths > 0,
+                    st.shots.client.shared(key).is_some(),
+                    st.shots.client.windup_keys.contains(&key),
+                    st.shots.player_site > 0,
+                    false,
+                )
+            }
+        };
+        // The damage layer's own lock: asked with the world's free.
+        let dmg_dying = enemy && self.dmg.is_dying(key);
+        // Its Destroy event running is an end too ([`windup::Maker::dying`]):
+        // a missile's or mine's timer ends it with its hull up, and the copy
+        // runs that event at the host's word as well.
+        let dying = dying || hull_out || dmg_dying || (enemy && in_destroy);
+        // Joining game: its own player's predicted kill.
+        let predicted = role == ROLE_CLIENT && dmg_dying;
+        // A joining game's copy dying the host's death runs its Destroy
+        // event alone (`die_like_host`): what it makes there is that event's.
+        let end_unseen = dying
+            && windup::end_unseen(
+                in_destroy || (role == ROLE_CLIENT && self.lock().copy_deaths > 0),
+                partner_kill || predicted,
+            );
+        // A shared wind-up, not a shared shot or charge-up (what those make
+        // stays as it was: each game's own from its own instance).
+        let shot = obj.and_then(|o| self.shot_kind(call, o)).is_some();
+        let windup =
+            candidate || (shared && !shot && obj.is_some_and(|o| self.windup_object(call, o)));
+        // A shared shot's ending ([`windup::ending`]), and a shared non-shot
+        // that follows nothing (that ending's lineage).
+        let ending = windup::ending(shared && shot, in_destroy, own_site);
+        let kin = windup::kin(
+            shared && windup && !candidate,
+            shared && windup && !candidate && self.maker_follows(call, role, &me),
+        );
+        windup::Maker {
+            enemy,
+            set_up,
+            dying,
+            windup,
+            ending,
+            kin,
+            end_unseen,
+        }
+    }
+
+    /// Before a create of a non-shot object: a wind-up candidate
+    /// ([`windup::candidate`]): the host notes it (shared when it follows
+    /// at the frame's end), a joining game's copy's own is noted as scratch
+    /// (removed at the frame's end when it follows). `None`: not one.
+    pub(super) fn windup_create(
+        &self,
+        call: &Call<'_>,
+        role: u8,
+        obj: u32,
+    ) -> Option<super::PartNote> {
+        if !self.shots_on() || role == ROLE_OFF {
+            return None;
+        }
+        // The mod's own make of a host's wind-up: once.
+        if role == ROLE_CLIENT && self.shot.making.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        if !self.windup_object(call, obj) || self.is_dep_kind(obj) {
+            return None;
+        }
+        let me = call.instance()?;
+        let (mk, maker_obj) = (me.key(), object_of(&me)?);
+        let m = self.windup_maker(call, role);
+        if !windup::candidate(m) {
+            return None;
+        }
+        let free = windup::free(m);
+        {
+            let mut st = self.lock();
+            if !free {
+                st.shots.attack_notes.push((mk, maker_obj, obj));
+            }
+            if !free && st.shots.overlaps.own(maker_obj, obj) {
+                return None;
+            }
+        }
+        Some(super::PartNote::Windup {
+            scratch: role == ROLE_CLIENT,
+            free,
+        })
+    }
+
+    /// A wind-up candidate made: noted in [`windup::Overlaps`], which tells
+    /// a continuous effect from a wind-up.
+    fn windup_overlap(&self, call: &Call<'_>, obj: u32) {
+        let Some(me) = call.instance() else { return };
+        let (mk, Some(maker_obj)) = (me.key(), object_of(&me)) else {
+            return;
+        };
+        let (now, was) = {
+            let mut st = self.lock();
+            let frame = st.frame;
+            let was = st.shots.overlaps.continuous(maker_obj, obj);
+            let now = st.shots.overlaps.note(mk, maker_obj, obj, frame);
+            (now, was)
+        };
+        if now && !was {
+            log::info!(
+                "co-op wind-ups: {} made by {} comes continuously (made again within half a second): each game's own once its makes show it does not come with its attacks",
+                self.object_name(call, obj),
+                self.object_name(call, maker_obj)
+            );
+        }
+    }
+
+    /// At the End Step: this frame's makes of wind-up objects, each with
+    /// whether its maker made an enemy shot this frame
+    /// ([`windup::Overlaps::note_attack`]). Each game learns from its own
+    /// creates.
+    fn windup_attack_learn(&self, call: &Call<'_>) {
+        let learned: Vec<(u32, u32, bool, (u32, u32))> = {
+            let mut guard = self.lock();
+            let st = &mut guard.shots;
+            let notes = std::mem::take(&mut st.attack_notes);
+            let makers = std::mem::take(&mut st.shot_makers);
+            notes
+                .into_iter()
+                .filter_map(|(mk, maker_obj, obj)| {
+                    let was = st.overlaps.attack_bound(maker_obj, obj);
+                    let now = st
+                        .overlaps
+                        .note_attack(maker_obj, obj, makers.contains(&mk));
+                    (now != was).then(|| {
+                        (
+                            maker_obj,
+                            obj,
+                            now,
+                            st.overlaps.attack_counts(maker_obj, obj),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for (maker_obj, obj, now, (with, all)) in learned {
+            let (o, m) = (
+                self.object_name(call, obj),
+                self.object_name(call, maker_obj),
+            );
+            if now {
+                log::info!(
+                    "co-op wind-ups: {o} made by {m} comes with its attacks ({with} of {all} made in the frames it fires in): the host's, also when it repeats"
+                );
+            } else {
+                log::info!(
+                    "co-op wind-ups: {o} made by {m} no longer comes with its attacks ({with} of {all} made in the frames it fires in)"
+                );
+            }
+        }
+    }
+
+    /// After that create: the host's birth (read a frame later, its maker's
+    /// `with` block and first step having shaped it, at its birth's time);
+    /// a joining game's candidate.
+    pub(super) fn windup_created(&self, call: &Call<'_>, scratch: bool, free: bool) {
+        let Some(id) = call.result().filter(is_instance) else {
+            return;
+        };
+        let mut found = None;
+        let _ = call.with(&id, |inst, _| found = Some((inst.key(), object_of(&inst))));
+        let Some((key, Some(obj))) = found else {
+            return;
+        };
+        let maker = call.instance().map(|i| i.key());
+        let role = self.role();
+        self.windup_overlap(call, obj);
+        let mut st = self.lock();
+        if role == ROLE_HOST {
+            let frame = st.frame;
+            let target = maker.and_then(|k| {
+                st.host
+                    .assignment(k)
+                    .or_else(|| st.shots.host.target_of(k).flatten())
+            });
+            let born_ms = st.repl.now_ms.max(1);
+            st.shots.host.born.push(sh::Born {
+                key,
+                value: id,
+                object: obj,
+                frame,
+                target,
+                wait: 1,
+                born_ms,
+                windup: true,
+                sid: None,
+            });
+            if free {
+                st.shots.host.free.insert(key);
+            }
+        } else if scratch {
+            st.shots.client.windups.push((key, id));
+            st.shots.client.windup_keys.insert(key);
+            if free {
+                st.shots.client.windups_free.insert(key);
+            }
+        }
+    }
+
+    /// Whether the instance `id` is drawn on an enemy: its `leader` or
+    /// `shooter` names a replicated enemy (a copy) or a shared attack or
+    /// wind-up ([`windup::follows`]).
+    fn windup_follows(&self, call: &Call<'_>, role: u8, id: &Value) -> bool {
+        let mut vals = Vec::new();
+        let _ = call.with(id, |inst, _| {
+            for v in [self.h.leader, self.h.shooter].into_iter().flatten() {
+                vals.push(inst.get_value(v));
+            }
+        });
+        self.leads_follow(call, role, vals)
+    }
+
+    /// Whether a create's maker (`self`) is drawn on an enemy or a shared
+    /// attack ([`Self::windup_follows`] for an instance in hand).
+    fn maker_follows(&self, call: &Call<'_>, role: u8, me: &ndml_sdk::Instance<'_>) -> bool {
+        let vals = [self.h.leader, self.h.shooter]
+            .into_iter()
+            .flatten()
+            .map(|v| me.get_value(v))
+            .collect();
+        self.leads_follow(call, role, vals)
+    }
+
+    /// [`windup::follows`] for the values of `leader` and `shooter`.
+    fn leads_follow(&self, call: &Call<'_>, role: u8, vals: Vec<Option<Value>>) -> bool {
+        let leads: Vec<Lead> = vals
+            .into_iter()
+            .map(|v| {
+                let Some(v) = v.filter(is_instance) else {
+                    return Lead::Nothing;
+                };
+                let mut key = None;
+                let _ = call.with(&v, |i, _| key = Some(i.key()));
+                let Some(k) = key else {
+                    return Lead::Nothing;
+                };
+                let st = self.lock();
+                let (enemy, shared) = if role == ROLE_HOST {
+                    (st.host.net_id(k).is_some(), st.shots.host.shared(k))
+                } else {
+                    let c = &st.shots.client;
+                    (
+                        st.client.net_id(k).is_some(),
+                        c.shared(k).is_some()
+                            || c.windup_keys.contains(&k)
+                            || c.scratch_keys.contains(&k),
+                    )
+                };
+                if enemy {
+                    Lead::Enemy
+                } else if shared {
+                    Lead::Shared
+                } else {
+                    Lead::Other
+                }
+            })
+            .collect();
+        windup::follows(&leads)
+    }
+
+    /// Host, at the end of a wind-up candidate's birth frame: kept only
+    /// when it follows an enemy and is no dependency (one an enemy's
+    /// variable names is the generic transfer's).
+    fn windups_host_check(&self, call: &Call<'_>) {
+        let check: Vec<(usize, Value)> = {
+            let mut st = self.lock();
+            let frame = st.frame;
+            let free = std::mem::take(&mut st.shots.host.free);
+            st.shots
+                .host
+                .born
+                .iter()
+                .filter(|b| b.windup && b.frame == frame && !free.contains(&b.key))
+                .map(|b| (b.key, b.value.clone()))
+                .collect()
+        };
+        if check.is_empty() {
+            return;
+        }
+        let drop: HashSet<usize> = check
+            .into_iter()
+            .filter(|(key, id)| {
+                self.lock().host.net_id(*key).is_some()
+                    || (self.exists(call, id) && !self.windup_follows(call, ROLE_HOST, id))
+            })
+            .map(|(k, _)| k)
+            .collect();
+        if drop.is_empty() {
+            return;
+        }
+        let mut st = self.lock();
+        st.shots
+            .host
+            .born
+            .retain(|b| !(b.windup && drop.contains(&b.key)));
+    }
+
+    /// Joining game, at the frame's end: the copies' own wind-ups that
+    /// follow an enemy are scratch (the host's come), removed silently
+    /// before anything draws them; the rest are left alone. All are checked
+    /// before any goes (a ring's `leader` can be its warning).
+    fn windups_scratch_clear(&self, call: &Call<'_>) {
+        let (windups, free) = {
+            let mut st = self.lock();
+            (
+                std::mem::take(&mut st.shots.client.windups),
+                std::mem::take(&mut st.shots.client.windups_free),
+            )
+        };
+        if windups.is_empty() {
+            self.lock().shots.client.windup_keys.clear();
+            return;
+        }
+        let scratch: Vec<Value> = windups
+            .into_iter()
+            .filter(|(key, id)| {
+                self.exists(call, id)
+                    && (free.contains(key) || self.windup_follows(call, ROLE_CLIENT, id))
+            })
+            .map(|(_, id)| id)
+            .collect();
+        for id in scratch {
+            self.destroy_silently(call, &id);
+        }
+        let mut st = self.lock();
+        st.shots.client.windup_keys.clear();
+    }
+
+    /// Joining game, after the frame's makes: each made birth's references
+    /// to another shared birth, once that one is made here.
+    fn shots_client_links(&self, call: &Call<'_>) {
+        let Some(refl) = self.h.reflect else { return };
+        let due = {
+            let mut st = self.lock();
+            let frame = st.frame;
+            st.shots.client.take_links(frame)
+        };
+        for (link, target) in due {
+            if !self.exists(call, &link.holder) {
+                continue;
+            }
+            let named = self.gen_named_vars(link.object, &[(link.var, StateValue::Undefined)]);
+            let Some((name, _)) = named.first() else {
+                continue;
+            };
+            let _ = state::set_var(call, &refl, &link.holder, name, &target);
         }
     }
 
@@ -324,6 +767,8 @@ impl WorldHooks {
                 target,
                 wait,
                 born_ms,
+                windup: false,
+                sid: None,
             });
         } else if role == ROLE_CLIENT && scratch {
             st.shots.client.scratch.push((key, id));
@@ -340,6 +785,12 @@ impl WorldHooks {
         class: EndClass,
     ) -> Option<SiteNote> {
         let role = self.role();
+        // A replicated enemy copy does not end itself by this game's view:
+        // the host's ends it by the host's, and its despawn comes here.
+        if name == sh::DESTROY_OUTSIDE && self.skip_view_death(call) {
+            let _ = call.set_return(Value::Bool(false));
+            return None;
+        }
         if role == ROLE_OFF || !self.shots_on() {
             return None;
         }
@@ -791,21 +1242,34 @@ impl WorldHooks {
         if !self.shots_on() {
             return;
         }
+        // No Destroy event runs around the controller's End Step: a key an
+        // abandoned event (a contained error) left on the stack goes.
+        self.shot
+            .ending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let role = self.role();
         if role == ROLE_OFF || self.lock().frozen {
             return;
         }
+        self.windup_attack_learn(call);
         if role == ROLE_HOST {
             self.shots_host_read(call);
             self.shots_host_sweep(call);
             self.shots_host_steer(call);
         } else {
+            // The copies' own wind-ups first: one can follow a scratch
+            // charge-up, which must still be there to say so.
+            self.windups_scratch_clear(call);
             self.shots_scratch_clear(call);
             self.shots_client_sweep(call);
             self.shots_client_ends(call);
             self.shots_client_make(call);
+            self.shots_client_links(call);
             // What the ends' Destroy events and the makes' Create events
             // made is scratch too: removed before anything draws it.
+            self.windups_scratch_clear(call);
             self.shots_scratch_clear(call);
         }
     }
@@ -813,6 +1277,7 @@ impl WorldHooks {
     /// Host: read the shots born since the last read (within the budget).
     fn shots_host_read(&self, call: &Call<'_>) {
         let Some(r) = self.h.reflect else { return };
+        self.windups_host_check(call);
         let (born, frame, now) = {
             let mut st = self.lock();
             let take = st.shots.host.born.len().min(sh::READS_PER_FRAME);
@@ -832,12 +1297,23 @@ impl WorldHooks {
                 st.shots.host.born = later;
                 st.shots.host.born.extend(rest);
             }
+            // Ids for the whole batch first, so that one read before another
+            // can name it ([`FiredShot::links`]: a warning and its ring).
+            for b in &mut born {
+                let sid = match b.sid {
+                    Some(s) => s,
+                    None => st.shots.host.next_id(),
+                };
+                b.sid = Some(sid);
+                st.shots.host.reading.insert(b.key, sid);
+            }
             (born, st.frame, st.repl.now_ms)
         };
         for b in born {
             let at = if b.born_ms > 0 { b.born_ms } else { now };
             self.shot_send(call, &r, b, (frame, at), true);
         }
+        self.lock().shots.host.reading.clear();
     }
 
     /// Host: read one shot (or an attack a shot follows, `promote` false:
@@ -869,6 +1345,9 @@ impl WorldHooks {
             return;
         }
         let (places, place_fills) = places.unwrap_or_default();
+        let (link_names, links) = self.shot_links(call, r, &id, object, &c.vars);
+        // What its maker's code dressed it with (`followers_glue`).
+        let (followers, followers_world) = self.shot_followers(call, &id, &c.vars);
         let (names, vars) = self.gen_index_vars(object, &c.vars);
         let builtins = c
             .builtins
@@ -884,10 +1363,11 @@ impl WorldHooks {
         } else {
             pos.and_then(|p| st.host.nearest_player(p))
         };
-        let sid = st.shots.host.next_id();
+        let sid = b.sid.unwrap_or_else(|| st.shots.host.next_id());
         st.shots.names_out.extend(names);
         st.shots.names_out.extend(place_names);
-        st.shots.host.fires.push(FiredShot {
+        st.shots.names_out.extend(link_names);
+        let mut fired = FiredShot {
             id: sid,
             object,
             time_ms: now,
@@ -899,7 +1379,10 @@ impl WorldHooks {
             places,
             place_fills,
             replaces: !promote,
-        });
+            links,
+        };
+        super::followers::dress(&mut fired, &followers, followers_world, &mut st.followers);
+        st.shots.host.fires.push(fired);
         st.shots.host.live.insert(
             key,
             sh::HostShot {
@@ -985,6 +1468,50 @@ impl WorldHooks {
         (names, Some((out, fills)))
     }
 
+    /// Host: a birth's references to another shared birth or wind-up (an
+    /// instance with no net id that is not an enemy attack: those go by
+    /// place), as links by shot id ([`FiredShot::links`]), and the
+    /// `StateNames` their indices need. A birth not read yet gets its id
+    /// now ([`sh::HostShots::sid_for`]).
+    fn shot_links(
+        &self,
+        call: &Call<'_>,
+        refl: &state::Reflect,
+        id: &Value,
+        object: u16,
+        vars: &[(String, StateValue)],
+    ) -> (Vec<Message>, Vec<(u16, u32)>) {
+        let mut names = Vec::new();
+        let mut out = Vec::new();
+        for (name, v) in vars {
+            let obj = match v {
+                StateValue::Unresolved(o) | StateValue::Singleton(o) if *o != 0 => *o,
+                _ => continue,
+            };
+            if matches!(
+                self.class_of(call, u32::from(obj), false),
+                Some(super::Class::EnemyShot)
+            ) {
+                continue;
+            }
+            let Some(target) = state::get_var(call, refl, id, name).filter(is_instance) else {
+                continue;
+            };
+            let mut key = None;
+            let _ = call.with(&target, |inst, _| key = Some(inst.key()));
+            let Some(key) = key else { continue };
+            let Some(sid) = self.lock().shots.host.sid_for(key) else {
+                continue;
+            };
+            let (n, ix) = self.gen_index_vars(object, &[(name.clone(), StateValue::Undefined)]);
+            names.extend(n);
+            if let Some((i, _)) = ix.first() {
+                out.push((*i, sid));
+            }
+        }
+        (names, out)
+    }
+
     /// Host: an enemy attack a shared shot follows (each game's own until
     /// now, a Dreadnought's ball) is shared from now on, its birth queued
     /// ahead of the shot's ([`FiredShot::replaces`]).
@@ -1014,6 +1541,8 @@ impl WorldHooks {
             target: None,
             wait: 0,
             born_ms: 0,
+            windup: false,
+            sid: None,
         };
         self.shot_send(call, refl, born, (frame, now), false);
     }
@@ -1544,10 +2073,38 @@ impl WorldHooks {
             shot.steer,
         );
         self.shot_place_refs(call, &refl, &id, shot);
+        self.shot_links_wait(&id, shot);
+        // What its maker's code dressed it with on the host (a burn's
+        // graphic, which its Step drives through `follower`).
+        let dressed = state::Captured {
+            builtins,
+            ..state::Captured::default()
+        };
+        self.followers_make(call, &id, 0, &dressed);
         self.shot_beam_sound(call, &id);
         // Its `target` came from the host's game: after a player on the
         // host, aimed at its player here now.
         self.shot_aim_now(call, &id, shot.target, shot.steer == steer::PLAYER);
+    }
+
+    /// Client: a made birth's links ([`FiredShot::links`]) wait for their
+    /// shots to be made here (written after the frame's makes,
+    /// `shots_client_links`).
+    fn shot_links_wait(&self, id: &Value, shot: &FiredShot) {
+        if shot.links.is_empty() {
+            return;
+        }
+        let mut st = self.lock();
+        let frame = st.frame;
+        for &(var, sid) in &shot.links {
+            st.shots.client.links.push(sh::Link {
+                holder: id.clone(),
+                object: shot.object,
+                var,
+                sid,
+                frame,
+            });
+        }
     }
 
     /// Client: a made shot's place references: this game's instance of the
@@ -1771,8 +2328,9 @@ pub(super) fn register(ctx: &ModContext, w: &Arc<WorldHooks>) {
         n += usize::from(r.is_ok());
         hook_or_warn(name, r);
     }
-    // A joining game's scratch beams touch nothing.
-    for name in sh::BEAM_COLLISIONS {
+    register_ending_observer(ctx, w);
+    // A joining game's scratch beams and blasts touch nothing.
+    for name in sh::BEAM_COLLISIONS.iter().chain(&sh::BLAST_COLLISIONS) {
         let c = Arc::clone(w);
         hook_or_warn(
             name,
@@ -1780,6 +2338,37 @@ pub(super) fn register(ctx: &ModContext, w: &Arc<WorldHooks>) {
         );
     }
     log::info!("co-op shots: shared enemy shots on ({n} end sites bracketed)");
+}
+
+/// A shared shot's ending (`windup::Maker::ending`): the Destroy events
+/// running now, both roles. The builtin `instance_destroy` misses the
+/// compiled code's own calls, so the event is watched.
+fn register_ending_observer(ctx: &ModContext, w: &Arc<WorldHooks>) {
+    /// GameMaker's Destroy event kind.
+    const EVENT_DESTROY: i32 = 1;
+    let c = Arc::clone(w);
+    match ctx.observe_event(EVENT_DESTROY, 0, move |e| {
+        let Some(i) = e.instance() else { return };
+        let mut s = c
+            .shot
+            .ending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if e.after {
+            if let Some(p) = s.iter().rposition(|k| *k == i.key()) {
+                s.remove(p);
+            }
+        } else {
+            s.push(i.key());
+        }
+    }) {
+        Ok(()) => log::info!(
+            "co-op shots: observing Destroy events (what a shared shot makes as it ends)"
+        ),
+        Err(e) => log::warn!(
+            "co-op shots: {e}; what a shared shot makes as it ends stays the host's alone"
+        ),
+    }
 }
 
 #[cfg(test)]

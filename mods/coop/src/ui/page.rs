@@ -25,7 +25,7 @@
 //! the game's main menu ("page mode"); the page answers confirm, left/right
 //! and back with [`Effect`]s.
 //!
-//! **Co-op** holds the Steam rows, colour, labels, "Codes and LAN" and back;
+//! **Co-op** holds the Steam rows, colour, labels, wild mods, "Codes and LAN" and back;
 //! **Codes and LAN** holds the lobby's code and address requests. Steam goes
 //! through [`super::steam_link`] only.
 
@@ -40,7 +40,12 @@ use super::lan::{
 use super::steam_link::{SteamAction, SteamState, SteamView};
 use super::style::color;
 use super::text::{self, en};
+use crate::wild::WildMods;
 use crate::world::color::ColorChoice;
+
+/// Players in a co-op session, as the page shows it ("PLAYERS n/2"). The
+/// lobby agent admits one partner and the start gate waits for two.
+pub const SESSION_PLAYERS: usize = 2;
 
 /// Frames a message stays (60 per second).
 pub const MESSAGE_FRAMES: u64 = 60 * 8;
@@ -176,6 +181,8 @@ pub enum RowId {
     WhoCanJoin,
     ShipColour,
     PartnerLabels,
+    /// "Wild Mods": Sync, Force On, Force Off (this player's own, `crate::wild`).
+    WildMods,
     CodesAndLan,
     Back,
     CopyCode,
@@ -187,7 +194,9 @@ pub enum RowId {
     Name,
 }
 
-/// The Co-op page's rows for this Steam state (at most 10: menu rows 1..=10).
+/// The Co-op page's rows for this Steam state: at most 11, menu rows 1..=11.
+/// The game draws rows 0..=10 and the mod draws row 11, as the plain menu's
+/// Exit.
 #[must_use]
 pub fn main_rows(steam: &SteamView) -> Vec<RowId> {
     let mut rows = vec![RowId::HostGame];
@@ -201,6 +210,7 @@ pub fn main_rows(steam: &SteamView) -> Vec<RowId> {
         RowId::WhoCanJoin,
         RowId::ShipColour,
         RowId::PartnerLabels,
+        RowId::WildMods,
         RowId::CodesAndLan,
         RowId::Back,
     ]);
@@ -315,6 +325,8 @@ pub enum Effect {
     SetColor(ColorChoice),
     /// The label switches changed (use them, save them).
     SetLabels(LabelMode),
+    /// The Wild Mods row changed (use it, save it).
+    SetWild(WildMods),
     /// The page closed: give the menu back.
     Closed,
     /// Switched between the pages (the glue resets the selection).
@@ -376,6 +388,8 @@ pub struct Page {
     colors: Vec<ColorChoice>,
     color: usize,
     labels: LabelMode,
+    /// The Wild Mods row (`wild_mods`).
+    wild: WildMods,
     message: Option<(String, Tone, u64)>,
     tick: u64,
     lang: String,
@@ -395,6 +409,7 @@ impl Page {
             color: colors.1.min(colors.0.len().saturating_sub(1)),
             colors: colors.0,
             labels,
+            wild: WildMods::default(),
             message: None,
             tick: 0,
             lang: String::new(),
@@ -457,6 +472,17 @@ impl Page {
         self.labels
     }
 
+    /// The Wild Mods row as configured (`wild_mods`).
+    pub fn set_wild(&mut self, wild: WildMods) {
+        self.wild = wild;
+    }
+
+    /// The Wild Mods row's value.
+    #[must_use]
+    pub fn wild(&self) -> WildMods {
+        self.wild
+    }
+
     /// The colour chosen.
     #[must_use]
     pub fn color(&self) -> Option<&ColorChoice> {
@@ -515,6 +541,7 @@ impl Page {
             ),
             RowId::ShipColour => ("Label Colour", self.color().map(|c| c.label.clone()), true),
             RowId::PartnerLabels => ("Partner Labels", Some(self.labels.label().to_owned()), true),
+            RowId::WildMods => ("Wild Mods", Some(self.wild.label().to_owned()), true),
             RowId::CodesAndLan => ("Codes and LAN", None, true),
             RowId::Back => (en::BACK, None, true),
             RowId::CopyCode => (
@@ -614,9 +641,11 @@ impl Page {
             | RowId::InviteFriend
             | RowId::JoinFriend
             | RowId::RoomCode => self.confirm_steam(id, steam),
-            RowId::WhoCanJoin | RowId::ShipColour | RowId::PartnerLabels | RowId::Role => {
-                self.shift_row(index, 1, steam, status)
-            }
+            RowId::WhoCanJoin
+            | RowId::ShipColour
+            | RowId::PartnerLabels
+            | RowId::WildMods
+            | RowId::Role => self.shift_row(index, 1, steam, status),
             RowId::CodesAndLan => {
                 self.show(PageId::Lan);
                 vec![Effect::Switched(PageId::Lan)]
@@ -772,6 +801,11 @@ impl Page {
                 self.labels = self.labels.step(dir);
                 vec![Effect::SetLabels(self.labels)]
             }
+            Some(RowId::WildMods) => {
+                self.wild = self.wild.step(dir);
+                self.say(self.wild.explain(), Tone::Info);
+                vec![Effect::SetWild(self.wild)]
+            }
             Some(RowId::WhoCanJoin) => {
                 if self.steam_unavailable(steam) {
                     return Vec::new();
@@ -805,7 +839,13 @@ impl Page {
     pub fn row_shifts(&self, index: usize, steam: &SteamView) -> bool {
         matches!(
             self.row_at(index, steam),
-            Some(RowId::ShipColour | RowId::PartnerLabels | RowId::WhoCanJoin | RowId::Role)
+            Some(
+                RowId::ShipColour
+                    | RowId::PartnerLabels
+                    | RowId::WildMods
+                    | RowId::WhoCanJoin
+                    | RowId::Role
+            )
         )
     }
 
@@ -1023,7 +1063,7 @@ impl Page {
             SteamState::PeerLost { lost_for_s } => {
                 let ago = lost_for_s.map_or_default(|s| format!(" {s} s ago"));
                 out.push(ColLine::body(
-                    &format!("Lost the link to {partner}{ago}."),
+                    &super::text::lost_link(&partner, &ago),
                     Tone::Bad,
                 ));
                 out.push(small(
@@ -1040,7 +1080,7 @@ impl Page {
             }
             SteamState::Left => {
                 out.push(ColLine::body(
-                    &format!("{partner} left the session."),
+                    &super::text::partner_left(&partner),
                     Tone::Info,
                 ));
                 out.push(small(try_again));
@@ -1059,10 +1099,11 @@ impl Page {
         }
         if steam.in_lobby() && !steam.members.is_empty() {
             out.push(ColLine::gap());
+            // The session's size, not the Steam lobby's (`steam::settings::LOBBY_SIZE`).
+            // A refused third member can sit in the Steam lobby for a moment.
             out.push(ColLine::heading(&format!(
-                "PLAYERS {}/{}",
-                steam.members.len(),
-                steam.max_members
+                "PLAYERS {}/{SESSION_PLAYERS}",
+                steam.members.len().min(SESSION_PLAYERS),
             )));
             for m in &steam.members {
                 out.push(self.member_line(m, steam));
@@ -1208,12 +1249,65 @@ mod tests {
         for s in [steam(), up(SteamState::Idle), up(SteamState::Left)] {
             for p in [PageId::Main, PageId::Lan] {
                 let rows = p.rows(&s);
-                assert!(rows.len() <= 10, "rows 1..=10 only");
+                assert!(rows.len() <= 11, "rows 1..=11 only");
                 assert_eq!(*rows.last().unwrap(), RowId::Back);
             }
         }
         assert!(!main_rows(&up(SteamState::Idle)).contains(&RowId::Retry));
         assert_eq!(main_rows(&up(SteamState::Left))[1], RowId::Retry);
+    }
+
+    #[test]
+    fn wild_mods_row_cycles_this_players_own_three_values() {
+        for state in [SteamState::Idle, SteamState::Linked, SteamState::Left] {
+            let s = up(state);
+            let mut p = page();
+            p.set_wild(WildMods::Sync);
+            let i = idx_in(PageId::Main, &s, RowId::WildMods);
+            assert!(p.row_shifts(i, &s));
+            let row = &p.rows(&s, None)[i];
+            assert_eq!(row.label, "Wild Mods");
+            assert_eq!(row.value.as_deref(), Some("Sync"));
+            assert!(row.enabled, "each player's own: the joining player's too");
+            assert_eq!(
+                p.shift_row(i, 1, &s, None),
+                vec![Effect::SetWild(WildMods::On)]
+            );
+            assert_eq!(p.rows(&s, None)[i].value.as_deref(), Some("Force On"));
+            let t = col_text(&p.view(&s, None).unwrap());
+            assert!(t.contains("halved"), "says what it means: {t}");
+            assert_eq!(
+                p.confirm_row(i, &s, None),
+                vec![Effect::SetWild(WildMods::Off)],
+                "confirm cycles too"
+            );
+            assert_eq!(
+                p.shift_row(i, -1, &s, None),
+                vec![Effect::SetWild(WildMods::On)]
+            );
+            assert_eq!(p.wild(), WildMods::On);
+        }
+    }
+
+    #[test]
+    fn players_heading_shows_the_two_player_session() {
+        let p = page();
+        let mut h = up(SteamState::Linked);
+        h.is_host = true;
+        h.members = vec![
+            member("Ace", true, true, true, None),
+            member("Sam", false, false, true, Some(40.0)),
+        ];
+        let t = col_text(&p.view(&h, None).unwrap());
+        assert!(t.contains("PLAYERS 2/2"), "{t}");
+        assert!(
+            !t.contains("/4"),
+            "the Steam lobby's room is not shown: {t}"
+        );
+        // A refused third member waiting in the Steam lobby for a moment.
+        h.members.push(member("Kim", false, false, false, None));
+        let t = col_text(&p.view(&h, None).unwrap());
+        assert!(t.contains("PLAYERS 2/2"), "{t}");
     }
 
     #[test]
@@ -1308,7 +1402,7 @@ mod tests {
         let t = col_text(&p.view(&h, None).unwrap());
         assert!(
             t.contains("ROOM CODE\nK7QX2")
-                && t.contains("PLAYERS 1/4")
+                && t.contains("PLAYERS 1/2")
                 && t.contains("Ace (host) - you"),
             "{t}"
         );
@@ -1396,7 +1490,7 @@ mod tests {
         );
         let mut left = up(SteamState::Left);
         left.partner = Some("Sam".into());
-        assert!(col_text(&p.view(&left, None).unwrap()).contains("Sam left the session."));
+        assert!(col_text(&p.view(&left, None).unwrap()).contains("Sam left."));
         // No listener: joining by invite is explained.
         let mut idle = up(SteamState::Idle);
         idle.invites_arrive = false;

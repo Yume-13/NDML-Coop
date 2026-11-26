@@ -393,8 +393,8 @@ impl Status {
     }
 }
 
-/// `peer.toml`, written by an outside tool; the game applies each request
-/// number once, for its own session only.
+/// `peer.toml`, written by another process on the same machine; the game
+/// applies each request number once, for its own session only.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PeerRequest {

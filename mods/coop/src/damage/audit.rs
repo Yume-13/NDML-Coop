@@ -21,8 +21,8 @@
 // SOFTWARE.
 
 //! An independent count of copies' hull changes (pure part; the hooks are in
-//! [`super::glue`]). This build keeps the count off; [`Audit::register`]
-//! still names the bracket sources for [`super::cause`].
+//! [`super::glue`]). The count is off; [`Audit::register`] names
+//! the bracket sources for [`super::cause`] either way.
 //!
 //! Every hull writer is bracketed; the change of each `oSolid` during a call,
 //! minus what nested brackets explained, is attributed to that function

@@ -164,7 +164,10 @@ pub fn page_ops(v: &PageView, g: &MenuGeom, f: Frame, m: &dyn Measure) -> Vec<Op
         #[allow(clippy::cast_precision_loss)]
         let y = g.row_y((i + 1) as f64);
         let ra = if r.enabled { a } else { a * alpha::DISABLED };
-        if !r.enabled {
+        // The game draws rows 0..=10 only. Row 11 is the mod's, as Exit.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // EXTRA_ROW, a small row
+        let mod_row = i + 1 >= EXTRA_ROW as usize;
+        if !r.enabled || mod_row {
             out.push(
                 TextOp::new(Font::Large, g.h_pos, y, &r.label)
                     .alpha(ra)
@@ -304,6 +307,8 @@ pub struct RunStyle {
     pub t: f64,
     /// The pause screen is up: bars go beside or under its menu rows.
     pub paused: bool,
+    /// The high-score table after a run is up (`oHighscoresDynamic`).
+    pub table: bool,
     /// The pause menu's rows as read from the game (bars beside them);
     /// without it, one bar goes under the rows.
     pub pause_rows: Option<PauseRows>,
@@ -362,6 +367,12 @@ pub const PAUSE_BAR_Y: f64 = 299.0;
 /// In a run, the lowest bar's centre above the bottom, clear of the hull and
 /// shield bars (× `guiScale`).
 pub const RUN_BAR_RISE: f64 = 143.0;
+/// The alert's top and the bar's centre on the high-score table, × `guiScale`
+/// above the bottom: in the gap between its statistics and its credits.
+/// `oHighscoresDynamic_Draw_64` draws the credits from `h - 278 × guiScale`.
+pub const TABLE_ALERT_TOP: f64 = 418.0;
+/// See [`TABLE_ALERT_TOP`].
+pub const TABLE_BAR_RISE: f64 = 338.0;
 
 fn bar_ops(b: &Bar, (x, y): (f64, f64), style: RunStyle, f: Frame, m: &dyn Measure) -> Vec<Op> {
     let a = if b.pulse {
@@ -389,7 +400,7 @@ fn bar_ops(b: &Bar, (x, y): (f64, f64), style: RunStyle, f: Frame, m: &dyn Measu
 
 /// The hint bars: beside the pause rows (one under them when they could
 /// not be read), or above the HUD in play.
-fn pause_bars(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure, out: &mut Vec<Op>) {
+fn pause_bars(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure, out: &mut Vec<Group>) {
     let rows = style.pause_rows.filter(|_| style.paused);
     let (mut bottom, mut centre) = (0.0_f64, 0.0_f64);
     for b in &ui.bars {
@@ -411,19 +422,45 @@ fn pause_bars(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure, out: &mut 
                 None if style.paused => (f.w / 2.0, PAUSE_BAR_Y * f.gs),
                 None => (
                     f.w / 2.0,
-                    f.h - RUN_BAR_RISE * f.gs - 60.0 * f.gs * (bottom - 1.0),
+                    f.h - if style.table {
+                        TABLE_BAR_RISE
+                    } else {
+                        RUN_BAR_RISE
+                    } * f.gs
+                        - 60.0 * f.gs * (bottom - 1.0),
                 ),
             }
         };
-        out.extend(bar_ops(b, at, style, f, m));
+        out.push(Group {
+            part: format!("bar {}", b.text),
+            ops: bar_ops(b, at, style, f, m),
+        });
     }
+}
+
+/// One piece of the run UI with its operations, by name ("bar `<text>`",
+/// "alert `<text>`", "count `<label> <number>`", "card `<title>`", "hud").
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    pub part: String,
+    pub ops: Vec<Op>,
 }
 
 /// Every in-run piece for this frame.
 #[must_use]
 pub fn run_ops(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure) -> Vec<Op> {
-    let mut out = Vec::new();
+    run_groups(ui, style, f, m)
+        .into_iter()
+        .flat_map(|g| g.ops)
+        .collect()
+}
+
+/// [`run_ops`] piece by piece, in drawing order.
+#[must_use]
+pub fn run_groups(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure) -> Vec<Group> {
+    let mut groups = Vec::new();
     if let Some(c) = &ui.card {
+        let mut out = Vec::new();
         out.push(Op::Dim { alpha: alpha::DIM });
         let cx = f.w / 2.0;
         let mut y = f.h * 0.4;
@@ -447,8 +484,20 @@ pub fn run_ops(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure) -> Vec<Op
                     .into(),
             );
         }
+        groups.push(Group {
+            part: format!("card {}", c.title),
+            ops: out,
+        });
     }
-    pause_bars(ui, style, f, m, &mut out);
+    pause_bars(ui, style, f, m, &mut groups);
+    if let Some(c) = &ui.count {
+        let mut out = Vec::new();
+        count_ops(c, f, m, &mut out);
+        groups.push(Group {
+            part: format!("count {} {}", c.label, c.number),
+            ops: out,
+        });
+    }
     // Never over the pause screen's text: there the bars say it.
     if let Some(a) = ui.alert.as_ref().filter(|_| !style.paused) {
         let lift = if style.wave_alert {
@@ -456,56 +505,261 @@ pub fn run_ops(ui: &RunUi, style: RunStyle, f: Frame, m: &dyn Measure) -> Vec<Op
         } else {
             0.0
         };
-        out.push(
-            TextOp::new(Font::XLarge, f.w / 2.0, f.h - 275.0 * f.gs - lift, &a.text)
-                .alpha(a.alpha)
-                .scale(a.scale)
-                .align(HAlign::Center, VAlign::Top)
-                .into(),
-        );
+        let top = if style.table { TABLE_ALERT_TOP } else { 275.0 };
+        groups.push(Group {
+            part: format!("alert {}", a.text),
+            ops: vec![
+                TextOp::new(Font::XLarge, f.w / 2.0, f.h - top * f.gs - lift, &a.text)
+                    .alpha(a.alpha)
+                    .scale(a.scale)
+                    .align(HAlign::Center, VAlign::Top)
+                    .into(),
+            ],
+        });
     }
     if let Some(h) = &ui.hud {
-        let a = hud_alpha(h, style.time_alpha, style.paused);
-        let detail_color = if h.bad { color::NEGATIVE } else { color::WHITE };
-        let gap = 16.0 * f.gs;
-        match style.hud_corner {
-            HudCorner::Right => {
-                let x = f.w - 18.0 * f.gs;
-                let y = f.h - 48.0 * f.gs;
-                let mut name_x = x;
-                if let Some(d) = &h.detail {
-                    out.push(
-                        TextOp::new(Font::Small, x, y, d)
-                            .color(detail_color)
-                            .alpha(a)
-                            .align(HAlign::Right, VAlign::Top)
-                            .into(),
-                    );
-                    name_x = x - m.width(Font::Small, d) - gap;
-                }
+        let mut out = Vec::new();
+        hud_ops(h, style, f, m, &mut out);
+        groups.push(Group {
+            part: "hud".into(),
+            ops: out,
+        });
+    }
+    groups
+}
+
+/// Rings of the count's edge glow, from the very edge inwards.
+const EDGE_RINGS: u32 = 12;
+/// The glow's depth, as a share of the GUI's short side.
+const EDGE_DEPTH: f64 = 0.07;
+
+/// A count: the edge glow, then its number and word on the panel or the strip.
+fn count_ops(c: &super::run::CountShow, f: Frame, m: &dyn Measure, out: &mut Vec<Op>) {
+    let fresh = (1.0 - c.phase).clamp(0.0, 1.0);
+    if c.dim {
+        count_dim_ops(f, out);
+    }
+    if c.edge {
+        edge_ops(fresh, f, out);
+    }
+    if !c.panel {
+        respawn_alert_ops(c, fresh, f, m, out);
+        return;
+    }
+    count_panel_ops(c, fresh, f, m, out);
+}
+
+/// The count's edge glow: [`EDGE_RINGS`] rings of the four sides.
+fn edge_ops(fresh: f64, f: Frame, out: &mut Vec<Op>) {
+    let peak = 0.45 + 0.3 * fresh * fresh;
+    let ring = f.w.min(f.h) * EDGE_DEPTH / f64::from(EDGE_RINGS);
+    for i in 0..EDGE_RINGS {
+        let k = 1.0 - f64::from(i) / f64::from(EDGE_RINGS);
+        let a = peak * k * k;
+        let o = f64::from(i) * ring;
+        let rect = |x1: f64, y1: f64, x2: f64, y2: f64| Op::Rect {
+            x1,
+            y1,
+            x2,
+            y2,
+            color: color::COUNT_EDGE,
+            alpha: a,
+            outline: false,
+        };
+        out.push(rect(o, o, f.w - o, o + ring));
+        out.push(rect(o, f.h - o - ring, f.w - o, f.h - o));
+        out.push(rect(o, o + ring, o + ring, f.h - o - ring));
+        out.push(rect(f.w - o - ring, o + ring, f.w - o, f.h - o - ring));
+    }
+}
+
+/// The resume and start counts' number and word on the middle panel.
+fn count_panel_ops(
+    c: &super::run::CountShow,
+    fresh: f64,
+    f: Frame,
+    m: &dyn Measure,
+    out: &mut Vec<Op>,
+) {
+    let num = c.number.to_string();
+    let lh = m.line(Font::Title);
+    let nh = m.line(Font::XXLarge) * COUNT_SCALE;
+    let cx = f.w / 2.0;
+    let cy = f.h * 0.47;
+    let top = cy - nh * 0.5 - lh * 1.3;
+    let bottom = cy + nh * 0.55;
+    let half = (m
+        .width(Font::Title, c.label)
+        .max(m.width(Font::XXLarge, &num) * COUNT_SCALE)
+        * 0.5
+        + lh)
+        .max((bottom - top) * 0.6);
+    out.push(Op::Rect {
+        x1: cx - half,
+        y1: top,
+        x2: cx + half,
+        y2: bottom,
+        color: color::BLACK,
+        alpha: COUNT_PANEL_ALPHA,
+        outline: false,
+    });
+    out.push(
+        TextOp::new(Font::Title, cx, top + lh * 0.25, c.label)
+            .align(HAlign::Center, VAlign::Top)
+            .into(),
+    );
+    out.push(
+        TextOp::new(Font::XXLarge, cx, cy, num)
+            .scale(COUNT_SCALE * (1.0 + 0.25 * fresh.powi(3)))
+            .align(HAlign::Center, VAlign::Middle)
+            .into(),
+    );
+}
+
+/// The pause screen dimmed under its rows while the resume count shows.
+fn count_dim_ops(f: Frame, out: &mut Vec<Op>) {
+    let soft = f.h * COUNT_DIM_SOFT / f64::from(COUNT_DIM_STEPS);
+    let from = f.h * COUNT_DIM_FROM;
+    for i in 0..COUNT_DIM_STEPS {
+        let y = from + f64::from(i) * soft;
+        out.push(Op::Rect {
+            x1: 0.0,
+            y1: y,
+            x2: f.w,
+            y2: y + soft,
+            color: color::BLACK,
+            alpha: COUNT_DIM_ALPHA * f64::from(i + 1) / f64::from(COUNT_DIM_STEPS + 1),
+            outline: false,
+        });
+    }
+    out.push(Op::Rect {
+        x1: 0.0,
+        y1: from + f.h * COUNT_DIM_SOFT,
+        x2: f.w,
+        y2: f.h,
+        color: color::BLACK,
+        alpha: COUNT_DIM_ALPHA,
+        outline: false,
+    });
+}
+
+/// The respawn alert: BACK IN and the number on an upper strip, outlined.
+fn respawn_alert_ops(
+    c: &super::run::CountShow,
+    fresh: f64,
+    f: Frame,
+    m: &dyn Measure,
+    out: &mut Vec<Op>,
+) {
+    let num = c.number.to_string();
+    let nh = m.line(Font::XXLarge) * ALERT_SCALE;
+    let lw = m.width(Font::Title, c.label);
+    let nw = m.width(Font::XXLarge, &num) * ALERT_SCALE;
+    let gap = m.line(Font::Title);
+    let total = lw + gap + nw;
+    let cx = f.w / 2.0;
+    let top = f.h * ALERT_TOP;
+    let cy = top + nh * 0.55;
+    let pad = gap;
+    out.push(Op::Rect {
+        x1: cx - total / 2.0 - pad,
+        y1: top,
+        x2: cx + total / 2.0 + pad,
+        y2: top + nh * 1.1,
+        color: color::BLACK,
+        alpha: ALERT_STRIP_ALPHA,
+        outline: false,
+    });
+    let label =
+        TextOp::new(Font::Title, cx - total / 2.0, cy, c.label).align(HAlign::Left, VAlign::Middle);
+    let number = TextOp::new(Font::XXLarge, cx + total / 2.0 - nw / 2.0, cy, num)
+        .scale(ALERT_SCALE * (1.0 + 0.2 * fresh.powi(3)))
+        .align(HAlign::Center, VAlign::Middle);
+    let o = (2.0 * f.gs).max(1.0);
+    for t in [label, number] {
+        for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o)] {
+            let mut shade = t.clone();
+            shade.x += dx;
+            shade.y += dy;
+            shade.color = color::BLACK;
+            shade.alpha = 0.85;
+            out.push(shade.into());
+        }
+        out.push(t.into());
+    }
+}
+
+/// The count's number: the high-score entry's font, this many times over.
+const COUNT_SCALE: f64 = 2.5;
+/// The panel behind the count (the game's dimmer is 0.5).
+const COUNT_PANEL_ALPHA: f64 = 0.8;
+/// The pause screen dimmed under its rows while the count shows: from this
+/// share of the height down, at this alpha.
+const COUNT_DIM_FROM: f64 = 0.21;
+const COUNT_DIM_ALPHA: f64 = 0.5;
+/// The dim's top edge: faded in over this share of the height, in steps.
+const COUNT_DIM_SOFT: f64 = 0.05;
+const COUNT_DIM_STEPS: u32 = 8;
+/// The respawn alert's number (the high-score entry's font, scaled).
+const ALERT_SCALE: f64 = 1.5;
+/// The respawn alert's strip: its top as a share of the height, and its alpha.
+/// The game's LEVEL UP banner reaches 15 % of the height.
+const ALERT_TOP: f64 = 0.19;
+const ALERT_STRIP_ALPHA: f64 = 0.35;
+
+/// P3: the HUD line, and the traffic line one line above it (`show_traffic`).
+fn hud_ops(h: &super::run::Hud, style: RunStyle, f: Frame, m: &dyn Measure, out: &mut Vec<Op>) {
+    let a = hud_alpha(h, style.time_alpha, style.paused);
+    let detail_color = if h.bad { color::NEGATIVE } else { color::WHITE };
+    let gap = 16.0 * f.gs;
+    let above = m.line(Font::Small);
+    match style.hud_corner {
+        HudCorner::Right => {
+            let x = f.w - 18.0 * f.gs;
+            let y = f.h - 48.0 * f.gs;
+            let mut name_x = x;
+            if let Some(d) = &h.detail {
                 out.push(
-                    TextOp::new(Font::Small, name_x, y, &h.name)
+                    TextOp::new(Font::Small, x, y, d)
+                        .color(detail_color)
+                        .alpha(a)
+                        .align(HAlign::Right, VAlign::Top)
+                        .into(),
+                );
+                name_x = x - m.width(Font::Small, d) - gap;
+            }
+            out.push(
+                TextOp::new(Font::Small, name_x, y, &h.name)
+                    .alpha(a)
+                    .align(HAlign::Right, VAlign::Top)
+                    .into(),
+            );
+            if let Some(t) = &h.traffic {
+                out.push(
+                    TextOp::new(Font::Small, x, y - above, t)
                         .alpha(a)
                         .align(HAlign::Right, VAlign::Top)
                         .into(),
                 );
             }
-            HudCorner::Left => {
-                let x = 18.0 * f.gs;
-                let y = f.h - 108.0 * f.gs;
-                out.push(TextOp::new(Font::Small, x, y, &h.name).alpha(a).into());
-                if let Some(d) = &h.detail {
-                    out.push(
-                        TextOp::new(Font::Small, x + m.width(Font::Small, &h.name) + gap, y, d)
-                            .color(detail_color)
-                            .alpha(a)
-                            .into(),
-                    );
-                }
+        }
+        HudCorner::Left => {
+            let x = 18.0 * f.gs;
+            let y = f.h - 108.0 * f.gs;
+            out.push(TextOp::new(Font::Small, x, y, &h.name).alpha(a).into());
+            if let Some(d) = &h.detail {
+                out.push(
+                    TextOp::new(Font::Small, x + m.width(Font::Small, &h.name) + gap, y, d)
+                        .color(detail_color)
+                        .alpha(a)
+                        .into(),
+                );
+            }
+            if let Some(t) = &h.traffic {
+                out.push(TextOp::new(Font::Small, x, y - above, t).alpha(a).into());
             }
         }
     }
-    out
 }
 
 /// The HUD line's alpha. In play the ordinary line follows the game's run
@@ -689,6 +943,29 @@ mod tests {
     }
 
     #[test]
+    fn a_page_of_eleven_rows_draws_its_last_on_row_11() {
+        let mut v = view();
+        let row = |label: &str| RowView {
+            id: RowId::WildMods,
+            label: label.into(),
+            value: None,
+            enabled: true,
+        };
+        v.rows = (1..=11).map(|i| row(&format!("Row {i}"))).collect();
+        v.rows[10].value = Some("Sync".into());
+        let ops = page_ops(&v, &G, F, &Fake);
+        let t = texts(&ops);
+        let last = t.iter().find(|x| x.text == "Row 11").expect("row 11 drawn");
+        assert!((last.y - G.row_y(11.0)).abs() < 1e-9);
+        assert!((last.alpha - 1.0).abs() < 1e-9, "enabled: full alpha");
+        assert!(
+            !t.iter().any(|x| x.text == "Row 10"),
+            "rows 1..=10 are the game's"
+        );
+        assert!(t.iter().any(|x| x.text == "Sync"), "its value too");
+    }
+
+    #[test]
     fn extras_follow_the_menu_fade_from_black() {
         assert!((faded(1.0, None) - 1.0).abs() < 1e-12);
         assert!((faded(0.8, Some(1.0))).abs() < 1e-12, "fully black");
@@ -778,8 +1055,75 @@ mod tests {
     }
 
     #[test]
+    fn the_count_stands_on_a_panel_in_the_middle() {
+        let f = Frame {
+            w: 1920.0,
+            h: 1080.0,
+            gs: 1.0,
+        };
+        let c = crate::ui::run::CountShow {
+            number: 3,
+            label: "RESUMING",
+            phase: 0.0,
+            edge: true,
+            panel: true,
+            dim: true,
+        };
+        let mut out = Vec::new();
+        count_ops(&c, f, &Fake, &mut out);
+        // The dim (its soft edge and the rest), 12 rings of 4 sides, the
+        // panel, the word, the number.
+        let dim = COUNT_DIM_STEPS as usize + 1;
+        assert_eq!(out.len(), dim + 12 * 4 + 3);
+        let panel = &out[dim + 48];
+        assert!(
+            matches!(panel, Op::Rect { color: color::BLACK, x1, x2, .. } if *x1 < 960.0 && *x2 > 960.0)
+        );
+        // The start count on the new game screen: the same without the dim.
+        let mut start = Vec::new();
+        count_ops(
+            &crate::ui::run::CountShow {
+                label: "STARTING",
+                dim: false,
+                ..c.clone()
+            },
+            f,
+            &Fake,
+            &mut start,
+        );
+        assert_eq!(start.len(), 12 * 4 + 3);
+        assert_eq!(start[48], out[dim + 48], "the same panel");
+        let mut out = Vec::new();
+        count_ops(
+            &crate::ui::run::CountShow {
+                panel: false,
+                dim: false,
+                ..c
+            },
+            f,
+            &Fake,
+            &mut out,
+        );
+        // The respawn alert: the glow, a strip, two texts in 4 outline shades.
+        assert_eq!(out.len(), 12 * 4 + 1 + 2 * 5, "the edge, no panel, no dim");
+        assert_eq!(out[..48], start[..48], "the same edge");
+        assert!(
+            out.iter().all(|o| !matches!(o, Op::Rect { color: color::BLACK, alpha, .. } if (*alpha - COUNT_PANEL_ALPHA).abs() < 1e-9)),
+            "no middle panel"
+        );
+        let Op::Rect { y1, y2, .. } = &out[48] else {
+            panic!("{:?}", out[48])
+        };
+        assert!(
+            *y1 >= f.h * 0.14 && *y2 < f.h * 0.35,
+            "the upper part, clear of the middle"
+        );
+    }
+
+    #[test]
     fn run_ops_place_each_primitive() {
         let ui = RunUi {
+            count: None,
             pause: None,
             bars: vec![
                 Bar {
@@ -797,6 +1141,7 @@ mod tests {
                 name: "Sam".into(),
                 detail: Some("210 ms".into()),
                 bad: true,
+                traffic: None,
             }),
             card: Some(Card {
                 title: "WAITING".into(),
@@ -815,6 +1160,7 @@ mod tests {
             wave_alert: false,
             t: 0.0,
             paused: false,
+            table: false,
             pause_rows: None,
         };
         let ops = run_ops(&ui, style, F, &Fake);
@@ -872,6 +1218,7 @@ mod tests {
         let pause = crate::ui::run::PauseText {
             row0: Some("Waiting for Sam...".into()),
             row0_blocked: true,
+            row0_choose: false,
             quit: Some(("Leave Co-op Run".into(), "?".into())),
         };
         RunUi {
@@ -917,6 +1264,7 @@ mod tests {
                 wave_alert: false,
                 t: 0.0,
                 paused: true,
+                table: false,
                 pause_rows: Some(rows),
             };
             let ops = run_ops(&ui, style, f, &Fake);
@@ -946,6 +1294,7 @@ mod tests {
             wave_alert: false,
             t: 0.0,
             paused: true,
+            table: false,
             pause_rows: Some(PauseRows {
                 x: 1143.0,
                 first_y: 117.0,
@@ -968,6 +1317,7 @@ mod tests {
         let ops = run_ops(
             &four,
             RunStyle {
+                table: false,
                 pause_rows: None,
                 ..style
             },
@@ -992,6 +1342,7 @@ mod tests {
             wave_alert: false,
             t: 0.0,
             paused: false,
+            table: false,
             pause_rows: None,
         };
         let line = |hud: Hud| {
@@ -1008,6 +1359,7 @@ mod tests {
             name: "Sam".into(),
             detail: Some("42 ms".into()),
             bad: false,
+            traffic: None,
         });
         assert!(ordinary.iter().all(|(_, a)| *a == 0.0), "{ordinary:?}");
         // On the pause screen the ordinary line shows whatever the timer.
@@ -1016,6 +1368,7 @@ mod tests {
                 name: "Sam".into(),
                 detail: Some("42 ms".into()),
                 bad: false,
+                traffic: None,
             }),
             ..RunUi::default()
         };
@@ -1041,6 +1394,73 @@ mod tests {
             assert_eq!(got.len(), 2);
             assert!(got.iter().all(|(_, a)| (*a - 0.65).abs() < 1e-9), "{got:?}");
         }
+    }
+
+    /// One `fontSmall` line above, in the same corner, font and alpha.
+    #[test]
+    fn the_traffic_line_sits_above_the_hud_line_in_both_corners() {
+        let mut h = crate::ui::run::hud("Sam", Some(42.0), Some(0.0));
+        let traffic = crate::ui::run::traffic_text(48.4, 7.25);
+        assert_eq!(traffic, "48 KB/s up  7.2 KB/s down");
+        h.traffic = Some(traffic.clone());
+        let ui = RunUi {
+            hud: Some(h),
+            ..RunUi::default()
+        };
+        for corner in [HudCorner::Right, HudCorner::Left] {
+            let style = RunStyle {
+                hud_corner: corner,
+                time_alpha: 1.0,
+                wave_alert: false,
+                t: 0.0,
+                paused: false,
+                table: false,
+                pause_rows: None,
+            };
+            let ops = run_ops(&ui, style, F, &Fake);
+            let t = texts(&ops);
+            assert_eq!(t.len(), 3, "{corner:?}");
+            let line = t.iter().find(|x| x.text == traffic).unwrap();
+            let name = t.iter().find(|x| x.text == "Sam").unwrap();
+            let ms = t.iter().find(|x| x.text == "42 ms").unwrap();
+            assert!(
+                (name.y - line.y - Fake.line(Font::Small)).abs() < 1e-9,
+                "{corner:?}: one line above"
+            );
+            assert_eq!(line.h, ms.h, "{corner:?}: the same alignment");
+            assert!((line.alpha - name.alpha).abs() < 1e-9);
+            assert_eq!(line.font, Font::Small);
+            match corner {
+                HudCorner::Right => assert!((line.x - ms.x).abs() < 1e-9, "right edge"),
+                HudCorner::Left => assert!((line.x - name.x).abs() < 1e-9, "left edge"),
+            }
+        }
+        // `show_traffic` off: the same HUD line, nothing above it.
+        let mut ui = RunUi {
+            hud: Some(crate::ui::run::hud("Sam", Some(42.0), Some(0.0))),
+            ..RunUi::default()
+        };
+        let off = crate::ui::run::Switches::default();
+        crate::ui::run::add_traffic(&mut ui, off, Some((48.0, 21.0)));
+        assert_eq!(ui.hud.as_ref().unwrap().traffic, None);
+        let on = crate::ui::run::Switches {
+            traffic: true,
+            ..off
+        };
+        crate::ui::run::add_traffic(&mut ui, on, None);
+        assert_eq!(
+            ui.hud.as_ref().unwrap().traffic,
+            None,
+            "no numbers unlinked"
+        );
+        crate::ui::run::add_traffic(&mut ui, on, Some((48.0, 21.0)));
+        assert_eq!(
+            ui.hud.as_ref().unwrap().traffic.as_deref(),
+            Some("48 KB/s up  21 KB/s down")
+        );
+        let mut none = RunUi::default();
+        crate::ui::run::add_traffic(&mut none, on, Some((1.0, 1.0)));
+        assert!(none.hud.is_none(), "only with a HUD line");
     }
 
     /// The fake, with the game reporting its own bar sprite height.
@@ -1074,6 +1494,7 @@ mod tests {
             wave_alert: false,
             t: 0.0,
             paused: false,
+            table: false,
             pause_rows: None,
         };
         let f = Frame { gs: 1.68, ..F };
@@ -1116,5 +1537,44 @@ mod tests {
         let t = texts(&ops);
         assert_eq!((t[0].font, t[0].color), (Font::Small, 7));
         assert!((t[0].alpha - 0.8).abs() < 1e-9);
+    }
+
+    /// The partner's Ready goes into the gap above the credits (`h - 278`).
+    #[test]
+    fn on_the_high_score_table_the_notice_clears_the_credits() {
+        let ui = RunUi {
+            bars: vec![super::super::run::ready_bar("ready")],
+            alert: Some(AlertView {
+                text: "SAM IS READY".into(),
+                scale: 1.0,
+                alpha: 1.0,
+            }),
+            ..RunUi::default()
+        };
+        let style = RunStyle {
+            hud_corner: HudCorner::Right,
+            time_alpha: 1.0,
+            wave_alert: false,
+            t: 0.0,
+            paused: false,
+            table: false,
+            pause_rows: None,
+        };
+        let at = |table| {
+            let ops = run_ops(&ui, RunStyle { table, ..style }, F, &Fake);
+            let t = texts(&ops);
+            let y = |s: &str| t.iter().find(|x| x.text == s).unwrap().y;
+            (y("SAM IS READY"), y("ready"))
+        };
+        let credits = F.h - 278.0;
+        let (alert, bar) = at(false);
+        assert!(alert >= credits - 5.0, "elsewhere: the usual places");
+        assert!((bar - (F.h - RUN_BAR_RISE)).abs() < 1.0);
+        let (alert, bar) = at(true);
+        let line = Fake.line(Font::XLarge);
+        assert!((alert - (F.h - TABLE_ALERT_TOP)).abs() < 1e-9);
+        assert!(alert + line < bar - 20.0, "the alert above the bar");
+        assert!(bar + 30.0 < credits, "the bar clear of the credits");
+        assert!(alert > F.h - 444.0, "below the statistics");
     }
 }
